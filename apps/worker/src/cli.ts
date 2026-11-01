@@ -25,7 +25,11 @@ import {
 import { selfTest, type InstanceConfig } from "./manager.js";
 import { HttpController } from "./control.js";
 import { normalizeCdkOrigin } from "../../../packages/core/src/cdk-origin.js";
-import { NODE_PROTOCOL_VERSION } from "../../../packages/core/src/node-control.js";
+import {
+  NODE_PROTOCOL_VERSION,
+  updateActive,
+} from "../../../packages/core/src/node-control.js";
+import { displayStatus } from "./status-display.js";
 const exec = promisify(execFile);
 const releaseRoot = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -316,9 +320,36 @@ async function menu() {
           } as Record<string, string>
         )[action];
         if (!command) continue;
+        if (command === "rebind") {
+          let current = await manage(root, name, { action: "status" });
+          if (!current.connected) {
+            console.log("请先启动节点并恢复控制台连接，再更换对接。");
+            continue;
+          }
+          if (current.control?.desiredState !== "paused") {
+            await manage(root, name, { action: "pause" });
+            console.log("已提交暂停接新单请求，正在确认原订单状态…");
+            for (let attempt = 0; attempt < 25; attempt++) {
+              await delay(200);
+              current = await manage(root, name, { action: "status" });
+              if (current.control?.desiredState === "paused") break;
+            }
+          }
+          if (
+            current.control?.desiredState !== "paused" ||
+            current.blockers?.length ||
+            current.inFlightCount ||
+            updateActive(current.control?.update)
+          ) {
+            console.log(
+              `原对接配置已保留；还有 ${current.blockers?.length || 0} 单未结束或维护尚未完成。请稍后再次选择更换对接。`,
+            );
+            continue;
+          }
+        }
         const args = command === "rebind" ? await credentials(name) : {};
         const result = await manage(root, name, { action: command, ...args });
-        if (command === "status") console.log(JSON.stringify(result, null, 2));
+        if (command === "status") console.log(displayStatus(result, name));
         else console.log("请求已保存；节点按当前订单状态执行。");
       }
     } catch (error) {

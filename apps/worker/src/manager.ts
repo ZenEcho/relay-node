@@ -64,7 +64,20 @@ export async function selfTest(releaseRoot: string) {
 export async function runManager(root: string) {
   root = resolve(root);
   const releaseRoot = await realpath(join(root, "current"));
-  const manifest = await selfTest(releaseRoot);
+  const manifest = await jsonFile<Manifest>(join(releaseRoot, "manifest.json"));
+  if (
+    manifest.protocolVersion !== NODE_PROTOCOL_VERSION ||
+    manifest.platform !== process.platform ||
+    manifest.arch !== process.arch
+  )
+    throw new Error("节点安装包不兼容当前系统");
+  let initialReady = false;
+  try {
+    await selfTest(releaseRoot);
+    initialReady = true;
+  } catch {
+    console.error("原生传输组件未就绪，管理与更新功能保持可用");
+  }
   let config = await jsonFile<InstanceConfig>(join(root, "config.json"));
   Object.assign(process.env, config.environment || {});
   process.env.WORKER_LOG_DIR = join(root, "audit");
@@ -75,7 +88,7 @@ export async function runManager(root: string) {
   });
   const pending = new Set<Promise<unknown>>();
   let stopping = false,
-    ready = true,
+    ready = initialReady,
     lastProbe = Date.now(),
     status: any = { blockers: [] },
     upgrading: Promise<void> | undefined,
@@ -113,7 +126,14 @@ export async function runManager(root: string) {
         version,
         previousVersion: manifest.version,
       });
-      await downloadRelease(release, directory, process.platform, process.arch, fetch, status.protocolVersion);
+      await downloadRelease(
+        release,
+        directory,
+        process.platform,
+        process.arch,
+        fetch,
+        status.protocolVersion,
+      );
       await exec(
         join(directory, "runtime/bin/node"),
         [
@@ -313,9 +333,10 @@ export async function runManager(root: string) {
         if (upgrade && !upgrading && !updateActive(status.control?.update)) {
           await rm(join(root, "upgrade.json"), { force: true });
         }
-        await writeFile(join(root, "healthy"), manifest.version, {
-          mode: 0o600,
-        });
+        if (ready)
+          await writeFile(join(root, "healthy"), manifest.version, {
+            mode: 0o600,
+          });
         while (state.commands.length) {
           const command = state.commands[0];
           try {

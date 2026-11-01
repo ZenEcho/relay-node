@@ -336,3 +336,81 @@ test("stable launcher automatically rolls back a candidate that exits before hea
   assert.equal(await readlink(join(root, "current")), old);
   assert.ok(await stat(join(root, "rollback.json")));
 });
+
+test("a broken execution helper leaves management online without declaring startup healthy", async (t) => {
+  const root = await mkdtemp("/tmp/relay-unready-");
+  const release = await fixture(root),
+    instance = join(root, "instances/one");
+  await rm(join(release, "bin/relay-transport"));
+  await mkdir(instance, { recursive: true });
+  await symlink(release, join(instance, "current"));
+  let reports = 0,
+    polls = 0;
+  const upstream = createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    const meta = JSON.parse(raw || "{}");
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/api/worker/heartbeat") {
+      assert.equal(meta.transportReady, false);
+      reports++;
+      res.end(
+        JSON.stringify({
+          control: { revision: 0, desiredState: "paused" },
+          blockers: [],
+          protocolVersion: 1,
+        }),
+      );
+    } else {
+      polls++;
+      res.end("null");
+    }
+  });
+  await new Promise<void>((resolve) =>
+    upstream.listen(0, "127.0.0.1", resolve),
+  );
+  await saveJson(join(instance, "config.json"), {
+    instance: "one",
+    consoleUrl: "http://127.0.0.1:" + (upstream.address() as any).port,
+    token: "relaynode.test.one.token",
+  });
+  const manager = spawn(
+    process.execPath,
+    [join(release, "dist/apps/worker/src/entry.js"), instance],
+    { stdio: "ignore" },
+  );
+  t.after(async () => {
+    if (manager.exitCode === null) {
+      const ended = new Promise<void>((resolve) =>
+        manager.once("exit", () => resolve()),
+      );
+      manager.kill("SIGTERM");
+      await Promise.race([ended, delay(4000)]);
+    }
+    upstream.closeAllConnections();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  });
+  await until(async () => reports >= 2);
+  const result = await exec(
+    process.execPath,
+    [
+      join(release, "dist/apps/worker/src/cli.js"),
+      "--instance",
+      "one",
+      "status",
+    ],
+    { env: { ...process.env, RELAY_NODE_HOME: join(root, "instances") } },
+  );
+  const status = JSON.parse(result.stdout);
+  assert.equal(status.connected, true);
+  assert.equal(status.transportReady, false);
+  assert.equal(polls, 0);
+  assert.equal(
+    await stat(join(instance, "healthy")).then(
+      () => true,
+      () => false,
+    ),
+    false,
+  );
+});
