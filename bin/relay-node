@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+if [ "$(uname -s)" = Linux ] && [ "$(id -u)" != 0 ]; then exec sudo "$0" "$@"; fi
 if [ "$(uname -s)" = Darwin ]; then base=${RELAY_NODE_HOME:-"$HOME/Library/Application Support/RelayNode"}; else base=${RELAY_NODE_HOME:-/var/lib/relay-node}; fi
 for directory in "$base"/*; do
   if [ -x "$directory/current/runtime/bin/node" ]; then

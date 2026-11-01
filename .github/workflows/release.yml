@@ -24,10 +24,19 @@ jobs:
           cache-dependency-path: native/transport/go.sum
       - run: npm ci
       - run: npm run check
+      - name: Download native dependencies with bounded retries
+        working-directory: native/transport
+        run: |
+          for attempt in 1 2 3; do
+            if go mod download; then exit 0; fi
+            sleep 5
+          done
+          exit 1
       - run: go test ./...
         working-directory: native/transport
       - run: npm run native:build
       - run: node scripts/package-release.mjs
+      - run: node scripts/verify-service.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: node-${{ matrix.runner }}

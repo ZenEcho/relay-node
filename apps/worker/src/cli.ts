@@ -198,11 +198,13 @@ async function install() {
       protocolVersion: NODE_PROTOCOL_VERSION,
       platform: process.platform,
       arch: process.arch,
-      transportReady: true,
+      transportReady: false,
       inFlightCount: 0,
       runtimeState: "starting",
     },
   );
+  await mkdir(base, { recursive: true, mode: 0o755 });
+  await chmod(base, 0o755);
   await mkdir(root, { recursive: true, mode: 0o700 });
   await chmod(root, 0o700);
   const target = join(root, "releases", manifest.version);

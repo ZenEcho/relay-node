@@ -6,8 +6,7 @@ const go =
     ? new URL("../.data/tools/go/bin/go", import.meta.url).pathname
     : "go");
 for (const args of [
-  ["mod", "tidy"],
-  ["build", "-trimpath", "-o", "relay-transport", "."],
+  ["build", "-mod=readonly", "-trimpath", "-o", "relay-transport", "."],
 ]) {
   const r = spawnSync(go, args, {
     cwd: new URL("../native/transport", import.meta.url),
