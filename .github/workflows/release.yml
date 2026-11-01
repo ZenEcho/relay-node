@@ -1,0 +1,65 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+          cache-dependency-path: native/transport/go.sum
+      - run: npm ci
+      - run: npm run check
+      - run: go test ./...
+        working-directory: native/transport
+      - run: npm run native:build
+      - run: node scripts/package-release.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.runner }}
+          path: |
+            release/relay-node-*.tar.gz
+            release/relay-node-sdk-*.tgz
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: node-*
+          merge-multiple: true
+          path: release
+      - name: Verify complete release and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version=$(cat VERSION)
+          test "$GITHUB_REF_NAME" = "v$version"
+          for platform in linux darwin; do
+            for arch in x64 arm64; do test -f "release/relay-node-$version-$platform-$arch.tar.gz"; done
+          done
+          test -f "release/relay-node-sdk-$version.tgz"
+          cd release
+          sha256sum relay-node-*.tar.gz relay-node-sdk-*.tgz > SHA256SUMS
+          gh release create "v$version" --repo "$GITHUB_REPOSITORY" --draft --title "Relay Node v$version" --generate-notes
+          gh release upload "v$version" ./*.tar.gz ./*sdk*.tgz SHA256SUMS --repo "$GITHUB_REPOSITORY"
+          gh release edit "v$version" --repo "$GITHUB_REPOSITORY" --draft=false --latest

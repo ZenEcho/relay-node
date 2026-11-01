@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+if [ "$(uname -s)" = Darwin ]; then base=${RELAY_NODE_HOME:-"$HOME/Library/Application Support/RelayNode"}; else base=${RELAY_NODE_HOME:-/var/lib/relay-node}; fi
+for directory in "$base"/*; do
+  if [ -x "$directory/current/runtime/bin/node" ]; then
+    exec "$directory/current/runtime/bin/node" "$directory/current/dist/apps/worker/src/cli.js" "$@"
+  fi
+done
+printf '%s\n' '尚未安装节点，请先运行 GitHub 仓库中的 install.sh。' >&2
+exit 1

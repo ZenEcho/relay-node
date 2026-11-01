@@ -1,0 +1,42 @@
+{
+  "name": "@relay/node",
+  "version": "0.1.0",
+  "description": "Relay independent execution node and SDK",
+  "type": "module",
+  "main": "dist/sdk.js",
+  "types": "dist/sdk.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/sdk.d.ts",
+      "import": "./dist/sdk.js"
+    },
+    "./worker/*": {
+      "types": "./dist/apps/worker/src/*.d.ts",
+      "import": "./dist/apps/worker/src/*.js"
+    },
+    "./core/*": {
+      "types": "./dist/packages/core/src/*.d.ts",
+      "import": "./dist/packages/core/src/*.js"
+    }
+  },
+  "files": [
+    "dist",
+    "bin",
+    "install.sh",
+    "VERSION"
+  ],
+  "engines": {
+    "node": ">=24.14.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "tsx --test tests/*.test.ts",
+    "native:build": "node scripts/build-native.mjs",
+    "check": "npm run build && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "24.0.0",
+    "typescript": "6.0.3",
+    "tsx": "4.19.4"
+  }
+}

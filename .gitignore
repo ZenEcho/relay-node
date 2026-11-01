@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.data/
+release/
+*.tgz
+.env
+native/transport/relay-transport
+.DS_Store
+*.log
