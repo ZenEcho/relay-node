@@ -60,6 +60,93 @@ test("interactive entry works under sh and bash syntax", async () => {
     for (const script of ["install.sh", "bin/launcher.sh", "bin/relay-node"])
       await exec(shell, ["-n", script]);
 });
+test("interactive installation hides credentials when stdin is redirected and reads from the controlling terminal", async () => {
+  const root = await mkdtemp("/tmp/relay-terminal-");
+  const upstream = createServer((request, response) => {
+    request.resume();
+    response.setHeader("content-type", "application/json");
+    response.end('{"ok":true}');
+  });
+  try {
+    const release = await fixture(root);
+    await new Promise<void>((resolve) =>
+      upstream.listen(0, "127.0.0.1", resolve),
+    );
+    const address = "http://127.0.0.1:" + (upstream.address() as any).port;
+    const token = "relaynode.test.node.terminal-secret";
+    const python = String.raw`
+import os, pty, select, signal, sys, time
+node, cli, root, address, token = sys.argv[1:]
+pid, master = pty.fork()
+if pid == 0:
+    env = os.environ.copy()
+    env.update(RELAY_NODE_HOME=root, RELAY_NODE_NO_SERVICE='1')
+    env.pop('CONSOLE_URL', None)
+    env.pop('NODE_TOKEN', None)
+    os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+    os.execve(node, [node, cli, 'install'], env)
+output = b''
+prompts = [('实例名称 [main]：', 'manual'), ('控制台地址：', address), ('节点凭证（输入隐藏）：', token)]
+index = 0
+finished = False
+try:
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if select.select([master], [], [], .1)[0]:
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+            if index < len(prompts) and prompts[index][0].encode() in output:
+                os.write(master, (prompts[index][1] + '\n').encode())
+                index += 1
+    else:
+        raise TimeoutError('interactive prompt timed out: ' + repr(output.replace(token.encode(), b'<hidden>')))
+    _, status = os.waitpid(pid, 0)
+    finished = True
+    assert os.waitstatus_to_exitcode(status) == 0, 'installer did not complete'
+    assert index == len(prompts), 'missing interactive prompt'
+    assert token.encode() not in output, 'credential echoed to terminal'
+    print('interactive installation completed without credential echo')
+finally:
+    if not finished:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    os.close(master)
+`;
+    const base = join(root, "instances");
+    const result = await exec(
+      "python3",
+      [
+        "-c",
+        python,
+        process.execPath,
+        join(release, "dist/apps/worker/src/cli.js"),
+        base,
+        address,
+        token,
+      ],
+      { timeout: 45000 },
+    );
+    assert.match(result.stdout, /without credential echo/);
+    assert.equal(
+      JSON.parse(await readFile(join(base, "manual/config.json"), "utf8"))
+        .token,
+      token,
+    );
+    assert.equal(
+      (await stat(join(base, "manual/config.json"))).mode & 0o777,
+      0o600,
+    );
+  } finally {
+    upstream.closeAllConnections();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
 test("install, menu commands, idle update, failed rebind and multiple instances work without source checkout", async (t) => {
   const root = await mkdtemp("/tmp/relay-runtime-");
   let launcher: ReturnType<typeof spawn> | undefined;

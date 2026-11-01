@@ -1,7 +1,8 @@
 import { createConnection } from "node:net";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
-import { createReadStream } from "node:fs";
+import { openSync } from "node:fs";
+import { ReadStream as TerminalInput } from "node:tty";
 import {
   cp,
   mkdir,
@@ -41,12 +42,13 @@ const base =
     ? join(process.env.HOME!, "Library/Application Support/RelayNode")
     : "/var/lib/relay-node");
 let muted = false,
-  reader: ReturnType<typeof createInterface> | undefined;
+  reader: ReturnType<typeof createInterface> | undefined,
+  terminalInput: TerminalInput | undefined;
 async function ask(prompt: string, secret = false) {
   if (!reader) {
     const input = process.stdin.isTTY
       ? process.stdin
-      : createReadStream("/dev/tty");
+      : (terminalInput = new TerminalInput(openSync("/dev/tty", "r")));
     const output = new Writable({
       write(chunk, _encoding, done) {
         if (!muted) process.stdout.write(chunk);
@@ -378,4 +380,5 @@ try {
   process.exitCode = 1;
 } finally {
   reader?.close();
+  terminalInput?.destroy();
 }
