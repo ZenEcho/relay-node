@@ -13,7 +13,7 @@ import {
   readlink,
   stat,
 } from "node:fs/promises";
-import { createHash } from 'node:crypto';
+import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
@@ -83,7 +83,9 @@ test("install, menu commands, idle update, failed rebind and multiple instances 
     base = join(root, "instances with spaces");
   let control: any = { revision: 0, desiredState: "running" },
     blockers: any[] = [];
-  let heartbeats = 0, prepares = 0, reportedVersion = '';
+  let heartbeats = 0,
+    prepares = 0,
+    reportedVersion = "";
   const upstream = createServer(async (request, response) => {
     let raw = "";
     for await (const chunk of request) raw += chunk;
@@ -95,7 +97,8 @@ test("install, menu commands, idle update, failed rebind and multiple instances 
       return;
     }
     if (request.url === "/api/worker/heartbeat") {
-      heartbeats++; reportedVersion = body.version;
+      heartbeats++;
+      reportedVersion = body.version;
       response.end(JSON.stringify({ control, blockers, protocolVersion: 1 }));
     } else if (request.url === "/api/worker/poll") response.end("null");
     else if (request.url === "/api/worker/control") {
@@ -122,7 +125,10 @@ test("install, menu commands, idle update, failed rebind and multiple instances 
   const preload = join(root, "fetch.cjs");
   const route = join(root, "release-route.json");
   await saveJson(route, { release: { tag_name: "v0.1.0", assets: [] } });
-  await writeFile(preload, `const fs=require('node:fs');const original=global.fetch;global.fetch=async(url,options)=>{const value=String(url);if(value.startsWith('https://api.github.com/')){fs.writeFileSync(${JSON.stringify(fetchMarker)},'checked');return Response.json(JSON.parse(fs.readFileSync(${JSON.stringify(route)},'utf8')).release);}if(value.startsWith('https://github.com/ZenEcho/relay-node/releases/download/'))return new Response(fs.readFileSync(JSON.parse(fs.readFileSync(${JSON.stringify(route)},'utf8')).archive));return original(url,options);};`);
+  await writeFile(
+    preload,
+    `const fs=require('node:fs');const original=global.fetch;global.fetch=async(url,options)=>{const value=String(url);if(value.startsWith('https://api.github.com/')){fs.writeFileSync(${JSON.stringify(fetchMarker)},'checked');return Response.json(JSON.parse(fs.readFileSync(${JSON.stringify(route)},'utf8')).release);}if(value.startsWith('https://github.com/ZenEcho/relay-node/releases/download/'))return new Response(fs.readFileSync(JSON.parse(fs.readFileSync(${JSON.stringify(route)},'utf8')).archive));return original(url,options);};`,
+  );
   const env = {
     ...process.env,
     RELAY_NODE_HOME: base,
@@ -171,28 +177,80 @@ test("install, menu commands, idle update, failed rebind and multiple instances 
   await until(async () => control.update?.phase === "current");
   assert.equal(prepares, 1);
   assert.equal(control.desiredState, "paused");
-  const configBefore = await readFile(join(base,'one/config.json'),'utf8');
-  await mkdir(join(base,'one/audit'),{recursive:true});
-  await writeFile(join(base,'one/audit/preserved'),'encrypted-queue-sentinel');
+  const configBefore = await readFile(join(base, "one/config.json"), "utf8");
+  await mkdir(join(base, "one/audit"), { recursive: true });
+  await writeFile(
+    join(base, "one/audit/preserved"),
+    "encrypted-queue-sentinel",
+  );
   async function candidate(version: string, broken = false) {
-    const source = join(root,'candidate-'+version); await cp(release,source,{recursive:true});
-    await saveJson(join(source,'manifest.json'),{version,protocolVersion:1,platform:process.platform,arch:process.arch,nodeVersion:process.versions.node});
-    await writeFile(join(source,'VERSION'),version+'\n');
-    if(broken) await writeFile(join(source,'dist/apps/worker/src/entry.js'),"if(process.argv[2]==='--self-test')console.log('self test');else process.exit(2);");
-    const bytes = execFileSync('tar',['-czf','-','-C',source,'.']); const archive=join(root,'candidate-'+version+'.tar.gz'); await writeFile(archive,bytes);
-    const name=`relay-node-${version}-${process.platform}-${process.arch}.tar.gz`;
-    await saveJson(route,{archive,release:{tag_name:'v'+version,assets:[{name,digest:'sha256:'+createHash('sha256').update(bytes).digest('hex'),browser_download_url:`https://github.com/ZenEcho/relay-node/releases/download/v${version}/${name}`} ]}});
+    const source = join(root, "candidate-" + version);
+    await cp(release, source, { recursive: true });
+    await saveJson(join(source, "manifest.json"), {
+      version,
+      protocolVersion: 1,
+      platform: process.platform,
+      arch: process.arch,
+      nodeVersion: process.versions.node,
+    });
+    await writeFile(join(source, "VERSION"), version + "\n");
+    if (broken)
+      await writeFile(
+        join(source, "dist/apps/worker/src/entry.js"),
+        "if(process.argv[2]==='--self-test')console.log('self test');else process.exit(2);",
+      );
+    const bytes = execFileSync("tar", ["-czf", "-", "-C", source, "."]);
+    const archive = join(root, "candidate-" + version + ".tar.gz");
+    await writeFile(archive, bytes);
+    const name = `relay-node-${version}-${process.platform}-${process.arch}.tar.gz`;
+    await saveJson(route, {
+      archive,
+      release: {
+        tag_name: "v" + version,
+        assets: [
+          {
+            name,
+            digest:
+              "sha256:" + createHash("sha256").update(bytes).digest("hex"),
+            browser_download_url: `https://github.com/ZenEcho/relay-node/releases/download/v${version}/${name}`,
+          },
+        ],
+      },
+    });
   }
-  await candidate('0.2.0'); await run('check_update');
-  await until(async()=>control.update?.phase==='completed' && reportedVersion==='0.2.0',25000);
-  assert.equal(control.desiredState,'paused');
-  assert.equal(await readFile(join(base,'one/config.json'),'utf8'),configBefore);
-  assert.equal(await readFile(join(base,'one/audit/preserved'),'utf8'),'encrypted-queue-sentinel');
-  await candidate('0.3.0',true); await run('check_update');
-  await until(async()=>control.update?.phase==='rolled_back' && reportedVersion==='0.2.0',25000);
-  assert.equal(control.desiredState,'paused');
-  assert.equal(await readFile(join(base,'one/config.json'),'utf8'),configBefore);
-  await until(async()=>JSON.parse(await readFile(join(base,'one/status.json'),'utf8')).control?.update?.phase==='rolled_back');
+  await candidate("0.2.0");
+  await run("check_update");
+  await until(
+    async () =>
+      control.update?.phase === "completed" && reportedVersion === "0.2.0",
+    25000,
+  );
+  assert.equal(control.desiredState, "paused");
+  assert.equal(
+    await readFile(join(base, "one/config.json"), "utf8"),
+    configBefore,
+  );
+  assert.equal(
+    await readFile(join(base, "one/audit/preserved"), "utf8"),
+    "encrypted-queue-sentinel",
+  );
+  await candidate("0.3.0", true);
+  await run("check_update");
+  await until(
+    async () =>
+      control.update?.phase === "rolled_back" && reportedVersion === "0.2.0",
+    25000,
+  );
+  assert.equal(control.desiredState, "paused");
+  assert.equal(
+    await readFile(join(base, "one/config.json"), "utf8"),
+    configBefore,
+  );
+  await until(
+    async () =>
+      JSON.parse(await readFile(join(base, "one/status.json"), "utf8")).control
+        ?.update?.phase === "rolled_back",
+  );
   const reply = await new Promise<any>(async (resolve, reject) => {
     const socket = createConnection(await managementSocket(join(base, "one")));
     let data = "";

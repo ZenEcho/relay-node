@@ -11,6 +11,7 @@ for (const args of [
   const r = spawnSync(go, args, {
     cwd: new URL("../native/transport", import.meta.url),
     stdio: "inherit",
+    env: { ...process.env, CGO_ENABLED: "0" },
   });
   if (r.error) {
     console.error("请安装 Go 1.26+ 或设置 GO_BINARY。");

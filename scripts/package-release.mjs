@@ -7,6 +7,8 @@ const nodeVersion = "24.22.1",
   platform = process.platform,
   arch = process.arch;
 const stage = resolve("release/stage");
+const nativeSettings = execFileSync(process.env.GO_BINARY || "go", ["version", "-m", "native/transport/relay-transport"], { encoding: "utf8" });
+if (!nativeSettings.includes("CGO_ENABLED=0")) throw new Error("Release transport must be built with CGO_ENABLED=0");
 await rm(stage, { recursive: true, force: true });
 await mkdir(join(stage, "runtime/bin"), { recursive: true });
 await mkdir(join(stage, "bin"));
