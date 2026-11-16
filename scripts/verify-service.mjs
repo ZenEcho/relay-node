@@ -71,6 +71,8 @@ try {
   const result = await invoke(["install", "--instance", instance]);
   console.log(result.stdout);
   await until(() => last?.transportReady === true);
+  if (!['on_demand', 'unavailable'].includes(last?.paymentRuntime))
+    throw Error('Managed service omitted the payment runtime capability');
   await invoke(["--instance", instance, "pause"]);
   await until(() => control.desiredState === "paused");
   await invoke(["--instance", instance, "resume"]);

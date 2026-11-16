@@ -1,4 +1,4 @@
-import { mkdir, rm, cp, readFile, writeFile, realpath } from 'node:fs/promises';
+import { access, mkdir, rm, cp, readFile, writeFile, realpath } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { resolve, join } from 'node:path';
@@ -19,6 +19,8 @@ await mkdir(join(stage, 'runtime/bin'), { recursive: true });
 await mkdir(join(stage, 'bin'));
 execFileSync('npm', ['run', 'build'], { stdio: 'inherit' });
 await cp('dist', join(stage, 'dist'), { recursive: true });
+for (const file of ['runtime/manager.js', 'browser/runtime.js', 'browser/configuration.js', 'browser/host.js'])
+  await access(join(stage, 'dist/apps/worker/src', file));
 await cp('bin', join(stage, 'bin'), { recursive: true });
 await cp('install.sh', join(stage, 'install.sh'));
 await mkdir(join(stage, 'scripts'));
