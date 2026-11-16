@@ -43,10 +43,18 @@ var hosts = map[string]bool{"chatgpt.com": true, "auth.openai.com": true, "api.s
 // Classify locally; never return raw errors containing proxy credentials or URLs.
 func transportErrorCode(err error) string {
 	detail := strings.ToLower(err.Error())
+	if status := proxyConnectStatus(err); status != 0 {
+		switch status {
+		case 403:
+			return "PROXY_FORBIDDEN"
+		case 407:
+			return "PROXY_AUTH_REQUIRED"
+		default:
+			return "PROXY_CONNECT_FAILED"
+		}
+	}
 	switch {
-	case strings.Contains(detail, "proxy responded with non 200 code: 403"):
-		return "PROXY_FORBIDDEN"
-	case strings.Contains(detail, "proxy responded with non 200 code: 407"), strings.Contains(detail, "username/password authentication failed"), strings.Contains(detail, "no acceptable authentication methods"):
+	case strings.Contains(detail, "username/password authentication failed"), strings.Contains(detail, "no acceptable authentication methods"):
 		return "PROXY_AUTH_REQUIRED"
 	case strings.Contains(detail, "unexpected protocol version 72"):
 		// 'H' can start an HTTP access-denied page before SOCKS authentication.
@@ -66,13 +74,41 @@ func transportErrorCode(err error) string {
 		return "UPSTREAM_TLS_FAILED"
 	case strings.Contains(detail, "connection refused"), strings.Contains(detail, "network is unreachable"), strings.Contains(detail, "connection reset"):
 		return "UPSTREAM_CONNECTION_FAILED"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "UPSTREAM_CONNECTION_CLOSED"
 	default:
 		return "UPSTREAM_TRANSPORT_FAILED"
 	}
 }
 
+func newUpstreamRequest(input Request) (*http.Request, error) {
+	var body io.Reader = strings.NewReader(input.Body)
+	if input.Method == "POST" {
+		// NewRequest normally makes strings.Reader bodies replayable. A
+		// payment's idempotency header must not enable library-level replay
+		// after an ambiguous disconnect, even for an empty POST body. Empty
+		// POSTs use an empty chunked stream in HTTP/1.1; nonempty lengths stay exact.
+		body = io.NopCloser(strings.NewReader(input.Body))
+	}
+	request, err := http.NewRequest(input.Method, input.URL, body)
+	if err != nil {
+		return nil, err
+	}
+	if input.Method == "POST" {
+		request.GetBody = nil
+		if len(input.Body) > 0 {
+			request.ContentLength = int64(len(input.Body))
+		}
+	}
+	for k, v := range input.Headers {
+		request.Header.Set(k, v)
+	}
+	return request, nil
+}
+
 func main() {
 	var client tls.HttpClient
+	var observer *transportObserver
 	var domains = map[string]bool{}
 	var mutex sync.Mutex
 	scanner := bufio.NewScanner(os.Stdin)
@@ -90,17 +126,13 @@ func main() {
 			continue
 		}
 		if input.Method == "initialize" {
-			profile, ok := profileMap[input.Profile]
+			_, ok := profileMap[input.Profile]
 			if !ok {
 				send(map[string]any{"id": input.ID, "error": "unsupported TLS profile"})
 				continue
 			}
-			opts := []tls.HttpClientOption{tls.WithTimeoutSeconds(35), tls.WithClientProfile(profile), tls.WithCookieJar(tls.NewCookieJar()), tls.WithNotFollowRedirects()}
-			if input.Proxy != "" {
-				opts = append(opts, tls.WithProxyUrl(input.Proxy))
-			}
 			var err error
-			client, err = tls.NewHttpClient(tls.NewNoopLogger(), opts...)
+			client, observer, err = newObservedClient(input.Profile, input.Proxy)
 			if err != nil {
 				send(map[string]any{"id": input.ID, "error": "transport initialization failed"})
 				continue
@@ -128,6 +160,11 @@ func main() {
 			send(map[string]any{"id": input.ID, "error": "transport not initialized"})
 			continue
 		}
+		if input.Method == "reset_connections" {
+			client.CloseIdleConnections()
+			send(map[string]any{"id": input.ID, "ready": true})
+			continue
+		}
 		u, err := url.Parse(input.URL)
 		if err != nil || u.Scheme != "https" || !hosts[u.Hostname()] || u.User != nil || (u.Port() != "" && u.Port() != "443") {
 			send(map[string]any{"id": input.ID, "error": "target not permitted"})
@@ -137,17 +174,26 @@ func main() {
 			send(map[string]any{"id": input.ID, "error": "method not permitted"})
 			continue
 		}
-		request, err := http.NewRequest(input.Method, input.URL, strings.NewReader(input.Body))
+		request, err := newUpstreamRequest(input)
 		if err != nil {
 			send(map[string]any{"id": input.ID, "error": "request invalid"})
 			continue
 		}
-		for k, v := range input.Headers {
-			request.Header.Set(k, v)
-		}
+		diagnostic := observer.start()
+		request = diagnostic.attach(request)
 		response, err := client.Do(request)
+		if response != nil {
+			diagnostic.update(func(v *TransportDiagnostic) {
+				v.ResponseStarted = true
+				v.RequestWritten = true
+				v.Phase = "response_body"
+			})
+		}
 		if err != nil {
-			send(map[string]any{"id": input.ID, "error": "upstream transport failed", "code": transportErrorCode(err)})
+			if response != nil && response.Body != nil {
+				_ = response.Body.Close()
+			}
+			send(map[string]any{"id": input.ID, "error": "upstream transport failed", "code": transportErrorCode(err), "diagnostic": diagnostic.finish(err)})
 			continue
 		}
 		body, readErr := io.ReadAll(io.LimitReader(response.Body, 8*1024*1024+1))
@@ -157,8 +203,9 @@ func main() {
 			if len(body) > 8*1024*1024 {
 				code = "UPSTREAM_RESPONSE_TOO_LARGE"
 				body = body[:8*1024*1024]
+				readErr = errors.New("response limit reached")
 			}
-			send(map[string]any{"id": input.ID, "error": "response read failed", "code": code, "status": response.StatusCode, "headers": response.Header, "body": string(body), "partial": true})
+			send(map[string]any{"id": input.ID, "error": "response read failed", "code": code, "status": response.StatusCode, "headers": response.Header, "body": string(body), "partial": true, "diagnostic": diagnostic.finish(readErr)})
 			continue
 		}
 		domains[u.Hostname()] = true
@@ -173,6 +220,6 @@ func main() {
 				cookies = append(cookies, Cookie{c.Name, c.Value, domain, c.Path, c.Secure, expires})
 			}
 		}
-		send(map[string]any{"id": input.ID, "status": response.StatusCode, "headers": response.Header, "body": string(body), "cookies": cookies})
+		send(map[string]any{"id": input.ID, "status": response.StatusCode, "headers": response.Header, "body": string(body), "cookies": cookies, "diagnostic": diagnostic.finish(nil)})
 	}
 }

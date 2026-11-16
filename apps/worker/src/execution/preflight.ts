@@ -1,8 +1,7 @@
 import { inspectEgress } from '../../../../packages/runtime/src/egress.js';
-import {
-  bindBillingEmail,
-  selectBillingEmail,
-} from '../../../../packages/rules/src/billing-email.js';
+import { digest } from '../../../../packages/runtime/src/security.js';
+import { isIP } from 'node:net';
+import { bindBillingEmail, selectBillingEmail } from '../../../../packages/rules/src/billing-email.js';
 import { verifySessionIdentity } from './credentials.js';
 import { UpstreamError } from './http-utils.js';
 import type { ExecutionServices } from './services.js';
@@ -10,8 +9,7 @@ export async function preflightExecution(services: ExecutionServices) {
   if (!services.context.proxyVerified) {
     await services.checkpoint('proxy_check');
     const proxied =
-      services.context.environment.networkMode === 'proxy' ||
-      !!services.context.environment.proxyUrl;
+      services.context.environment.networkMode === 'proxy' || !!services.context.environment.proxyUrl;
     const result = await inspectEgress(async (input) => {
       try {
         return await services.request(proxied ? '检查本单代理出口' : '检查执行节点本机出口', input);
@@ -26,6 +24,28 @@ export async function preflightExecution(services: ExecutionServices) {
     services.context.exitCountry = result.country;
     services.context.proxyVerified = true;
   }
+  const exitIp = services.context.exitIp;
+  if (
+    typeof exitIp === 'string' &&
+    isIP(exitIp) &&
+    !/^[a-f0-9]{12}$/.test(services.context.exitFingerprint || '')
+  ) {
+    // A shared proxy gateway can assign different real exits. Correlate the
+    // verified exit without adding its address or location to diagnostic logs.
+    services.context.exitFingerprint = digest(exitIp).slice(0, 12);
+    await services.log({
+      name: '记录本单网络出口',
+      status: 'succeeded',
+      category: 'event',
+      response: {
+        exitFingerprint: services.context.exitFingerprint,
+        country: /^[A-Z]{2}$/.test(services.context.exitCountry || '')
+          ? services.context.exitCountry
+          : undefined,
+        networkMode: services.context.environment.proxyUrl ? 'proxy' : 'direct',
+      },
+    });
+  }
   if (
     !services.context.session?.accessToken ||
     (!services.context.billingEmailBinding &&
@@ -35,9 +55,7 @@ export async function preflightExecution(services: ExecutionServices) {
     verifySessionIdentity(services.context, refreshed);
     services.context.session = refreshed;
   }
-  services.context.billing ||= services.assignment.billing
-    ? { ...services.assignment.billing }
-    : null;
+  services.context.billing ||= services.assignment.billing ? { ...services.assignment.billing } : null;
   if (!services.context.billingEmailBinding) {
     const binding = bindBillingEmail(services.context, 'chatgpt', services.context.billing?.email);
     // This one-time checkpoint lets the controller validate the Session
@@ -65,9 +83,7 @@ export async function preflightExecution(services: ExecutionServices) {
     );
     const accounts = Object.values(info.accounts || {}) as any[];
     const selected = services.context.accountId
-      ? accounts.find(
-          (a) => (a.account?.account_id || a.account?.id) === services.context.accountId,
-        )
+      ? accounts.find((a) => (a.account?.account_id || a.account?.id) === services.context.accountId)
       : info.accounts?.default || accounts[0];
     const accountId = selected?.account?.account_id || selected?.account?.id;
     if (!accountId) throw new Error('订阅查询未返回原账号');

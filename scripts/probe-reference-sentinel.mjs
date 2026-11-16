@@ -34,7 +34,7 @@ if (option('--environment-file') && option('--proxy-file'))
 let privateEnvironment = {};
 if (environmentFile) {
   const info = await stat(environmentFile);
-  if (!info.isFile() || (process.platform !== 'win32' && (info.mode & 0o077)))
+  if (!info.isFile() || (process.platform !== 'win32' && info.mode & 0o077))
     throw new Error('环境配置必须是仅当前用户可读的私有文件（0600）');
   const content = (await readFile(environmentFile, 'utf8')).trim();
   if (content.startsWith('{')) {
@@ -47,7 +47,8 @@ if (environmentFile) {
   } else if (option('--proxy-file')) privateEnvironment = { proxyUrl: content };
   else throw new Error('--environment-file 需要 JSON 配置');
   if (
-    !privateEnvironment || typeof privateEnvironment !== 'object' ||
+    !privateEnvironment ||
+    typeof privateEnvironment !== 'object' ||
     (privateEnvironment.proxyUrl !== undefined && typeof privateEnvironment.proxyUrl !== 'string') ||
     (privateEnvironment.country !== undefined && !/^[a-z]{2}$/i.test(privateEnvironment.country))
   )
@@ -61,7 +62,15 @@ const context = {
   credential: JSON.stringify({ ...session, cookies }),
 };
 loadCredential(context);
-const transport = new NativeTransport(binary);
+const transportAttempts = new Map();
+const transport = new NativeTransport(binary, {
+  onAttempt(attempt) {
+    if (attempt.outcome !== 'running') {
+      transportAttempts.set(attempt.attemptId, attempt);
+      if (transportAttempts.size > 32) transportAttempts.delete(transportAttempts.keys().next().value);
+    }
+  },
+});
 const authorize = createReferenceSentinelAuthorizer(context, {
   bridgePath: resolve(bridgePath),
   ...(option('--version') ? { version: option('--version') } : {}),
@@ -121,8 +130,10 @@ const get = (path) =>
 const fail = (stage) => {
   throw Object.assign(new Error('预检未通过'), { stage });
 };
+let currentStage = 'transport_initialize';
 try {
   await transport.initialize(context.environment);
+  currentStage = 'account_check';
   const accountResponse = await get('/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-480');
   const account = Object.values(accountResponse.data?.accounts || {}).find(
     (a) => (a.account?.account_id || a.account?.id) === context.accountId,
@@ -166,6 +177,7 @@ try {
     };
   }
   for (const flow of ['chatgpt_checkout', 'checkout_session_approval']) {
+    currentStage = 'sentinel_authorization';
     report.currentFlow = flow;
     console.log(JSON.stringify({ event: 'sentinel_flow_started', flow }));
     await authorizeSentinel(context, flow, 'https://chatgpt.com/', authorize);
@@ -175,14 +187,17 @@ try {
   if (process.argv.includes('--verify-checkout')) {
     if (account.entitlement?.has_active_subscription !== false) fail('subscription_not_free');
     const country = context.environment.country;
+    currentStage = 'pricing';
     const pricing = await get('/backend-api/checkout_pricing_config/configs/' + country);
     const pricingCurrency = pricing.data?.currency_config?.symbol_code;
     if (pricing.status !== 200 || typeof pricingCurrency !== 'string' || !/^[a-z]{3}$/i.test(pricingCurrency))
       fail('pricing');
     const currency = pricingCurrency.toUpperCase();
     report.pricingCurrency = currency;
+    currentStage = 'sentinel_authorization';
     await authorizeSentinel(context, 'chatgpt_checkout', 'https://chatgpt.com/', authorize);
     const path = '/backend-api/payments/checkout';
+    currentStage = 'merchant_checkout';
     const response = await transport.request({
       method: 'POST',
       url: 'https://chatgpt.com' + path,
@@ -236,6 +251,7 @@ try {
     if (typeof processor !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(processor))
       fail('checkout_processor');
     context.checkout = { id, processor_entity: processor };
+    currentStage = 'checkout_read';
     const checkoutResponse = await get('/backend-api/payments/checkout/' + processor + '/' + id);
     report.checkoutReadHttpStatus = checkoutResponse.status;
     const snapshot = checkoutResponse.data?.checkout_session || checkoutResponse.data;
@@ -267,7 +283,16 @@ try {
     if (option('--checkout-file')) {
       await writeFile(
         option('--checkout-file'),
-        JSON.stringify({ checkoutId: id, checkoutUrl, currency: report.currency, ...(amount !== undefined ? { amountMinor: amount } : {}) }, null, 2) + '\n',
+        JSON.stringify(
+          {
+            checkoutId: id,
+            checkoutUrl,
+            currency: report.currency,
+            ...(amount !== undefined ? { amountMinor: amount } : {}),
+          },
+          null,
+          2,
+        ) + '\n',
         { mode: 0o600, flag: 'wx' },
       );
       report.paymentLinkSaved = true;
@@ -276,12 +301,16 @@ try {
 } catch (error) {
   report.errorCode =
     typeof error?.code === 'string' && /^[A-Z_]{3,60}$/.test(error.code) ? error.code : 'PROBE_FAILED';
-  report.failureStage =
-    error?.stage || (report.sentinelIssued ? 'checkout_verification' : 'sentinel_authorization');
+  report.failureStage = error?.stage || currentStage;
+  if (error?.diagnostic) report.transportFailureDiagnostic = error.diagnostic;
   process.exitCode = 1;
 } finally {
   transport.close();
   report.transportClosed = true;
+  report.transportAttempts = [...transportAttempts.values()];
+  report.transportRetryCount = report.transportAttempts.filter(
+    (attempt) => attempt.outcome === 'retrying',
+  ).length;
   if (option('--report'))
     await writeFile(option('--report'), JSON.stringify(report, null, 2) + '\n', { mode: 0o600 });
   console.log(JSON.stringify(report));

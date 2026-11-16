@@ -17,6 +17,11 @@ import { billingPostalCodeOptional } from '../../../../packages/rules/src/billin
 import { authorizeSentinel } from './sentinel.js';
 import type { RuntimeContext } from '../../../../packages/contracts/src/execution.js';
 import type { StripeTokenProvider } from '../../../../packages/contracts/src/stripe.js';
+import {
+  transportAttempt,
+  transportAttempts,
+  transportDiagnostic,
+} from '../../../../packages/runtime/src/transport-diagnostics.js';
 const CHAT = 'https://chatgpt.com',
   STRIPE = 'https://api.stripe.com';
 const STRIPE_VERSION = '2025-03-31.basil';
@@ -94,6 +99,10 @@ export class ProtocolEngine {
         environmentId: environment.id,
         profile: environment.profile,
         country: environment.country,
+        exitFingerprint: /^[a-f0-9]{12}$/.test(this.context.exitFingerprint || '')
+          ? this.context.exitFingerprint
+          : undefined,
+        exitCountry: /^[A-Z]{2}$/.test(this.context.exitCountry || '') ? this.context.exitCountry : undefined,
         networkMode: environment.networkMode || (environment.proxyUrl ? 'proxy' : 'direct'),
         proxyUrl: environment.proxyUrl,
         cookieNames: environment.cookies.map((cookie) => cookie.name),
@@ -103,12 +112,55 @@ export class ProtocolEngine {
         const backoff = this.context.retryAfterByOrigin?.[origin];
         if (backoff && backoff > Date.now())
           throw new UpstreamError('上游仍在退避期限内，只保留原付款', 429, null);
-        const output = await this.transport.request(input);
+        const output = await this.transport.request(input, {
+          onAttempt: async (attempt) => {
+            const event = transportAttempt(attempt);
+            if (!event) return;
+            await this.log({
+              traceId: event.attemptId,
+              name: '原生 HTTP 传输尝试',
+              category: 'http',
+              status:
+                event.outcome === 'running'
+                  ? 'running'
+                  : event.outcome === 'succeeded' && (!event.httpStatus || event.httpStatus < 400)
+                    ? 'succeeded'
+                    : 'failed',
+              startedAt: event.startedAt,
+              ...(event.completedAt
+                ? {
+                    completedAt: event.completedAt,
+                    durationMs: event.elapsedMs,
+                  }
+                : {}),
+              request: {
+                requestId: event.requestId,
+                attempt: event.attempt,
+                method: event.method,
+                targetHost: event.targetHost,
+              },
+              response: event,
+              httpStatus: event.httpStatus,
+              ...(event.errorCode
+                ? {
+                    error: event.errorCode,
+                    errorDetail: {
+                      code: event.errorCode,
+                      transportDiagnostic: event.diagnostic,
+                      retryStopReason: event.retryStopReason,
+                    },
+                  }
+                : {}),
+            });
+          },
+        });
         capture(
           {
             status: output.status,
             headers: output.headers,
             body: output.data ?? output.body,
+            diagnostic: transportDiagnostic(output.diagnostic),
+            transportAttempts: transportAttempts(output.transportAttempts),
           },
           output.status,
         );

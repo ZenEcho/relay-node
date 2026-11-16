@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { cleanText } from './security.js';
 import type { Step } from '../../contracts/src/execution.js';
+import { transportDiagnostic, transportAttempts } from './transport-diagnostics.js';
 
 // Audit payloads have explicit limits. Never silently drop an oversized response.
 const sensitive =
@@ -17,8 +18,7 @@ function safeUrl(value: string) {
         url.password = '';
       }
       for (const key of [...url.searchParams.keys()])
-        if (secretParameter.test(key) || sensitive.test(key))
-          url.searchParams.set(key, '[REDACTED]');
+        if (secretParameter.test(key) || sensitive.test(key)) url.searchParams.set(key, '[REDACTED]');
       if (/access|token|secret|session/i.test(url.hash)) url.hash = '[REDACTED]';
       return url.href;
     } catch {
@@ -41,8 +41,7 @@ export function auditRedact(value: unknown): any {
           for (const item of [url.username, url.password])
             if (item.length >= 4) secrets.add(decodeURIComponent(item));
           for (const [key, item] of url.searchParams)
-            if ((secretParameter.test(key) || sensitive.test(key)) && item.length >= 4)
-              secrets.add(item);
+            if ((secretParameter.test(key) || sensitive.test(key)) && item.length >= 4) secrets.add(item);
         } catch {}
       }
       return;
@@ -84,8 +83,7 @@ export function auditRedact(value: unknown): any {
         if (remaining <= 0) break;
         result.push(visit(item, depth + 1));
       }
-      if (result.length < v.length)
-        result.push(`[TRUNCATED: ${v.length - result.length} remaining items]`);
+      if (result.length < v.length) result.push(`[TRUNCATED: ${v.length - result.length} remaining items]`);
       return result;
     }
     if (v && typeof v === 'object') {
@@ -103,8 +101,7 @@ export function auditRedact(value: unknown): any {
           configurable: true,
         });
       }
-      if (entries.length > 1000)
-        result._truncated = `[TRUNCATED: ${entries.length - 1000} remaining fields]`;
+      if (entries.length > 1000) result._truncated = `[TRUNCATED: ${entries.length - 1000} remaining fields]`;
       return result;
     }
     remaining -= 16;
@@ -128,6 +125,8 @@ export function auditError(error: unknown, depth = 0): any {
     hostname: e?.hostname,
     address: e?.address,
     port: e?.port,
+    ...(e?.diagnostic ? { transportDiagnostic: transportDiagnostic(e.diagnostic) } : {}),
+    ...(e?.transportAttempts ? { transportAttempts: transportAttempts(e.transportAttempts) } : {}),
     ...(e?.cause ? { cause: auditError(e.cause, depth + 1) } : {}),
   });
 }
@@ -138,15 +137,12 @@ export function auditRequest(input: {
   body?: string;
   [key: string]: any;
 }) {
-  const type = Object.entries(input.headers || {}).find(
-    ([key]) => key.toLowerCase() === 'content-type',
-  )?.[1];
+  const type = Object.entries(input.headers || {}).find(([key]) => key.toLowerCase() === 'content-type')?.[1];
   let body: any = input.body;
   if (body && String(type).includes('application/x-www-form-urlencoded')) {
     body = {};
     for (const [key, value] of new URLSearchParams(input.body))
-      body[key] =
-        key in body ? [...(Array.isArray(body[key]) ? body[key] : [body[key]]), value] : value;
+      body[key] = key in body ? [...(Array.isArray(body[key]) ? body[key] : [body[key]]), value] : value;
   } else if (body) {
     try {
       body = JSON.parse(body);
