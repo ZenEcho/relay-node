@@ -1,3 +1,5 @@
+import { SystemMonitor } from '../../../../packages/runtime/src/system-metrics.js';
+import { pollBatch } from './poll-batch.js';
 import { readManifest } from './manifest.js';
 import { updateActive } from '../../../../packages/rules/src/node-control.js';
 import { createServer } from 'node:net';
@@ -97,8 +99,9 @@ export async function runManager(root: string) {
     inFlightCount: pending.size,
     runtimeState: upgrading ? 'updating' : status.control?.desiredState || 'running',
   });
+  const monitor = new SystemMonitor(root);
   const heartbeat = async () => {
-    const value = await controller.request('heartbeat', metadata());
+    const value = await controller.request('heartbeat', { ...metadata(), metrics: await monitor.sample() });
     cancellations.apply(value.cancelledRuns);
     return value;
   };
@@ -342,11 +345,11 @@ export async function runManager(root: string) {
           !upgrading &&
           ready &&
           !state.commands.length &&
-          pending.size < 100 &&
           !(updateActive(updateStatus) && !['queued', 'draining'].includes(updateStatus.phase))
         ) {
-          const assignment = await controller.request('poll');
-          if (assignment) {
+          await pollBatch(
+            () => controller.request('poll'),
+            (assignment: import('../../../../packages/contracts/src/execution.js').Assignment) => {
             const handle = cancellations.register(assignment.run.id, assignment.run.workerLease);
             if (handle && !handle.controller.signal.aborted) {
               const task = executeWithOnDemandSdk(
@@ -365,7 +368,9 @@ export async function runManager(root: string) {
                 });
               pending.add(task);
             } else handle?.dispose();
-          }
+            },
+            () => !stopping && !upgrading && ready && !state.commands.length,
+          );
         }
       } catch {
         authenticated = false;

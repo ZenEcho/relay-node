@@ -12,4 +12,5 @@ export * from './packages/runtime/src/security.js';
 export * from './packages/runtime/src/audit.js';
 export * from './packages/runtime/src/environment.js';
 export * from './packages/runtime/src/egress.js';
+export * from './packages/runtime/src/system-metrics.js';
 export type * from './contracts.js';

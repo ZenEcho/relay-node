@@ -37,6 +37,7 @@ export type NodeControl = {
 };
 
 export type WorkerMetadata = {
+  metrics?: import('../../runtime/src/system-metrics.js').SystemMetrics;
   version: string;
   protocolVersion: number;
   platform: string;
