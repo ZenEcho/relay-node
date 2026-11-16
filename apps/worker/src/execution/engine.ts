@@ -1,4 +1,9 @@
-import { hostedPublishableKey, prepareHostedCheckout, submitHostedCheckout } from './hosted-checkout.js';
+import {
+  hostedPublishableKey,
+  referenceHostedKey,
+  prepareHostedCheckout,
+  submitHostedCheckout,
+} from './hosted-checkout.js';
 import type { SentinelFlow, SentinelAuthorizer } from '../../../../packages/contracts/src/sentinel.js';
 import type { ExecutionServices } from './services.js';
 import { preflightExecution } from './preflight.js';
@@ -418,7 +423,8 @@ export class ProtocolEngine {
                 this.context.snapshot.url || this.context.checkout!.url,
                 this.context.checkout!.id,
               )
-            : undefined);
+            : undefined) ||
+          (this.context.checkoutMode === 'hosted' ? referenceHostedKey : undefined);
         if (!this.context.key)
           this.context.key = (
             await this.chat('读取付款组件配置', '/backend-api/payments/stripe_client_bootstrap', {})
@@ -431,6 +437,7 @@ export class ProtocolEngine {
           this.context.snapshot.url || this.context.checkout!.url,
           this.context.checkout!.id,
         );
+        this.context.key ||= referenceHostedKey;
         await prepareHostedCheckout(this.services);
       }
       const amount =

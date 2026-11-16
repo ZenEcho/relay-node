@@ -3,6 +3,9 @@ import { form } from './http-utils.js';
 import type { ExecutionServices } from './services.js';
 
 const VERSION = '2025-03-31.basil; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1';
+// Public merchant key from oa-pay-protocol-go; the original payment page must accept it before card access.
+export const referenceHostedKey =
+  'pk_live_51HOrSwC6h1nxGoI3lTAgRjYVrz4dU3fVOabyCcKR3pbEJguCVAlqCxdxCUvoRh1XWwRacViovU3kLKvpkjh7IqkW00iXQsjo3n';
 const CHAT = 'https://chatgpt.com';
 
 // Hosted URLs carry Stripe's public client configuration (base64, XOR 5).

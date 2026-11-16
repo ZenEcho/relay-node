@@ -107,6 +107,8 @@ async function execute(
     card?: { number: string; expiry: string; cvc: string; lastFour?: string };
     nestedTaxQuote?: boolean;
     hostedUrlConfig?: boolean;
+    hostedKeyMissing?: boolean;
+    hostedPageStatus?: number;
     credentialUserEmail?: string;
     refreshedUserEmail?: string;
     defaultBillingEmail?: string;
@@ -213,12 +215,14 @@ async function execute(
         response.data.checkout_session.stripe_account = options.stripeAccount;
         return response;
       }
-      if (url.pathname.endsWith('/checkout/taxes') && options.hostedUrlConfig) {
+      if (url.pathname.endsWith('/checkout/taxes') && (options.hostedUrlConfig || options.hostedKeyMissing)) {
         const response = await super.request(input);
         const c = response.data.checkout_session;
         const bytes = Buffer.from(JSON.stringify({ apiKey: c.publishable_key }));
         for (let i = 0; i < bytes.length; i++) bytes[i] ^= 5;
-        c.url = 'https://checkout.stripe.com/c/pay/' + c.id + '#' + bytes.toString('base64');
+        c.url = options.hostedUrlConfig
+          ? 'https://checkout.stripe.com/c/pay/' + c.id + '#' + bytes.toString('base64')
+          : undefined;
         delete c.publishable_key;
         return response;
       }
@@ -248,6 +252,13 @@ async function execute(
             data: options.tokenData || {},
           };
       }
+      if (url.pathname.startsWith('/v1/payment_pages/') && input.method === 'GET' && options.hostedPageStatus)
+        return {
+          status: options.hostedPageStatus,
+          headers: {},
+          body: '',
+          data: { error: { message: 'original page key rejected' } },
+        };
       if (url.pathname.endsWith('/checkout') && options.returnedCheckoutId)
         return {
           status: 200,
@@ -993,4 +1004,32 @@ test('hosted takes the public Stripe key from its own returned URL without a boo
   assert.equal(result.finish.status, 'completed', result.finish.error);
   assert.equal(result.assignment.context.key, 'pk_test_demo');
   assert.ok(!result.requests.some((r) => r.url.endsWith('/stripe_client_bootstrap')));
+});
+
+test('hosted without returned public configuration validates the reference key on the original page before card access', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    checkoutMode: 'hosted',
+    hostedKeyMissing: true,
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  assert.match(result.assignment.context.key!, /^pk_live_/);
+  assert.ok(!result.requests.some((r) => r.url.endsWith('/stripe_client_bootstrap')));
+  const page = result.requests.findIndex((r) => r.url.includes('/v1/payment_pages/') && r.method === 'GET');
+  const token = result.requests.findIndex((r) => r.url.endsWith('/confirmation_tokens'));
+  assert.ok(page >= 0 && token > page);
+});
+
+test('Stripe rejecting the reference hosted key stops before card assignment or payment authorization', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    checkoutMode: 'hosted',
+    hostedKeyMissing: true,
+    hostedPageStatus: 404,
+  });
+  assert.equal(result.finish.status, 'failed');
+  assert.equal(result.assignment.run.paymentSubmitted, false);
+  assert.ok(!result.commands.some((c) => c.action === 'card' || c.action === 'authorize'));
 });
