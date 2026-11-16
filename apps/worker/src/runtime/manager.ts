@@ -99,10 +99,32 @@ export async function runManager(root: string) {
     inFlightCount: pending.size,
     runtimeState: upgrading ? 'updating' : status.control?.desiredState || 'running',
   });
-  const monitor = new SystemMonitor(root);
+  let monitor: SystemMonitor | undefined;
+  let metricsTask: Promise<unknown> | undefined;
+  let metricsController: AbortController | undefined;
+  const stopMetrics = () => {
+    monitor = undefined;
+    metricsController?.abort();
+  };
   const heartbeat = async () => {
-    const value = await controller.request('heartbeat', { ...metadata(), metrics: await monitor.sample() });
+    const value = await controller.request('heartbeat', metadata());
     cancellations.apply(value.cancelledRuns);
+    if (value.metricsRequested === true) {
+      // Optional monitoring must not hold up heartbeat, cancellation or order polling.
+      if (!metricsTask) {
+        const target = controller;
+        const signal = (metricsController = new AbortController()).signal;
+        metricsTask = (monitor ??= new SystemMonitor(root))
+          .sample()
+          .then((metrics) =>
+            target.request('metrics', metrics, AbortSignal.any([signal, AbortSignal.timeout(3000)])),
+          )
+          .catch(() => {})
+          .finally(() => {
+            metricsTask = undefined;
+          });
+      }
+    } else stopMetrics();
     return value;
   };
   async function update(id: string) {
@@ -219,6 +241,7 @@ export async function runManager(root: string) {
           await replacement.initializeLogs();
           await saveJson(join(root, 'config.json'), candidate);
           config = candidate;
+          stopMetrics();
           controller = replacement;
           return { ok: true };
         }
@@ -373,6 +396,7 @@ export async function runManager(root: string) {
           );
         }
       } catch {
+        stopMetrics();
         authenticated = false;
         console.error('控制台暂不可用；停止领取新任务，保留原节点状态');
       }
@@ -382,6 +406,7 @@ export async function runManager(root: string) {
     await upgrading;
     await controller.flushLogs();
   } finally {
+    stopMetrics();
     server.close();
     await rm(socket, { force: true });
     await rm(lock, { recursive: true, force: true });

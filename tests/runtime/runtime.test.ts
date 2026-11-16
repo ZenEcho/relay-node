@@ -138,6 +138,8 @@ test('install, menu commands, idle update, failed rebind and multiple instances 
   let control: any = { revision: 0, desiredState: 'running' },
     blockers: any[] = [];
   let heartbeats = 0,
+    metricsRequested = false,
+    metricReports = 0,
     prepares = 0,
     reportedVersion = '';
   const upstream = createServer(async (request, response) => {
@@ -151,9 +153,15 @@ test('install, menu commands, idle update, failed rebind and multiple instances 
       return;
     }
     if (request.url === '/api/worker/heartbeat') {
+      assert.equal(body.metrics, undefined, 'normal heartbeats carry no resource samples');
       heartbeats++;
       reportedVersion = body.version;
-      response.end(JSON.stringify({ control, blockers, protocolVersion: 1 }));
+      response.end(JSON.stringify({ control, blockers, protocolVersion: 1, metricsRequested }));
+    } else if (request.url === '/api/worker/metrics') {
+      metricReports++;
+      assert.ok(body.cpu.cores > 0);
+      assert.ok(body.memory.total > 0);
+      response.end('{"ok":true}');
     } else if (request.url === '/api/worker/poll') response.end('null');
     else if (request.url === '/api/worker/control') {
       control.revision++;
@@ -210,6 +218,16 @@ test('install, menu commands, idle update, failed rebind and multiple instances 
         () => false,
       )),
   );
+  assert.equal(metricReports, 0, 'idle nodes do not collect or upload metrics');
+  metricsRequested = true;
+  await until(async () => metricReports >= 2);
+  metricsRequested = false;
+  const beforeStop = heartbeats;
+  await until(async () => heartbeats > beforeStop + 1);
+  const reportsAfterStop = metricReports;
+  const afterStop = heartbeats;
+  await until(async () => heartbeats > afterStop + 1);
+  assert.equal(metricReports, reportsAfterStop, 'closing the last viewer stops monitoring while heartbeats continue');
   const run = (action: string) => exec(process.execPath, [cli, '--instance', 'one', action], { env });
   await run('pause');
   await until(async () => control.desiredState === 'paused');
