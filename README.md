@@ -52,11 +52,13 @@ import { createBrowserSentinelAuthorizer } from '@relay/node/browser';
 
 源码按 `execution/`、`browser/`、`transport/`、`runtime/` 分工，命令行与安装入口保留在 worker 根目录。`packages/contracts`、`packages/rules`、`packages/runtime` 分别提供协议、纯函数和 Node 基础设施；测试按相同职责分组，开发探针集中在 `scripts/probes/`。开发依赖使用 npm 与唯一的 package-lock.json。
 
-SDK 的 `createBrowserSentinelAuthorizer(execute)` 可配合现有可信扩展，在匹配本单账号、设备和页面的真实登录文档中调用官方 Sentinel SDK。主令牌和 SO 的 flow 分开处理，保持 SDK 原始值；运行期间身份改变、SDK 未就绪或超时会停止。该模块不创建浏览器、不导入登录凭证、不模拟设备或求解挑战；`execute` 需由已有授权运行时提供。独立节点默认使用下述 reference Sentinel；Chrome/Chromium 仅在 Stripe 官方组件需要时按单启动，结束或进入 CDK 验证等待后关闭。原单只读核对和收尾不启动浏览器。可在实例 config.json 的 officialSdk 中指定浏览器 executablePath 和 headless，默认 Linux 无界面、macOS 临时有界面。显式配置 `sentinel.mode: "official"` 时保留原官方登录页 SDK 路径；后端 HTTP 引擎继续负责付款确认和收尾。
+独立节点默认通过 HTTP API 创建 Stripe confirmation token、确认原结账和原 PaymentIntent，使用下述 reference Sentinel，不启动 Chrome/Chromium。卡片资料仅在节点内存中准备，通过本单冻结代理发往 Stripe，不写入检查点或日志；付款开关、逐次派发授权与付款结果核对仍由原执行流程处理。
+
+SDK 的 `createBrowserSentinelAuthorizer(execute)` 可配合现有可信扩展，在匹配本单账号、设备和页面的真实登录文档中调用官方 Sentinel SDK。主令牌和 SO 的 flow 分开处理，保持 SDK 原始值；运行期间身份改变、SDK 未就绪或超时会停止。该模块不创建浏览器、不导入登录凭证、不模拟设备或求解挑战；`execute` 需由已有授权运行时提供。显式配置 `sentinel.mode: "official"` 时，Sentinel 授权仍使用临时浏览器，可在实例 config.json 的 officialSdk 中指定 executablePath 和 headless。显式注入的 StripeTokenProvider 与浏览器页面动作继续保留，默认节点不使用它们。
 
 ## 后端 Sentinel 参考运行时
 
-节点默认使用 [gpt-subscribe-studio-1](https://github.com/crhywun/gpt-subscribe-studio-1/tree/adccdfc993e368f2c09bad7081885c6daff2d320) 的 Node VM、浏览器环境 shim 和 PoW 方案。Sentinel 由后端 reference 桥签发，浏览器仅在需要 Stripe 官方组件时启动。正式节点包与 SDK 已包含固定校验的参考桥及 undici；新安装节点自动配置 `reference`，未配置 Sentinel 的旧节点更新后使用新版随包参考桥。安装和更新无需系统 npm。参考桥失败或缺失会停止，不会自动切换模式、代理或账号。
+节点默认使用 [gpt-subscribe-studio-1](https://github.com/crhywun/gpt-subscribe-studio-1/tree/adccdfc993e368f2c09bad7081885c6daff2d320) 的 Node VM、浏览器环境 shim 和 PoW 方案。Sentinel 由后端 reference 桥签发，Stripe 令牌由 HTTP API 创建。正式节点包与 SDK 已包含固定校验的参考桥及 undici；新安装节点自动配置 `reference`，未配置 Sentinel 的旧节点更新后使用新版随包参考桥。安装和更新无需系统 npm。参考桥失败或缺失会停止，不会自动切换模式、代理或账号。
 
 如需指定独立参考运行时，可用系统 Node.js 24 和 npm 安装：
 
@@ -77,7 +79,7 @@ node scripts/install-reference-sentinel.mjs --directory /absolute/path/reference
 
 暂停并排空原任务后重启节点服务，使配置生效。外部桥是本机明确选择的可信程序，适配器通过 stdin 传入本单 UA、设备、Cookie、代理、页面和 flow；核对输出绑定，限制时间/输出，回收子进程，不记录授权内容。SO 可空，参考桥的 SO 使用当前主 flow；浏览器适配器仍使用官方 SDK 自己返回的 flow。参考 SDK 是固定版本，站点协议改变时需要更新并重新验收。
 
-新环境固定使用原生组件支持的 Chrome 146 TLS/UA，避免随机旧 Chrome 档案触发站点 challenge。已有订单的环境不改写。节点仍需 Chrome 供 Stripe 使用，管理器同时检查浏览器与参考桥可读性。
+新环境固定使用原生组件支持的 Chrome 146 TLS/UA，已有订单的环境不改写。默认 reference 模式只检查参考桥及其依赖；只有显式 official Sentinel 模式需要可执行的 Chrome/Chromium。
 
 独立预检默认只核对原账号并签发两个 flow；可用 `--sdk-root` 指定安装节点。额外传 `--verify-checkout` 才创建一个未付款 Plus 结账并核验商户接受情况，始终不取卡、不确认付款：
 

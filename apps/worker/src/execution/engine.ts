@@ -435,8 +435,6 @@ export class ProtocolEngine {
       if (!this.context.confirmationToken) {
         await this.checkpoint('card_preparation');
         await this.requireSentinel('chatgpt_checkout');
-        if (!this.assignment.demo && !this.stripeTokenProvider)
-          throw new Error('此商户卡片准备需要官方 Stripe SDK，请连接 SDK 组件后继续');
         const card = await this.command('card');
         try {
           if (this.stripeTokenProvider) {
@@ -465,9 +463,22 @@ export class ProtocolEngine {
               throw new Error('官方 Stripe SDK 返回的令牌或卡片尾号不匹配');
             this.context.confirmationToken = token.id;
           } else {
-            const [month, yearText] = String(card.expiry).split(/[\/-]/);
-            const year = yearText?.length === 2 ? '20' + yearText : yearText;
-            if (!month || !year) throw new Error('卡片有效期格式不支持');
+            const number = String(card.number || '').replace(/[ -]/g, ''),
+              cvc = String(card.cvc || ''),
+              lastFour = card.lastFour || number.slice(-4);
+            const expiry = String(card.expiry || '').match(/^(\d{1,2})\s*[\/-]\s*(\d{2}|\d{4})$/);
+            if (
+              !/^\d{13,19}$/.test(number) ||
+              !/^\d{4}$/.test(lastFour) ||
+              !number.endsWith(lastFour) ||
+              !/^\d{3,4}$/.test(cvc) ||
+              !expiry ||
+              Number(expiry[1]) < 1 ||
+              Number(expiry[1]) > 12
+            )
+              throw new Error('本单卡片资料不完整或卡片尾号不匹配');
+            const month = expiry[1].padStart(2, '0'),
+              year = expiry[2].length === 2 ? '20' + expiry[2] : expiry[2];
             const fields: Record<string, any> = {
               key: this.context.key,
               _stripe_version: STRIPE_VERSION,
@@ -475,8 +486,8 @@ export class ProtocolEngine {
               'payment_method_data[guid]': this.context.environment.stripeIds.guid,
               'payment_method_data[muid]': this.context.environment.stripeIds.muid,
               'payment_method_data[sid]': this.context.environment.stripeIds.sid,
-              'payment_method_data[card][number]': card.number,
-              'payment_method_data[card][cvc]': card.cvc,
+              'payment_method_data[card][number]': number,
+              'payment_method_data[card][cvc]': cvc,
               'payment_method_data[card][exp_month]': month,
               'payment_method_data[card][exp_year]': year,
               'payment_method_data[allow_redisplay]': 'limited',
@@ -489,6 +500,10 @@ export class ProtocolEngine {
               'payment_method_data[billing_details][address][state]': billing.state,
               'payment_method_data[billing_details][address][postal_code]': billing.postalCode,
               'payment_method_data[billing_details][address][country]': billing.country,
+              'client_context[currency]': this.context.snapshot.currency,
+              'client_context[mode]': this.context.snapshot.mode || 'subscription',
+              'client_context[payment_method_types][0]': 'card',
+              'client_context[customer]': this.context.snapshot.customer,
               setup_future_usage: 'off_session',
               set_as_default_payment_method: 'false',
             };
@@ -507,12 +522,16 @@ export class ProtocolEngine {
               fields[`payment_method_data[client_attribution_metadata][${k}]`] = v;
             }
             const token = await this.stripe('创建原卡确认令牌', '/v1/confirmation_tokens', fields);
-            if (!/^ctoken_/.test(token.id || '')) throw new Error('未取得 confirmation token');
+            if (!/^ctoken_[a-zA-Z0-9]+$/.test(token?.id || '')) throw new Error('未取得 confirmation token');
+            const preview = token.payment_method_preview;
+            if (preview && (preview.type !== 'card' || preview.card?.last4 !== lastFour))
+              throw new Error('Stripe API 返回的令牌或卡片尾号不匹配');
             this.context.confirmationToken = token.id;
           }
         } finally {
           card.number = '';
           card.cvc = '';
+          card.expiry = '';
         }
         await this.checkpoint('confirmation_token_ready');
       }

@@ -19,6 +19,7 @@ import {
   defaultSentinelRuntime,
 } from '../../apps/worker/src/browser/runtime.js';
 import { DemoTransport } from '../../apps/worker/src/testing/demo-transport.js';
+import type { HttpInput } from '../../apps/worker/src/transport/native.js';
 import { createEnvironment } from '../../packages/runtime/src/environment.js';
 
 test('omitted Sentinel configuration selects the packaged reference bridge', () => {
@@ -386,27 +387,118 @@ test('configured reference Sentinel completes preflight without starting the off
   assert.ok(!events.some((e) => e.action === 'card' || e.action === 'authorize'));
 });
 
-test('reference mode readiness requires both a readable bridge and the Stripe browser', async (t) => {
+test('reference readiness requires its bridge without requiring Chrome', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'relay-reference-readiness-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const bridgePath = join(directory, 'bridge.cjs');
   await writeFile(bridgePath, '');
   await checkPaymentRuntime(
-    { executablePath: process.execPath },
+    { executablePath: '/does-not-exist/Chrome' },
     { mode: 'reference', bridgePath },
   );
   await assert.rejects(
     checkPaymentRuntime(
       { executablePath: '/does-not-exist/Chrome' },
-      { mode: 'reference', bridgePath },
-    ),
-    /需要 Chrome/,
-  );
-  await assert.rejects(
-    checkPaymentRuntime(
-      { executablePath: process.execPath },
       { mode: 'reference', bridgePath: join(directory, 'missing') },
     ),
     /BRIDGE_UNAVAILABLE/,
   );
+});
+
+test('official Sentinel readiness still requires Chrome', async () => {
+  await checkPaymentRuntime({ executablePath: process.execPath }, { mode: 'official' });
+  await assert.rejects(
+    checkPaymentRuntime({ executablePath: '/does-not-exist/Chrome' }, { mode: 'official' }),
+    /需要 Chrome/,
+  );
+});
+
+test('reference execution prepares the original card through the API without Chrome', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'relay-reference-payment-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const bridgePath = join(directory, 'bridge.cjs');
+  await writeFile(
+    bridgePath,
+    `let input='';process.stdin.on('data',d=>input+=d);process.stdin.on('end',()=>{const p=JSON.parse(input);process.stdout.write(JSON.stringify({main:JSON.stringify({p:'reference-proof',c:'reference-challenge',id:p.deviceId,flow:p.flow})}));});`,
+  );
+  const assignment: any = {
+    run: {
+      id: 'reference-payment',
+      order: { cdkRedeemType: 'gpt_plus', cdkPaymentCurrency: 'PHP' },
+      workflow: { plan: 'gpt_plus', cleanup: {} },
+      paymentSubmitted: false,
+      dispatches: {},
+    },
+    context: {
+      environment: createEnvironment('PH', ''),
+      credential: JSON.stringify({
+        accessToken: 'test-access',
+        account: { id: 'demo-account' },
+        user: { email: 'test@example.invalid' },
+      }),
+    },
+    demo: false,
+    paymentEnabled: true,
+    mode: 'execute',
+    billing: { name: 'Test', line1: '123 Test St', city: 'Manila', postalCode: '1000', country: 'PH' },
+  };
+  const events: any[] = [],
+    requests: HttpInput[] = [];
+  class Transport extends DemoTransport {
+    override async request(input: HttpInput) {
+      requests.push(input);
+      return super.request(input);
+    }
+  }
+  await executeWithOnDemandSdk(
+    assignment,
+    {
+      request: async (action, body) => {
+        events.push({ action, body });
+        if (action === 'card') return { number: '4242424242424242', expiry: '12/30', cvc: '123' };
+        return {};
+      },
+    },
+    new Transport(0),
+    { executablePath: '/does-not-exist/Chrome' },
+    { mode: 'reference', bridgePath },
+  );
+  const finish = events.findLast((event) => event.action === 'finish').body;
+  assert.equal(finish.status, 'completed', finish.error);
+  const tokenIndex = requests.findIndex((request) => request.url.endsWith('/v1/confirmation_tokens'));
+  assert.ok(tokenIndex >= 0);
+  const fields = new URLSearchParams(requests[tokenIndex].body);
+  assert.equal(fields.get('payment_method_data[card][number]'), '4242424242424242');
+  assert.equal(fields.get('payment_method_data[billing_details][email]'), 'test@example.invalid');
+  assert.ok(requests.findIndex((request) => request.url.endsWith('/checkout/confirm')) > tokenIndex);
+  assert.equal(JSON.parse(assignment.context.sentinel).p, 'reference-proof');
+});
+
+test('a missing reference bridge stops execution before assigning a card or authorizing payment', async () => {
+  const events: any[] = [];
+  await executeWithOnDemandSdk(
+    {
+      run: { id: 'missing-reference', order: {}, workflow: { plan: 'gpt_plus', cleanup: {} }, dispatches: {} },
+      context: {
+        environment: createEnvironment('PH', ''),
+        credential: JSON.stringify({ accessToken: 'test-access', account: { id: 'demo-account' } }),
+      },
+      demo: false,
+      paymentEnabled: true,
+      mode: 'execute',
+    } as any,
+    {
+      request: async (action, body) => {
+        events.push({ action, body });
+        return {};
+      },
+    },
+    new DemoTransport(0),
+    { executablePath: '/does-not-exist/Chrome' },
+    { mode: 'reference', bridgePath: '/does-not-exist/sentinel-bridge.js' },
+  );
+  const finish = events.findLast((event) => event.action === 'finish').body;
+  assert.equal(finish.status, 'failed');
+  assert.match(finish.error, /参考 Sentinel 授权未完成/);
+  assert.ok(!events.some((event) => event.action === 'card' || event.action === 'authorize'));
 });

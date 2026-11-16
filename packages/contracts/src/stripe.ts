@@ -14,8 +14,9 @@ export type StripeTokenRequest = {
   cardLastFour: string;
 };
 export type StripeTokenResult = { id: string; lastFour: string };
-// Metadata can cross an authorization bridge. The optional card stays in the
-// trusted node process and is entered only into Stripe's official iframe.
+// Optional custom-provider contract. Metadata may cross an authorization bridge;
+// card credentials stay local to the trusted provider. The default HTTP engine
+// sends card data directly to Stripe without invoking this provider.
 export type StripeLocalCard = {
   number?: string;
   cvc?: string;

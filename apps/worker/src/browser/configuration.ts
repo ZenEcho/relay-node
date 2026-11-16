@@ -21,9 +21,9 @@ export async function checkPaymentRuntime(
   options: OnDemandSdkOptions = {},
   sentinel: SentinelRuntimeOptions = defaultSentinelRuntime(),
 ) {
-  await findSdkBrowser(options.executablePath);
   if (sentinel?.mode === 'reference') await assertReferenceSentinelReady(sentinel);
-  else if (sentinel?.mode !== 'official') throw new Error('不支持的 Sentinel 运行模式');
+  else if (sentinel?.mode === 'official') await findSdkBrowser(options.executablePath);
+  else throw new Error('不支持的 Sentinel 运行模式');
 }
 export function sdkLoginCookies(cookies: Cookie[]) {
   // Import identity, not another browser's caches, tracking or temporary site
@@ -58,5 +58,5 @@ export async function findSdkBrowser(configured?: string) {
       return path;
     } catch {}
   }
-  throw new Error('Stripe SDK 环境需要 Chrome/Chromium，请安装或配置 officialSdk.executablePath');
+  throw new Error('官方 SDK 环境需要 Chrome/Chromium，请安装或配置 officialSdk.executablePath');
 }

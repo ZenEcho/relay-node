@@ -2,10 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ProtocolEngine } from '../../apps/worker/src/execution/engine.js';
 import { DemoTransport } from '../../apps/worker/src/testing/demo-transport.js';
-import type { HttpInput } from '../../apps/worker/src/transport/native.js';
+import type { HttpInput, HttpOutput } from '../../apps/worker/src/transport/native.js';
 import type { Assignment, Control } from '../../apps/worker/src/runtime/controller.js';
 import { createEnvironment } from '../../packages/runtime/src/environment.js';
 import type { SentinelAuthorizer } from '../../packages/contracts/src/sentinel.js';
+
+const boundAuthorizer: SentinelAuthorizer = async (request) => ({
+  ...request,
+  token: 'fixture-bound-authorization',
+  issuedAt: new Date().toISOString(),
+  expiresAt: new Date(Date.now() + 60000).toISOString(),
+});
 
 test('Session email overrides the default in merchant taxes and Stripe form fields', async () => {
   const result = await execute({
@@ -22,7 +29,7 @@ test('Session email overrides the default in merchant taxes and Stripe form fiel
   );
 });
 
-test('token-only credentials read the authenticated Session email before binding and official SDK use', async () => {
+test('token-only credentials read the authenticated Session email before binding and direct API tokenization', async () => {
   const result = await execute({
     refreshedUserEmail: 'fresh-session@example.invalid',
     defaultBillingEmail: 'default@example.invalid',
@@ -41,7 +48,12 @@ test('token-only credentials read the authenticated Session email before binding
       (command) => command.action === 'checkpoint' && command.body.stage === 'billing_email_ready',
     ),
   );
-  assert.equal(result.sdkRequest.billing.email, 'fresh-session@example.invalid');
+  const token = result.requests.find((request) => request.url.endsWith('/confirmation_tokens'))!;
+  assert.equal(
+    new URLSearchParams(token.body).get('payment_method_data[billing_details][email]'),
+    'fresh-session@example.invalid',
+  );
+  assert.equal(result.sdkRequest, undefined);
   assert.equal(result.finish.context.billingEmailBinding.source, 'session');
 });
 
@@ -78,8 +90,14 @@ async function execute(
     authorizer?: SentinelAuthorizer;
     elementsShape?: 'current' | 'conflicting';
     customerSession?: string;
-    sdkUnavailable?: boolean;
+    stripeProvider?: boolean;
     sdkWrongCard?: boolean;
+    tokenResponse?: (input: HttpInput, cancellation: AbortController) => Promise<HttpOutput>;
+    tokenData?: any;
+    tokenStatus?: number;
+    merchantDisconnect?: boolean;
+    checkoutCustomer?: string;
+    card?: { number: string; expiry: string; cvc: string; lastFour?: string };
     nestedTaxQuote?: boolean;
     credentialUserEmail?: string;
     refreshedUserEmail?: string;
@@ -88,6 +106,7 @@ async function execute(
   } = {},
 ) {
   const environment = createEnvironment('PH', '');
+  const cancellation = new AbortController();
   const assignment = {
     run: {
       id: 'custom-order',
@@ -134,6 +153,11 @@ async function execute(
   } as Assignment;
   const requests: HttpInput[] = [],
     commands: { action: string; body: any }[] = [];
+  const card = options.card || {
+    number: '4242424242424242',
+    expiry: '12/30',
+    cvc: '123',
+  };
   let sdkRequest: any;
   class Transport extends DemoTransport {
     constructor() {
@@ -147,11 +171,7 @@ async function execute(
         response.data.user = { email: options.refreshedUserEmail };
         return response;
       }
-      assert.notEqual(
-        url.pathname,
-        '/',
-        'Sentinel authorization must not depend on a homepage navigation',
-      );
+      assert.notEqual(url.pathname, '/', 'Sentinel authorization must not depend on a homepage navigation');
       if (url.pathname.includes('/accounts/check/')) {
         if (options.apiStatus)
           return {
@@ -182,22 +202,41 @@ async function execute(
         delete snapshot.currency;
         return response;
       }
+      if (url.pathname.endsWith('/checkout/taxes') && options.checkoutCustomer) {
+        const response = await super.request(input);
+        response.data.checkout_session.customer = options.checkoutCustomer;
+        return response;
+      }
+      if (url.pathname.endsWith('/confirmation_tokens')) {
+        if (options.tokenResponse) return options.tokenResponse(input, cancellation);
+        if (options.tokenData || options.tokenStatus)
+          return {
+            status: options.tokenStatus || 200,
+            headers: {},
+            body: JSON.stringify(options.tokenData || {}),
+            data: options.tokenData || {},
+          };
+      }
+      if (url.pathname.endsWith('/checkout/confirm') && options.merchantDisconnect)
+        throw new Error('merchant response connection lost');
       return super.request(input);
     }
   }
   const control: Control = {
+    signal: cancellation.signal,
     async request(action, body = {}) {
       commands.push({ action, body: structuredClone(body) });
-      if (action === 'card') return { number: '4242424242424242', expiry: '12/30', cvc: '123' };
+      if (action === 'card') return card;
       return {};
     },
   };
+  const transport = new Transport();
   await new ProtocolEngine(
     assignment,
     control,
-    new Transport(),
+    transport,
     options.authorizer,
-    !assignment.demo && !options.sdkUnavailable
+    options.stripeProvider
       ? async (request) => {
           sdkRequest = request;
           return {
@@ -212,7 +251,10 @@ async function execute(
     requests,
     commands,
     sdkRequest,
-    finish: commands.filter((c) => c.action === 'finish').at(-1)!.body,
+    card,
+    control,
+    transport,
+    finish: commands.filter((c) => c.action === 'finish').at(-1)?.body,
   };
 }
 
@@ -237,16 +279,12 @@ test('custom oaics flow requires Sentinel and forwards both token headers withou
   assert.notEqual(so.c, main.c);
   assert.equal(so.flow, main.flow);
   const confirm = result.requests.find((r) => r.url.endsWith('/payments/checkout/confirm'))!;
-  assert.equal(
-    JSON.parse(confirm.headers!['openai-sentinel-token']).flow,
-    'checkout_session_approval',
-  );
+  assert.equal(JSON.parse(confirm.headers!['openai-sentinel-token']).flow, 'checkout_session_approval');
   assert.equal(JSON.parse(confirm.headers!['openai-sentinel-so-token']).flow, 'chatgpt_checkout');
   const authIndex = result.requests.findIndex((r) => r.url.includes('/sentinel/req'));
   assert.ok(authIndex >= 0 && authIndex < result.requests.indexOf(checkout));
   assert.equal(
-    result.commands.filter((c) => c.action === 'authorize' && c.body.action === 'merchant_confirm')
-      .length,
+    result.commands.filter((c) => c.action === 'authorize' && c.body.action === 'merchant_confirm').length,
     1,
   );
 });
@@ -257,13 +295,8 @@ test('the current Stripe session_id response and original customer session are f
     customerSession: 'cuss_original_fixture',
   });
   assert.equal(result.finish.status, 'completed', result.finish.error);
-  const initialized = new URL(
-    result.requests.find((r) => r.url.includes('/elements/sessions'))!.url,
-  );
-  assert.equal(
-    initialized.searchParams.get('customer_session_client_secret'),
-    'cuss_original_fixture',
-  );
+  const initialized = new URL(result.requests.find((r) => r.url.includes('/elements/sessions'))!.url);
+  assert.equal(initialized.searchParams.get('customer_session_client_secret'), 'cuss_original_fixture');
   const token = result.requests.find((r) => r.url.endsWith('/confirmation_tokens'))!;
   const fields = new URLSearchParams(token.body);
   assert.equal(
@@ -309,9 +342,7 @@ test('production execution without a real Sentinel adapter stops before checkout
   assert.equal(result.finish.status, 'failed');
   assert.match(result.finish.error, /缺少本单真实 Sentinel 授权/);
   assert.ok(
-    !result.requests.some(
-      (r) => r.url.includes('/sentinel/req') || r.url.includes('/payments/checkout'),
-    ),
+    !result.requests.some((r) => r.url.includes('/sentinel/req') || r.url.includes('/payments/checkout')),
   );
   assert.ok(!result.commands.some((c) => ['card', 'authorize'].includes(c.action)));
 });
@@ -346,10 +377,7 @@ test('an authenticated-runtime adapter supplies fresh bound credentials before t
   assert.equal(result.finish.status, 'completed', result.finish.error);
   assert.equal(authorizations, 4);
   assert.ok(!result.requests.some((r) => r.url.includes('/sentinel/req')));
-  assert.ok(
-    !result.requests.some((r) => r.url.includes('/confirmation_tokens')),
-    'production tokenization must use the SDK provider',
-  );
+  assert.equal(result.requests.filter((r) => r.url.endsWith('/confirmation_tokens')).length, 1);
   const checkout = result.requests.find((r) => r.url.endsWith('/payments/checkout'))!;
   const confirm = result.requests.find((r) => r.url.endsWith('/payments/checkout/confirm'))!;
   assert.equal(JSON.parse(checkout.headers!['openai-sentinel-token']).c, 'test-auth-1');
@@ -358,10 +386,11 @@ test('an authenticated-runtime adapter supplies fresh bound credentials before t
   assert.ok(!logs.includes('test-authentication') && !logs.includes('test-session-observer'));
 });
 
-test('production without an official Stripe SDK provider stops before card retrieval', async () => {
+test('production without a Stripe provider creates one API token before the authorized merchant and Intent confirms', async () => {
   const result = await execute({
     demo: false,
-    sdkUnavailable: true,
+    checkoutCustomer: 'cus_originalfixture',
+    credentialUserEmail: 'session@example.invalid',
     authorizer: async (request) => ({
       ...request,
       token: 'opaque-from-official-sdk',
@@ -369,14 +398,47 @@ test('production without an official Stripe SDK provider stops before card retri
       expiresAt: new Date(Date.now() + 60000).toISOString(),
     }),
   });
-  assert.match(result.finish.error, /官方 Stripe SDK/);
-  assert.ok(!result.commands.some((c) => ['card', 'authorize'].includes(c.action)));
-  assert.ok(!result.requests.some((r) => r.url.includes('/confirmation_tokens')));
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  assert.equal(result.sdkRequest, undefined);
+  const tokens = result.requests.filter((r) => r.url.endsWith('/confirmation_tokens'));
+  assert.equal(tokens.length, 1);
+  assert.equal(tokens[0].method, 'POST');
+  const fields = new URLSearchParams(tokens[0].body);
+  assert.equal(fields.get('payment_method_data[card][number]'), '4242424242424242');
+  assert.equal(fields.get('payment_method_data[card][cvc]'), '123');
+  assert.equal(fields.get('payment_method_data[card][exp_month]'), '12');
+  assert.equal(fields.get('payment_method_data[card][exp_year]'), '2030');
+  assert.equal(fields.get('client_context[currency]'), 'php');
+  assert.equal(fields.get('client_context[mode]'), 'subscription');
+  assert.equal(fields.get('client_context[customer]'), 'cus_originalfixture');
+  assert.equal(fields.get('client_context[payment_method_types][0]'), 'card');
+  assert.equal(fields.get('payment_method_data[payment_user_agent]'), null);
+  assert.equal(fields.get('payment_method_data[time_on_page]'), null);
+  const merchant = result.requests.filter((r) => r.url.endsWith('/checkout/confirm'));
+  const intent = result.requests.filter((r) => /\/payment_intents\/[^/]+\/confirm$/.test(r.url));
+  assert.equal(merchant.length, 1);
+  assert.equal(intent.length, 1);
+  assert.ok(result.requests.indexOf(tokens[0]) < result.requests.indexOf(merchant[0]));
+  assert.ok(result.requests.indexOf(merchant[0]) < result.requests.indexOf(intent[0]));
+  assert.deepEqual(
+    result.commands
+      .filter(
+        (c) => c.action === 'authorize' && ['merchant_confirm', 'stripe_confirm'].includes(c.body.action),
+      )
+      .map((c) => c.body.action),
+    ['merchant_confirm', 'stripe_confirm'],
+  );
+  const logs = JSON.stringify(result.commands.filter((c) => c.action === 'step'));
+  assert.ok(!logs.includes('4242424242424242'));
+  assert.ok(!logs.includes('"payment_method_data[card][cvc]":"123"'));
+  assert.ok(!logs.includes(result.assignment.context.confirmationToken));
+  assert.ok(!JSON.stringify(result.assignment.context).includes('4242424242424242'));
 });
 
 test('the nested real checkout total is passed to both Elements and the official SDK provider', async () => {
   const result = await execute({
     demo: false,
+    stripeProvider: true,
     nestedTaxQuote: true,
     authorizer: async (request) => ({
       ...request,
@@ -390,11 +452,151 @@ test('the nested real checkout total is passed to both Elements and the official
   const url = new URL(result.requests.find((r) => r.url.includes('/elements/sessions'))!.url);
   assert.equal(url.searchParams.get('deferred_intent[amount]'), '32100');
   assert.equal(url.searchParams.get('deferred_intent[currency]'), 'php');
+  assert.ok(!result.requests.some((r) => r.url.endsWith('/confirmation_tokens')));
+});
+
+test('production direct tokenization normalizes the assigned card and validates the matching API preview', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    card: {
+      number: '4242 4242 4242 4242',
+      expiry: '1 / 2030',
+      cvc: '123',
+      lastFour: '4242',
+    },
+    tokenData: {
+      id: 'ctoken_originalcard',
+      payment_method_preview: { type: 'card', card: { last4: '4242' } },
+    },
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const token = result.requests.find((r) => r.url.endsWith('/confirmation_tokens'))!;
+  const fields = new URLSearchParams(token.body);
+  assert.equal(fields.get('payment_method_data[card][number]'), '4242424242424242');
+  assert.equal(fields.get('payment_method_data[card][exp_month]'), '01');
+  assert.equal(fields.get('payment_method_data[card][exp_year]'), '2030');
+  assert.equal(result.assignment.context.confirmationToken, 'ctoken_originalcard');
+});
+
+for (const invalid of [
+  { name: 'card number', card: { number: '4242' } },
+  { name: 'security code', card: { cvc: 'x23' } },
+  { name: 'expiry month', card: { expiry: '13/30' } },
+  { name: 'assigned last four', card: { lastFour: '9999' } },
+]) {
+  test(`production rejects an invalid ${invalid.name} before sending card data to Stripe`, async () => {
+    const result = await execute({
+      demo: false,
+      authorizer: boundAuthorizer,
+      card: {
+        number: '4242424242424242',
+        cvc: '123',
+        expiry: '12/30',
+        ...invalid.card,
+      },
+    });
+    assert.equal(result.finish.status, 'failed');
+    assert.match(result.finish.error, /卡片资料不完整或卡片尾号不匹配/);
+    assert.equal(result.assignment.run.paymentSubmitted, false);
+    assert.ok(!result.requests.some((r) => r.url.endsWith('/confirmation_tokens')));
+    assert.ok(!result.commands.some((c) => c.action === 'authorize'));
+    assert.equal(result.card.number, '');
+    assert.equal(result.card.cvc, '');
+    assert.equal(result.card.expiry, '');
+  });
+}
+
+for (const failure of [
+  {
+    name: 'an API rejection',
+    status: 400,
+    data: { error: { message: 'tokenization rejected by upstream' } },
+    message: /HTTP 400.*tokenization rejected/,
+  },
+  {
+    name: 'an invalid token ID',
+    status: 200,
+    data: { id: 'ctoken_invalid!' },
+    message: /未取得 confirmation token/,
+  },
+  {
+    name: 'a preview for another card',
+    status: 200,
+    data: {
+      id: 'ctoken_anothercard',
+      payment_method_preview: { type: 'card', card: { last4: '9999' } },
+    },
+    message: /卡片尾号不匹配/,
+  },
+]) {
+  test(`production direct tokenization stops on ${failure.name} before authorizing a payment`, async () => {
+    const result = await execute({
+      demo: false,
+      authorizer: boundAuthorizer,
+      tokenStatus: failure.status,
+      tokenData: failure.data,
+    });
+    assert.equal(result.finish.status, 'failed');
+    assert.match(result.finish.error, failure.message);
+    assert.equal(result.assignment.run.paymentSubmitted, false);
+    assert.equal(result.assignment.context.confirmationToken, undefined);
+    assert.equal(result.requests.filter((r) => r.url.endsWith('/confirmation_tokens')).length, 1);
+    assert.ok(!result.commands.some((c) => c.action === 'authorize'));
+    assert.ok(!result.requests.some((r) => /\/checkout\/confirm$|\/payment_intents\//.test(r.url)));
+    assert.deepEqual(result.card, { number: '', cvc: '', expiry: '' });
+  });
+}
+
+test('cancelling a production token API request discards its late result and never authorizes payment', async () => {
+  let complete!: (value: HttpOutput) => void;
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    tokenResponse: async (_input, cancellation) => {
+      const pending = new Promise<HttpOutput>((resolve) => {
+        complete = resolve;
+      });
+      cancellation.abort();
+      return pending;
+    },
+  });
+  complete({
+    status: 200,
+    headers: {},
+    body: '{}',
+    data: { id: 'ctoken_late' },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(result.finish, undefined);
+  assert.equal(result.assignment.run.paymentSubmitted, false);
+  assert.equal(result.assignment.context.confirmationToken, undefined);
+  assert.equal(result.requests.filter((r) => r.url.endsWith('/confirmation_tokens')).length, 1);
+  assert.ok(!result.commands.some((c) => c.action === 'authorize'));
+  assert.ok(!result.requests.some((r) => /\/checkout\/confirm$|\/payment_intents\//.test(r.url)));
+  assert.deepEqual(result.card, { number: '', cvc: '', expiry: '' });
+});
+
+test('a lost merchant response preserves the submitted boundary and resuming does not tokenize or confirm again', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    merchantDisconnect: true,
+  });
+  assert.equal(result.finish.status, 'pending_confirmation');
+  assert.equal(result.assignment.run.paymentSubmitted, true);
+  assert.equal(result.requests.filter((r) => r.url.endsWith('/checkout/confirm')).length, 1);
+  assert.ok(!result.requests.some((r) => /\/payment_intents\/[^/]+\/confirm$/.test(r.url)));
+  await new ProtocolEngine(result.assignment, result.control, result.transport, boundAuthorizer).execute();
+  assert.equal(result.requests.filter((r) => r.url.endsWith('/confirmation_tokens')).length, 1);
+  assert.equal(result.requests.filter((r) => r.url.endsWith('/checkout/confirm')).length, 1);
+  assert.ok(!result.requests.some((r) => /\/payment_intents\/[^/]+\/confirm$/.test(r.url)));
 });
 
 test('an SDK token for another card cannot be used for merchant confirmation', async () => {
   const result = await execute({
     demo: false,
+    stripeProvider: true,
     sdkWrongCard: true,
     authorizer: async (request) => ({
       ...request,

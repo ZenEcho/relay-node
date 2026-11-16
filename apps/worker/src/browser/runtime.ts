@@ -451,10 +451,10 @@ export async function executeWithOnDemandSdk(
   options: OnDemandSdkOptions = {},
   sentinel: SentinelRuntimeOptions = defaultSentinelRuntime(),
 ) {
-  const sdk = new OnDemandSdkRuntime(assignment, options, control.signal);
+  let sdk: OnDemandSdkRuntime | undefined;
   const abort = () => {
     transport.close();
-    void sdk.close(true).catch(() => {});
+    void sdk?.close(true).catch(() => {});
   };
   control.signal?.addEventListener('abort', abort, { once: true });
   try {
@@ -470,6 +470,7 @@ export async function executeWithOnDemandSdk(
           control.signal,
         ))(request);
       if (sentinel?.mode !== 'official') throw new Error('不支持的 Sentinel 运行模式');
+      sdk ||= new OnDemandSdkRuntime(assignment, options, control.signal);
       return sdk.authorize(request);
     };
     await new ProtocolEngine(
@@ -477,13 +478,10 @@ export async function executeWithOnDemandSdk(
       control,
       transport,
       assignment.demo ? undefined : (request) => withSdkLease(assignment, control, () => authorize(request)),
-      assignment.demo
-        ? undefined
-        : (request, card) => withSdkLease(assignment, control, () => sdk.prepareStripeToken(request, card)),
     ).execute();
   } finally {
     control.signal?.removeEventListener('abort', abort);
-    await sdk.close(!!control.signal?.aborted);
+    await sdk?.close(!!control.signal?.aborted);
   }
 }
 
