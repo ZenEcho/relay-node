@@ -89,12 +89,14 @@ async function execute(
     demo?: boolean;
     authorizer?: SentinelAuthorizer;
     elementsShape?: 'current' | 'conflicting';
+    elements?: Record<string, unknown>;
     customerSession?: string;
     stripeProvider?: boolean;
     sdkWrongCard?: boolean;
     tokenResponse?: (input: HttpInput, cancellation: AbortController) => Promise<HttpOutput>;
     tokenData?: any;
     tokenStatus?: number;
+    intentResponse?: (input: HttpInput) => HttpOutput;
     merchantDisconnect?: boolean;
     checkoutCustomer?: string;
     card?: { number: string; expiry: string; cvc: string; lastFour?: string };
@@ -102,6 +104,7 @@ async function execute(
     credentialUserEmail?: string;
     refreshedUserEmail?: string;
     defaultBillingEmail?: string;
+    billingPhone?: string;
     boundBillingEmail?: string;
   } = {},
 ) {
@@ -149,6 +152,7 @@ async function execute(
       postalCode: '1000',
       country: 'PH',
       email: options.defaultBillingEmail,
+      phone: options.billingPhone,
     },
   } as Assignment;
   const requests: HttpInput[] = [],
@@ -184,11 +188,14 @@ async function execute(
         response.data.accounts.default.entitlement.has_active_subscription = !!options.active;
         return response;
       }
-      if (url.pathname.endsWith('/elements/sessions') && options.elementsShape) {
+      if (url.pathname.endsWith('/elements/sessions') && (options.elementsShape || options.elements)) {
         const response = await super.request(input);
-        response.data.session_id = response.data.id;
-        if (options.elementsShape === 'current') delete response.data.id;
-        else response.data.id = 'another-elements-session';
+        if (options.elementsShape) {
+          response.data.session_id = response.data.id;
+          if (options.elementsShape === 'current') delete response.data.id;
+          else response.data.id = 'another-elements-session';
+        }
+        Object.assign(response.data, options.elements);
         return response;
       }
       if (url.pathname.endsWith('/checkout/taxes') && options.nestedTaxQuote) {
@@ -219,6 +226,8 @@ async function execute(
       }
       if (url.pathname.endsWith('/checkout/confirm') && options.merchantDisconnect)
         throw new Error('merchant response connection lost');
+      if (url.pathname.startsWith('/v1/payment_intents/') && options.intentResponse)
+        return options.intentResponse(input);
       return super.request(input);
     }
   }
@@ -403,6 +412,32 @@ test('production without a Stripe provider creates one API token before the auth
   const tokens = result.requests.filter((r) => r.url.endsWith('/confirmation_tokens'));
   assert.equal(tokens.length, 1);
   assert.equal(tokens[0].method, 'POST');
+  assert.equal(tokens[0].headers!['content-type'], 'application/x-www-form-urlencoded');
+  assert.equal(tokens[0].headers!.origin, 'https://js.stripe.com');
+  assert.equal(tokens[0].headers!.referer, 'https://js.stripe.com/');
+  const stripeHeaders = {
+    'sec-fetch-site': 'same-site',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-dest': 'empty',
+    'cache-control': 'no-cache',
+    pragma: 'no-cache',
+    dnt: '1',
+  };
+  const elementsRequest = result.requests.find((request) => request.url.includes('/elements/sessions'))!;
+  assert.equal(elementsRequest.method, 'GET');
+  assert.equal(elementsRequest.headers!['content-type'], undefined);
+  for (const [name, value] of Object.entries(stripeHeaders)) {
+    assert.equal(tokens[0].headers![name], value);
+    assert.equal(elementsRequest.headers![name], value);
+  }
+  const checkoutRequest = result.requests.find((request) => request.url.endsWith('/payments/checkout'))!;
+  assert.equal(checkoutRequest.method, 'POST');
+  assert.equal(checkoutRequest.headers!['content-type'], 'application/json');
+  assert.equal(checkoutRequest.headers!.origin, 'https://chatgpt.com');
+  assert.equal(checkoutRequest.headers!['sec-fetch-site'], 'same-origin');
+  assert.equal(checkoutRequest.headers!['cache-control'], undefined);
+  assert.equal(checkoutRequest.headers!.pragma, undefined);
+  assert.equal(checkoutRequest.headers!.dnt, undefined);
   const fields = new URLSearchParams(tokens[0].body);
   assert.equal(fields.get('payment_method_data[card][number]'), '4242424242424242');
   assert.equal(fields.get('payment_method_data[card][cvc]'), '123');
@@ -412,8 +447,12 @@ test('production without a Stripe provider creates one API token before the auth
   assert.equal(fields.get('client_context[mode]'), 'subscription');
   assert.equal(fields.get('client_context[customer]'), 'cus_originalfixture');
   assert.equal(fields.get('client_context[payment_method_types][0]'), 'card');
-  assert.equal(fields.get('payment_method_data[payment_user_agent]'), null);
+  assert.equal(fields.get('client_context[payment_method_types][1]'), null);
+  assert.equal(fields.get('payment_method_data[billing_details][phone]'), null);
+  assert.equal(fields.get('payment_method_data[payment_user_agent]'), 'Relay/relay-node protocol API');
+  assert.equal(fields.get('payment_method_data[referrer]'), 'https://chatgpt.com');
   assert.equal(fields.get('payment_method_data[time_on_page]'), null);
+  assert.equal(fields.get('payment_method_data[pasted_fields]'), null);
   const merchant = result.requests.filter((r) => r.url.endsWith('/checkout/confirm'));
   const intent = result.requests.filter((r) => /\/payment_intents\/[^/]+\/confirm$/.test(r.url));
   assert.equal(merchant.length, 1);
@@ -433,6 +472,109 @@ test('production without a Stripe provider creates one API token before the auth
   assert.ok(!logs.includes('"payment_method_data[card][cvc]":"123"'));
   assert.ok(!logs.includes(result.assignment.context.confirmationToken));
   assert.ok(!JSON.stringify(result.assignment.context).includes('4242424242424242'));
+});
+
+test('direct tokenization forwards only the provided billing phone', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    billingPhone: '  +1 202 555 0148  ',
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const token = result.requests.find((request) => request.url.endsWith('/confirmation_tokens'))!;
+  const fields = new URLSearchParams(token.body);
+  assert.equal(fields.get('payment_method_data[billing_details][phone]'), '+1 202 555 0148');
+});
+
+test('direct tokenization omits a blank billing phone instead of manufacturing one', async () => {
+  const result = await execute({ demo: false, authorizer: boundAuthorizer, billingPhone: '   ' });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const token = result.requests.find((request) => request.url.endsWith('/confirmation_tokens'))!;
+  assert.equal(new URLSearchParams(token.body).has('payment_method_data[billing_details][phone]'), false);
+});
+
+for (const methods of [
+  {
+    name: 'original Elements response enables Link',
+    elements: { payment_method_types: ['card', 'link', 'link', 'ideal'] },
+    expected: ['card', 'link'],
+  },
+  {
+    name: 'original Elements response omits Link',
+    elements: { payment_method_types: ['card', 'ideal'] },
+    expected: ['card'],
+  },
+  {
+    name: 'original Elements method list is malformed',
+    elements: { payment_method_types: 'link' },
+    expected: ['card'],
+  },
+  {
+    name: 'original nested Elements preference enables Link',
+    elements: { payment_method_preference: { ordered_payment_method_types: ['card', 'link', 'ideal'] } },
+    expected: ['card', 'link'],
+  },
+  {
+    name: 'nested Elements preference enables only card and wallets',
+    elements: {
+      payment_method_preference: {
+        ordered_payment_method_types: ['card'],
+        ordered_payment_method_types_and_wallets: ['card', 'apple_pay', 'google_pay'],
+      },
+      payment_method_specs: [{ type: 'card' }],
+    },
+    expected: ['card'],
+  },
+  {
+    name: 'nested Elements preference takes precedence over a conflicting top-level list',
+    elements: {
+      payment_method_preference: { ordered_payment_method_types: ['card'] },
+      payment_method_types: ['card', 'link'],
+    },
+    expected: ['card'],
+  },
+]) {
+  test(`direct tokenization advertises only card and enabled Link when ${methods.name}`, async () => {
+    const result = await execute({
+      demo: false,
+      authorizer: boundAuthorizer,
+      elements: methods.elements,
+    });
+    assert.equal(result.finish.status, 'completed', result.finish.error);
+    const token = result.requests.find((request) => request.url.endsWith('/confirmation_tokens'))!;
+    const fields = new URLSearchParams(token.body);
+    const types = [...fields]
+      .filter(([key]) => /^client_context\[payment_method_types\]\[\d+\]$/.test(key))
+      .map(([, value]) => value);
+    assert.deepEqual(types, methods.expected);
+  });
+}
+
+test('direct tokenization preserves the returned Elements session without inventing a config ID', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    elements: { id: 'elements_session_original', config_id: undefined },
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const token = result.requests.find((request) => request.url.endsWith('/confirmation_tokens'))!;
+  const fields = new URLSearchParams(token.body);
+  for (const prefix of ['client_attribution_metadata', 'payment_method_data[client_attribution_metadata]']) {
+    assert.equal(fields.get(prefix + '[elements_session_id]'), 'elements_session_original');
+    assert.equal(fields.has(prefix + '[elements_session_config_id]'), false);
+  }
+});
+
+test('a missing original Elements session stops before obtaining or sending card data', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    elements: { id: undefined, session_id: undefined },
+  });
+  assert.equal(result.finish.status, 'failed');
+  assert.match(result.finish.error, /缺少会话标识/);
+  assert.ok(!result.commands.some((command) => command.action === 'card'));
+  assert.ok(!result.requests.some((request) => request.url.endsWith('/confirmation_tokens')));
 });
 
 test('the nested real checkout total is passed to both Elements and the official SDK provider', async () => {
@@ -509,6 +651,17 @@ for (const invalid of [
 
 for (const failure of [
   {
+    name: 'the Stripe SDK requirement',
+    status: 400,
+    data: {
+      error: {
+        type: 'invalid_request_error',
+        message: 'This publishable key tokenization request is required to use the Stripe SDK.',
+      },
+    },
+    message: /HTTP 400.*required to use the Stripe SDK/,
+  },
+  {
     name: 'an API rejection',
     status: 400,
     data: { error: { message: 'tokenization rejected by upstream' } },
@@ -545,6 +698,63 @@ for (const failure of [
     assert.ok(!result.commands.some((c) => c.action === 'authorize'));
     assert.ok(!result.requests.some((r) => /\/checkout\/confirm$|\/payment_intents\//.test(r.url)));
     assert.deepEqual(result.card, { number: '', cvc: '', expiry: '' });
+  });
+}
+
+for (const status of [200, 402]) {
+  test(`an insufficient-funds Intent response (${status}) fails and recovery never repeats payment writes`, async () => {
+    const result = await execute({
+      demo: false,
+      authorizer: boundAuthorizer,
+      intentResponse(input) {
+        const url = new URL(input.url);
+        const lastError = {
+          type: 'card_error',
+          code: 'card_declined',
+          decline_code: 'insufficient_funds',
+          message: 'Your card has insufficient funds.',
+        };
+        const intent = {
+          id: url.pathname.split('/')[3],
+          client_secret: new URLSearchParams(input.body ?? url.search).get('client_secret'),
+          status: 'requires_payment_method',
+          last_payment_error: lastError,
+        };
+        const responseStatus = input.method === 'POST' ? status : 200;
+        const data = responseStatus === 402 ? { error: { ...lastError, payment_intent: intent } } : intent;
+        return { status: responseStatus, headers: {}, data, body: JSON.stringify(data) };
+      },
+    });
+    assert.equal(result.finish.status, 'failed');
+    assert.equal(result.finish.paymentOutcome, 'failed');
+    assert.match(result.finish.error, /insufficient funds/);
+    assert.equal(result.assignment.run.paymentSubmitted, true);
+    assert.equal(result.assignment.context.intent?.status, 'requires_payment_method');
+    assert.equal(result.assignment.context.intent?.last_payment_error.decline_code, 'insufficient_funds');
+    assert.equal(result.requests.filter((r) => r.url.endsWith('/confirmation_tokens')).length, 1);
+    assert.equal(result.requests.filter((r) => r.url.endsWith('/checkout/confirm')).length, 1);
+    assert.equal(result.requests.filter((r) => /\/payment_intents\/[^/]+\/confirm$/.test(r.url)).length, 1);
+    assert.deepEqual(
+      result.commands.filter((c) => c.action === 'authorize').map((c) => c.body.action),
+      ['merchant_confirm', 'stripe_confirm'],
+    );
+    assert.ok(!result.commands.some((c) => c.action === 'verification'));
+    assert.ok(!result.requests.some((r) => /\/subscriptions\/cancel$|\/invoices$/.test(r.url)));
+    assert.deepEqual(result.card, { number: '', cvc: '', expiry: '' });
+
+    const requestCount = result.requests.length;
+    const commandCount = result.commands.length;
+    const originalIntentId = result.assignment.context.intent!.id;
+    await new ProtocolEngine(result.assignment, result.control, result.transport, boundAuthorizer).execute();
+    const recoveryRequests = result.requests.slice(requestCount);
+    assert.equal(recoveryRequests.length, 1);
+    assert.equal(recoveryRequests[0].method, 'GET');
+    assert.equal(new URL(recoveryRequests[0].url).pathname, '/v1/payment_intents/' + originalIntentId);
+    assert.ok(!result.commands.slice(commandCount).some((c) => ['card', 'authorize'].includes(c.action)));
+    const recovered = result.commands.filter((c) => c.action === 'finish').at(-1)!.body;
+    assert.equal(recovered.status, 'failed');
+    assert.equal(recovered.paymentOutcome, 'failed');
+    assert.match(recovered.error, /insufficient funds/);
   });
 }
 

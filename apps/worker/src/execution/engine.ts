@@ -251,9 +251,15 @@ export class ProtocolEngine {
         url: STRIPE + path,
         headers: {
           accept: 'application/json',
-          'content-type': 'application/x-www-form-urlencoded',
+          ...(body === undefined ? {} : { 'content-type': 'application/x-www-form-urlencoded' }),
           origin: 'https://js.stripe.com',
           referer: 'https://js.stripe.com/',
+          'sec-fetch-site': 'same-site',
+          'sec-fetch-mode': 'cors',
+          'sec-fetch-dest': 'empty',
+          'cache-control': 'no-cache',
+          pragma: 'no-cache',
+          dnt: '1',
         },
         body: body === undefined ? undefined : form(body),
       })
@@ -494,12 +500,17 @@ export class ProtocolEngine {
               'payment_method_data[billing_details][name]': billing.name,
               'payment_method_data[billing_details][email]':
                 this.context.billingEmailBinding?.email || undefined,
+              'payment_method_data[billing_details][phone]':
+                typeof billing.phone === 'string' ? billing.phone.trim() || undefined : undefined,
               'payment_method_data[billing_details][address][line1]': billing.line1,
               'payment_method_data[billing_details][address][line2]': billing.line2,
               'payment_method_data[billing_details][address][city]': billing.city,
               'payment_method_data[billing_details][address][state]': billing.state,
               'payment_method_data[billing_details][address][postal_code]': billing.postalCode,
               'payment_method_data[billing_details][address][country]': billing.country,
+              // Identify this HTTP client without claiming a Stripe.js session.
+              'payment_method_data[payment_user_agent]': 'Relay/relay-node protocol API',
+              'payment_method_data[referrer]': CHAT,
               'client_context[currency]': this.context.snapshot.currency,
               'client_context[mode]': this.context.snapshot.mode || 'subscription',
               'client_context[payment_method_types][0]': 'card',
@@ -507,6 +518,14 @@ export class ProtocolEngine {
               setup_future_usage: 'off_session',
               set_as_default_payment_method: 'false',
             };
+            // Link is advertised only when the original Elements response enables it.
+            const orderedMethodTypes =
+              this.context.elements.payment_method_preference?.ordered_payment_method_types;
+            const availableMethodTypes = Array.isArray(orderedMethodTypes)
+              ? orderedMethodTypes
+              : this.context.elements.payment_method_types;
+            if (Array.isArray(availableMethodTypes) && availableMethodTypes.includes('link'))
+              fields['client_context[payment_method_types][1]'] = 'link';
             const attribution = {
               client_session_id: this.context.clientSessionId,
               elements_session_id: this.context.elements.id,
