@@ -200,7 +200,10 @@ async function execute(
         Object.assign(response.data, options.elements);
         return response;
       }
-      if (url.pathname.endsWith('/checkout/taxes') && (options.snapshotCustomerSession || options.stripeAccount)) {
+      if (
+        url.pathname.endsWith('/checkout/taxes') &&
+        (options.snapshotCustomerSession || options.stripeAccount)
+      ) {
         const response = await super.request(input);
         response.data.checkout_session.customer_session_client_secret = options.snapshotCustomerSession;
         response.data.checkout_session.stripe_account = options.stripeAccount;
@@ -457,10 +460,18 @@ test('production without a Stripe provider creates one API token before the auth
   assert.equal(fields.get('client_context[payment_method_types][0]'), 'card');
   assert.equal(fields.get('client_context[payment_method_types][1]'), null);
   assert.equal(fields.get('payment_method_data[billing_details][phone]'), null);
-  assert.equal(fields.get('payment_method_data[payment_user_agent]'), 'Relay/relay-node protocol API');
+  assert.match(
+    fields.get('payment_method_data[payment_user_agent]')!,
+    /^stripe\.js\/(628eb3cacd|a44b454c|d21f1cd6|9c1e8d52|f7a3b211|692f102a8f); stripe-js-v3\/\1; payment-element; deferred-intent$/,
+  );
+  assert.equal(
+    fields.get('_stripe_version'),
+    '2025-03-31.basil; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1',
+  );
   assert.equal(fields.get('payment_method_data[referrer]'), 'https://chatgpt.com');
-  assert.equal(fields.get('payment_method_data[time_on_page]'), null);
-  assert.equal(fields.get('payment_method_data[pasted_fields]'), null);
+  const timeOnPage = Number(fields.get('payment_method_data[time_on_page]'));
+  assert.ok(Number.isInteger(timeOnPage) && timeOnPage >= 8000 && timeOnPage <= 30000);
+  assert.equal(fields.get('payment_method_data[pasted_fields]'), 'number');
   const merchant = result.requests.filter((r) => r.url.endsWith('/checkout/confirm'));
   const intent = result.requests.filter((r) => /\/payment_intents\/[^/]+\/confirm$/.test(r.url));
   assert.equal(merchant.length, 1);

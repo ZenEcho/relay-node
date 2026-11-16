@@ -482,13 +482,6 @@ export async function executeWithOnDemandSdk(
       control,
       transport,
       assignment.demo ? undefined : (request) => withSdkLease(assignment, control, () => authorize(request)),
-      assignment.demo
-        ? undefined
-        : (request, card) =>
-            withSdkLease(assignment, control, () => {
-              sdk ||= new OnDemandSdkRuntime(assignment, options, control.signal);
-              return sdk.prepareStripeToken(request, card);
-            }),
     ).execute();
   } finally {
     control.signal?.removeEventListener('abort', abort);
