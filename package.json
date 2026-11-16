@@ -10,19 +10,25 @@
       "types": "./dist/sdk.d.ts",
       "import": "./dist/sdk.js"
     },
-    "./worker/*": {
-      "types": "./dist/apps/worker/src/*.d.ts",
-      "import": "./dist/apps/worker/src/*.js"
+    "./contracts": {
+      "types": "./dist/contracts.d.ts",
+      "import": "./dist/contracts.js"
     },
-    "./core/*": {
-      "types": "./dist/packages/core/src/*.d.ts",
-      "import": "./dist/packages/core/src/*.js"
+    "./rules": {
+      "types": "./dist/rules.d.ts",
+      "import": "./dist/rules.js"
+    },
+    "./browser": {
+      "types": "./dist/apps/worker/src/browser/actions.d.ts",
+      "import": "./dist/apps/worker/src/browser/actions.js"
     }
   },
   "files": [
     "dist",
     "bin",
     "install.sh",
+    "scripts/install-reference-sentinel.mjs",
+    "scripts/probe-reference-sentinel.mjs",
     "VERSION"
   ],
   "engines": {
@@ -30,8 +36,9 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "tsx --test tests/*.test.ts",
+    "test": "tsx --test tests/*/*.test.ts",
     "native:build": "node scripts/build-native.mjs",
+    "sentinel:install-reference": "node scripts/install-reference-sentinel.mjs",
     "check": "npm run build && npm test"
   },
   "devDependencies": {

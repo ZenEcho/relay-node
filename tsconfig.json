@@ -8,13 +8,9 @@
     "declaration": true,
     "outDir": "dist",
     "rootDir": ".",
-    "types": [
-      "node"
-    ]
+    "types": ["node"],
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
   },
-  "include": [
-    "sdk.ts",
-    "apps/**/*.ts",
-    "packages/**/*.ts"
-  ]
+  "include": ["sdk.ts", "contracts.ts", "rules.ts", "apps/**/*.ts", "packages/**/*.ts"]
 }

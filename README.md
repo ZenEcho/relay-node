@@ -40,3 +40,48 @@ npm run native:build
 `VERSION` 和 package.json 使用同一语义版本。推送 `vX.Y.Z` 标签后 CI 验证四个平台并创建正式 Release。平台包、SDK 和 SHA256SUMS 齐备后才公开版本；节点更新只接受本仓库正式发布的匹配平台包。
 
 控制台通过固定 Release URL 引用 `relay-node-sdk-X.Y.Z.tgz`，SDK 提供执行器、传输组件、公共类型及工具；不要求在旁边检出节点源码。发布包使用白名单，不包含凭证、环境配置或本地数据。
+
+SDK 只公开四个入口：`@relay/node` 为 Node 执行运行时，`@relay/node/contracts` 为执行与节点控制协议，`@relay/node/rules` 为共享纯规则，`@relay/node/browser` 为无外部依赖的浏览器页面动作。控制台持有账号、工作流、订单、卡库存和数据库模型；节点仅接收执行快照。
+
+```ts
+import { ProtocolEngine, NativeTransport, createEnvironment } from '@relay/node';
+import type { ExecutionAssignment } from '@relay/node/contracts';
+import { createBrowserSentinelAuthorizer } from '@relay/node/browser';
+```
+
+源码按 `execution/`、`browser/`、`transport/`、`runtime/` 分工，命令行与安装入口保留在 worker 根目录。`packages/contracts`、`packages/rules`、`packages/runtime` 分别提供协议、纯函数和 Node 基础设施；测试按相同职责分组，开发探针集中在 `scripts/probes/`。开发依赖使用 npm 与唯一的 package-lock.json。
+
+SDK 的 `createBrowserSentinelAuthorizer(execute)` 可配合现有可信扩展，在匹配本单账号、设备和页面的真实登录文档中调用官方 Sentinel SDK。主令牌和 SO 的 flow 分开处理，保持 SDK 原始值；运行期间身份改变、SDK 未就绪或超时会停止。该模块不创建浏览器、不导入登录凭证、不模拟设备或求解挑战；`execute` 需由已有授权运行时提供。独立节点管理器现已接入按需官方 SDK：每单需要时启动独立临时 Chrome/Chromium，结束或进入 CDK 验证等待后关闭，原单只读核对和收尾不启动浏览器。节点需安装 Chrome/Chromium；可在实例 config.json 的 officialSdk 中指定 executablePath 和 headless，默认 Linux 无界面、macOS 临时有界面。登录 Cookie/设备与本单绑定；官方授权被拒绝时停在建单和取卡前等待处理。后端 HTTP 引擎继续负责付款确认和收尾，浏览器只准备真实官方令牌。
+
+## 后端 Sentinel 参考运行时
+
+节点也支持 [gpt-subscribe-studio-1](https://github.com/crhywun/gpt-subscribe-studio-1/tree/adccdfc993e368f2c09bad7081885c6daff2d320) 的 Node VM、浏览器环境 shim 和 PoW 方案。显式选择 `reference` 模式后，Sentinel 由后端桥签发，浏览器仅在需要 Stripe 官方组件时启动。默认仍使用 `official`；失败不会自动切换模式、代理或账号。
+
+先用系统 Node.js 24 和 npm 安装独立参考运行时（SDK/Release 不包含第三方修改版 Sentinel SDK）：
+
+```sh
+node scripts/install-reference-sentinel.mjs --directory /absolute/path/reference-sentinel
+```
+
+安装器固定上游提交、四个文件的 SHA-256 和 undici 版本，下载校验后安装，生成 `source.json`，不覆盖现有目录。然后在实例 `config.json` 中添加，保留已有对接信息：
+
+```json
+{
+  "sentinel": {
+    "mode": "reference",
+    "bridgePath": "/absolute/path/reference-sentinel/sentinel_bridge.js"
+  }
+}
+```
+
+暂停并排空原任务后重启节点服务，使配置生效。外部桥是本机明确选择的可信程序，适配器通过 stdin 传入本单 UA、设备、Cookie、代理、页面和 flow；核对输出绑定，限制时间/输出，回收子进程，不记录授权内容。SO 可空，参考桥的 SO 使用当前主 flow；浏览器适配器仍使用官方 SDK 自己返回的 flow。参考 SDK 是固定版本，站点协议改变时需要更新并重新验收。
+
+新环境固定使用原生组件支持的 Chrome 146 TLS/UA，避免随机旧 Chrome 档案触发站点 challenge。已有订单的环境不改写。节点仍需 Chrome 供 Stripe 使用，管理器同时检查浏览器与参考桥可读性。
+
+独立预检默认只核对原账号并签发两个 flow；可用 `--sdk-root` 指定安装节点。额外传 `--verify-checkout` 才创建一个未付款 Plus 结账并核验商户接受情况，始终不取卡、不确认付款：
+
+```sh
+node scripts/probe-reference-sentinel.mjs --session-file /private/session.json --bridge /absolute/path/reference-sentinel/sentinel_bridge.js --transport /absolute/path/bin/relay-transport --proxy http://127.0.0.1:10809 --report /private/sentinel-report.json
+```
+
+`--cookie-file` 可指定原账号的 Cookie 导出；`--reference-warmup` 对照上游的首页 metadata/建单字段。报告仅保存状态及未付款 checkout ID，不保存 Token 或响应秘密。签发成功与商户接受分别报告。
