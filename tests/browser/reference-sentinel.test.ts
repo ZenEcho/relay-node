@@ -53,6 +53,31 @@ process.stdin.on('end', () => {
   return { context, request, bridgePath, directory, authorize };
 }
 
+async function assertProcessesStopped(pids: number[]) {
+  const stopped = async (pid: number) => {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ESRCH';
+    }
+    if (process.platform === 'linux') {
+      try {
+        // kill(0) still succeeds for a killed process awaiting init reaping.
+        const state = await readFile(`/proc/${pid}/stat`, 'utf8');
+        return ['Z', 'X'].includes(state.slice(state.lastIndexOf(')') + 2, state.lastIndexOf(')') + 3));
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'ENOENT';
+      }
+    }
+    return false;
+  };
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if ((await Promise.all(pids.map(stopped))).every(Boolean)) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail('a bridge process remained runnable after termination');
+}
+
 test('the one-shot reference bridge receives the exact original profile, device, flow, proxy and eligible cookies', async (t) => {
   const f = await fixture(t);
   f.context.environment.headers['accept-language'] = 'fr-CA,fr;q=0.9,en;q=0.5';
@@ -280,7 +305,7 @@ test(
     });
     await assert.rejects(authorize(f.request), /TIMEOUT/);
     const pids = JSON.parse(await readFile(join(f.directory, 'pids.json'), 'utf8'));
-    for (const pid of pids) assert.throws(() => process.kill(pid, 0));
+    await assertProcessesStopped(pids);
   },
 );
 
