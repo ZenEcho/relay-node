@@ -1,3 +1,4 @@
+import { hostedPublishableKey, prepareHostedCheckout, submitHostedCheckout } from './hosted-checkout.js';
 import type { SentinelFlow, SentinelAuthorizer } from '../../../../packages/contracts/src/sentinel.js';
 import type { ExecutionServices } from './services.js';
 import { preflightExecution } from './preflight.js';
@@ -113,6 +114,7 @@ export class ProtocolEngine {
         ...input,
         headers: { ...environment.headers, ...input.headers },
         environmentId: environment.id,
+        checkoutMode: this.context.checkoutMode || this.assignment.run.workflow?.checkoutMode || 'custom',
         profile: environment.profile,
         country: environment.country,
         exitFingerprint: /^[a-f0-9]{12}$/.test(this.context.exitFingerprint || '')
@@ -336,22 +338,46 @@ export class ProtocolEngine {
             country: this.context.environment.country,
             currency,
           },
-          entry_point: 'all_plans_pricing_modal',
-          checkout_ui_mode: 'custom',
-          processor_entity: 'openai_llc',
+          ...(this.assignment.run.workflow.checkoutMode === 'hosted'
+            ? { checkout_ui_mode: 'hosted', cancel_url: CHAT + '/#pricing' }
+            : {
+                entry_point: 'all_plans_pricing_modal',
+                checkout_ui_mode: 'custom',
+                processor_entity: 'openai_llc',
+              }),
         });
-        const id =
-          result.internal_checkout_session_id ||
-          result.internalCheckoutSessionId ||
-          result.checkout_session?.id ||
-          result.checkout_session_id;
-        if (!/^(oaics_|cs_)[a-zA-Z0-9_]+$/.test(id || ''))
-          throw new Error('支付链接响应缺少可识别的原 checkout ID');
+        const mode = this.assignment.run.workflow.checkoutMode || 'custom';
+        const candidates = [
+          result.internal_checkout_session_id,
+          result.internalCheckoutSessionId,
+          result.checkout_session?.id,
+          result.checkout_session_id,
+          result.checkoutSessionId,
+        ];
+        const prefix = mode === 'hosted' ? 'cs_' : 'oaics_';
+        const id = candidates.find((value) => typeof value === 'string' && value.startsWith(prefix));
+        if (!id || !/^(oaics_|cs_(?:live_|test_))[a-zA-Z0-9_]+$/.test(id))
+          throw new Error('返回的支付链接与所选 ' + mode + ' 类型不匹配');
+        this.context.checkoutMode = mode;
         this.context.checkout = {
           id,
           processor_entity: result.processor_entity || 'openai_llc',
+          ...(mode === 'hosted'
+            ? { url: result.url || result.checkout_url || result.checkout_session?.url }
+            : {}),
         };
         await this.checkpoint('checkout_created');
+      }
+      this.context.checkoutMode ||= this.context.checkout!.id.startsWith('cs_') ? 'hosted' : 'custom';
+      if (!this.context.checkoutTypeLogged) {
+        await this.log({
+          name: '支付链接类型 · ' + this.context.checkoutMode,
+          category: 'event',
+          status: 'succeeded',
+          response: { checkoutMode: this.context.checkoutMode, checkoutId: this.context.checkout!.id },
+        });
+        this.context.checkoutTypeLogged = true;
+        await this.checkpoint('checkout_type_ready');
       }
       if (!this.context.snapshot) {
         await this.requireSentinel('chatgpt_checkout');
@@ -385,13 +411,27 @@ export class ProtocolEngine {
         this.context.key =
           this.context.snapshot.publishable_key ||
           this.context.snapshot.stripe_publishable_key ||
-          this.context.snapshot.stripe?.publishable_key;
+          this.context.snapshot.stripe?.publishable_key ||
+          this.context.key ||
+          (this.context.checkoutMode === 'hosted'
+            ? hostedPublishableKey(
+                this.context.snapshot.url || this.context.checkout!.url,
+                this.context.checkout!.id,
+              )
+            : undefined);
         if (!this.context.key)
           this.context.key = (
             await this.chat('读取付款组件配置', '/backend-api/payments/stripe_client_bootstrap', {})
           ).publishable_key;
         if (!this.context.key) throw new Error('原结账缺少 Stripe publishable key');
         await this.checkpoint('taxes_ready');
+      }
+      if (this.context.checkoutMode === 'hosted') {
+        this.context.key ||= hostedPublishableKey(
+          this.context.snapshot.url || this.context.checkout!.url,
+          this.context.checkout!.id,
+        );
+        await prepareHostedCheckout(this.services);
       }
       const amount =
         this.context.snapshot.amount_total ??
@@ -562,6 +602,10 @@ export class ProtocolEngine {
         }
         await this.checkpoint('confirmation_token_ready');
       }
+      if (this.context.checkoutMode === 'hosted') {
+        await submitHostedCheckout(this.services);
+        return;
+      }
       await this.requireSentinel('checkout_session_approval');
       await this.command('authorize', { action: 'merchant_confirm' });
       this.assignment.run.paymentSubmitted = true;
@@ -571,6 +615,16 @@ export class ProtocolEngine {
         selected_payment_method_type: 'card',
       });
       this.context.merchantConfirmation = confirm;
+      // An explicit refusal without an Intent is terminal, not a lost response.
+      if (confirm.status === 'subscription_limit' && !confirm.client_secret && !confirm.payment_intent) {
+        await this.command('finish', {
+          status: 'failed',
+          paymentOutcome: 'failed',
+          context: this.context,
+          error: '商户确认未成功：subscription_limit',
+        });
+        return;
+      }
       if (confirm.error || confirm.success === false || confirm.status !== 'success')
         throw new Error(
           '商户确认未成功：' + String(confirm.status || confirm.error?.message || '响应缺少状态'),

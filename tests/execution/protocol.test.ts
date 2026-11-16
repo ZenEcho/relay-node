@@ -83,6 +83,8 @@ test('an invalid authenticated Session email falls back after the Session read a
 
 async function execute(
   options: {
+    checkoutMode?: 'custom' | 'hosted';
+    returnedCheckoutId?: string;
     apiStatus?: number;
     active?: boolean;
     resumed?: boolean;
@@ -100,9 +102,11 @@ async function execute(
     tokenStatus?: number;
     intentResponse?: (input: HttpInput) => HttpOutput;
     merchantDisconnect?: boolean;
+    merchantData?: any;
     checkoutCustomer?: string;
     card?: { number: string; expiry: string; cvc: string; lastFour?: string };
     nestedTaxQuote?: boolean;
+    hostedUrlConfig?: boolean;
     credentialUserEmail?: string;
     refreshedUserEmail?: string;
     defaultBillingEmail?: string;
@@ -116,7 +120,7 @@ async function execute(
     run: {
       id: 'custom-order',
       order: { cdkRedeemType: 'gpt_plus', cdkPaymentCurrency: 'PHP' },
-      workflow: { plan: 'gpt_plus', cleanup: {} },
+      workflow: { plan: 'gpt_plus', cleanup: {}, checkoutMode: options.checkoutMode },
       paymentSubmitted: false,
       dispatches: {},
     },
@@ -209,6 +213,15 @@ async function execute(
         response.data.checkout_session.stripe_account = options.stripeAccount;
         return response;
       }
+      if (url.pathname.endsWith('/checkout/taxes') && options.hostedUrlConfig) {
+        const response = await super.request(input);
+        const c = response.data.checkout_session;
+        const bytes = Buffer.from(JSON.stringify({ apiKey: c.publishable_key }));
+        for (let i = 0; i < bytes.length; i++) bytes[i] ^= 5;
+        c.url = 'https://checkout.stripe.com/c/pay/' + c.id + '#' + bytes.toString('base64');
+        delete c.publishable_key;
+        return response;
+      }
       if (url.pathname.endsWith('/checkout/taxes') && options.nestedTaxQuote) {
         const response = await super.request(input);
         const snapshot = response.data.checkout_session;
@@ -235,6 +248,20 @@ async function execute(
             data: options.tokenData || {},
           };
       }
+      if (url.pathname.endsWith('/checkout') && options.returnedCheckoutId)
+        return {
+          status: 200,
+          headers: {},
+          body: '',
+          data: { internal_checkout_session_id: options.returnedCheckoutId },
+        };
+      if (url.pathname.endsWith('/checkout/confirm') && options.merchantData)
+        return {
+          status: 200,
+          headers: {},
+          body: JSON.stringify(options.merchantData),
+          data: options.merchantData,
+        };
       if (url.pathname.endsWith('/checkout/confirm') && options.merchantDisconnect)
         throw new Error('merchant response connection lost');
       if (url.pathname.startsWith('/v1/payment_intents/') && options.intentResponse)
@@ -884,4 +911,86 @@ test('an official SDK login rejection pauses an unsubmitted order before checkou
   assert.equal(result.assignment.context.officialAuthorizationRequired, true);
   assert.ok(!result.commands.some((c) => ['card', 'authorize'].includes(c.action)));
   assert.ok(!result.requests.some((r) => r.url.includes('/payments/checkout')));
+});
+
+test('an explicit subscription limit fails immediately without another payment or read-only round', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    merchantData: { status: 'subscription_limit' },
+  });
+  assert.equal(result.finish.status, 'failed');
+  assert.equal(result.finish.paymentOutcome, 'failed');
+  assert.equal(result.finish.error, '商户确认未成功：subscription_limit');
+  assert.equal(result.requests.filter((r) => r.url.endsWith('/checkout/confirm')).length, 1);
+  assert.ok(!result.requests.some((r) => /\/v1\/payment_intents\//.test(r.url)));
+  assert.equal(result.assignment.run.paymentSubmitted, true);
+});
+
+test('a subscription limit carrying an Intent remains pending for original-payment reconciliation', async () => {
+  for (const data of [
+    { status: 'subscription_limit', client_secret: 'pi_original_secret_fixture' },
+    { status: 'subscription_limit', payment_intent: { id: 'pi_original' } },
+  ]) {
+    const result = await execute({ demo: false, authorizer: boundAuthorizer, merchantData: data });
+    assert.equal(result.finish.status, 'pending_confirmation');
+    assert.notEqual(result.finish.paymentOutcome, 'failed');
+  }
+});
+
+test('hosted uses Stripe payment pages and merchant approval, records its type, and never calls custom confirmation', async () => {
+  const result = await execute({ demo: false, authorizer: boundAuthorizer, checkoutMode: 'hosted' });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const checkout = result.requests.find((r) => r.url.endsWith('/payments/checkout'))!;
+  assert.equal(JSON.parse(checkout.body!).checkout_ui_mode, 'hosted');
+  assert.equal(JSON.parse(checkout.body!).processor_entity, undefined);
+  assert.ok(!result.requests.some((r) => r.url.endsWith('/checkout/confirm')));
+  assert.ok(!result.requests.some((r) => r.url.endsWith('/stripe_client_bootstrap')));
+  const confirmed = result.requests.filter((r) => /\/payment_pages\/cs_live_[^/]+\/confirm$/.test(r.url));
+  assert.equal(confirmed.length, 1);
+  assert.equal(new URLSearchParams(confirmed[0].body).get('expected_amount'), '2000');
+  assert.equal(result.requests.filter((r) => r.url.endsWith('/checkout/approve')).length, 1);
+  assert.equal(result.assignment.context.checkoutMode, 'hosted');
+  assert.ok(result.commands.some((c) => c.action === 'step' && c.body.step.name === '支付链接类型 · hosted'));
+});
+
+test('a checkout of another selected type stops before card access and never switches routes', async () => {
+  for (const [checkoutMode, returnedCheckoutId] of [
+    ['hosted', 'oaics_other'],
+    ['custom', 'cs_live_other'],
+  ] as const) {
+    const result = await execute({
+      demo: false,
+      authorizer: boundAuthorizer,
+      checkoutMode,
+      returnedCheckoutId,
+    });
+    assert.equal(result.finish.status, 'failed');
+    assert.equal(result.assignment.run.paymentSubmitted, false);
+    assert.ok(!result.commands.some((c) => c.action === 'card' || c.action === 'authorize'));
+    assert.equal(result.requests.filter((r) => r.url.endsWith('/payments/checkout')).length, 1);
+  }
+});
+
+test('hosted recovery reads the original page and never replays confirmation or approval', async () => {
+  const result = await execute({ demo: false, authorizer: boundAuthorizer, checkoutMode: 'hosted' });
+  const before = result.requests.length;
+  result.assignment.mode = 'reconcile';
+  await new ProtocolEngine(result.assignment, result.control, result.transport, boundAuthorizer).execute();
+  const replay = result.requests.slice(before);
+  assert.ok(replay.length > 0);
+  assert.ok(replay.every((r) => r.method === 'GET'));
+  assert.ok(replay.some((r) => r.url.includes('/payment_pages/' + result.assignment.context.checkout!.id)));
+});
+
+test('hosted takes the public Stripe key from its own returned URL without a bootstrap request', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    checkoutMode: 'hosted',
+    hostedUrlConfig: true,
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  assert.equal(result.assignment.context.key, 'pk_test_demo');
+  assert.ok(!result.requests.some((r) => r.url.endsWith('/stripe_client_bootstrap')));
 });

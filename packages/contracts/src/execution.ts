@@ -76,6 +76,7 @@ export type ExecutionSnapshot = {
   order: { cdkPaymentCurrency?: string };
   workflow: {
     plan: string;
+    checkoutMode?: 'custom' | 'hosted';
     billingCountry?: string;
     cleanup: { refresh: boolean; cancel: boolean; invoices: boolean };
   };

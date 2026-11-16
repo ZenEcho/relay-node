@@ -4,6 +4,9 @@ import type { HttpInput, HttpOutput, Transport } from '../transport/native.js';
 export class DemoTransport implements Transport {
   private environment!: Environment;
   private willRenew = true;
+  private checkoutId = '';
+  private hostedConfirmed = false;
+  private hostedApproved = false;
   constructor(private delay = 180) {}
   async initialize(environment: Environment) {
     this.environment = environment;
@@ -40,9 +43,7 @@ export class DemoTransport implements Transport {
     else if (u.pathname.includes('pricing_config'))
       data = {
         currency_config: {
-          symbol_code: ({ US: 'USD', PH: 'PHP', EG: 'EGP', CL: 'CLP' } as any)[
-            this.environment.country
-          ],
+          symbol_code: ({ US: 'USD', PH: 'PHP', EG: 'EGP', CL: 'CLP' } as any)[this.environment.country],
         },
       };
     else if (u.pathname.includes('/sentinel/')) {
@@ -60,12 +61,14 @@ export class DemoTransport implements Transport {
         issuedAt: new Date().toISOString(),
         expiresAt: new Date(Date.now() + 60000).toISOString(),
       };
-    } else if (u.pathname.endsWith('/checkout'))
-      data = { internal_checkout_session_id: 'oaics_demo' + suffix };
-    else if (u.pathname.endsWith('/taxes'))
+    } else if (u.pathname.endsWith('/checkout')) {
+      const mode = JSON.parse(input.body || '{}').checkout_ui_mode;
+      this.checkoutId = (mode === 'hosted' ? 'cs_live_demo' : 'oaics_demo') + suffix;
+      data = { internal_checkout_session_id: this.checkoutId };
+    } else if (u.pathname.endsWith('/taxes'))
       data = {
         checkout_session: {
-          id: 'oaics_demo' + suffix,
+          id: this.checkoutId || 'oaics_demo' + suffix,
           publishable_key: 'pk_test_demo',
           amount_total: 2000,
           currency: String(JSON.parse(input.body || '{}').currency || 'usd').toLowerCase(),
@@ -73,7 +76,22 @@ export class DemoTransport implements Transport {
           processor_entity: 'openai_llc',
         },
       };
-    else if (u.pathname.endsWith('/elements/sessions'))
+    else if (u.pathname.endsWith('/stripe_client_bootstrap')) data = { publishable_key: 'pk_test_demo' };
+    else if (u.pathname.startsWith('/v1/payment_pages/')) {
+      if (u.pathname.endsWith('/confirm')) this.hostedConfirmed = true;
+      data = {
+        id: this.checkoutId,
+        checkout_session_id: this.checkoutId,
+        status: this.hostedConfirmed && this.hostedApproved ? 'complete' : 'open',
+        payment_status: this.hostedConfirmed && this.hostedApproved ? 'paid' : 'unpaid',
+        amount_total: 2000,
+        currency: 'php',
+        elements_session: { id: 'elements_session_demo' + suffix, config_id: 'cfg_demo' + suffix },
+      };
+    } else if (u.pathname.endsWith('/checkout/approve')) {
+      this.hostedApproved = true;
+      data = { status: 'approved' };
+    } else if (u.pathname.endsWith('/elements/sessions'))
       data = { id: 'elements_session_demo' + suffix, config_id: 'cfg_demo' + suffix };
     else if (u.pathname.endsWith('/confirmation_tokens')) data = { id: 'ctoken_demo' + suffix };
     else if (u.pathname.endsWith('/checkout/confirm'))
@@ -82,8 +100,7 @@ export class DemoTransport implements Transport {
         client_secret: 'pi_demo' + suffix + '_secret_demo',
         confirm_return_url: 'https://chatgpt.com/',
       };
-    else if (u.pathname.includes('/payment_intents/'))
-      data = { id: 'pi_demo' + suffix, status: 'succeeded' };
+    else if (u.pathname.includes('/payment_intents/')) data = { id: 'pi_demo' + suffix, status: 'succeeded' };
     else if (u.pathname.includes('/checkout/openai_llc/'))
       data = {
         checkout_session: { id: 'oaics_demo' + suffix, status: 'complete', payment_status: 'paid' },

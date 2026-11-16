@@ -54,6 +54,8 @@ import { createBrowserSentinelAuthorizer } from '@relay/node/browser';
 
 独立节点通过纯 HTTP 创建 confirmation token，并确认原结账和原 PaymentIntent。令牌请求参数参考 oa-pay-protocol-go，包含 Stripe.js 兼容元数据；此路径不加载 Stripe.js、不启动浏览器。卡片资料仅在节点内存和本单冻结代理的 HTTPS 请求中使用，使用后清空，不进入检查点或日志。付款开关、逐次派发授权与付款结果核对仍由原执行流程处理。
 
+工作流的 `checkoutMode` 可选 `custom`（默认，oaics_ / ChatGPT）或 `hosted`（cs_live_ / Stripe）。Hosted 通过 payment_pages 初始化、HTTP 令牌、原结账确认及商户审批处理；两条路径不自动互换。日志和执行检查点携带实际链接类型，恢复只查询原结账或原 Intent，不重放付款。商户明确返回 `subscription_limit` 且没有 Intent 时直接失败。
+
 SDK 的 `createBrowserSentinelAuthorizer(execute)` 可配合现有可信扩展，在匹配本单账号、设备和页面的真实登录文档中调用官方 Sentinel SDK。主令牌和 SO 的 flow 分开处理，保持 SDK 原始值；运行期间身份改变、SDK 未就绪或超时会停止。该模块不创建浏览器、不导入登录凭证、不模拟设备或求解挑战；`execute` 需由已有授权运行时提供。默认节点不注入浏览器 StripeTokenProvider；显式配置 `sentinel.mode: "official"` 时，仅 Sentinel 使用本单临时浏览器。在实例 config.json 的 officialSdk 中可指定 executablePath 和 headless。
 
 ## 后端 Sentinel 参考运行时

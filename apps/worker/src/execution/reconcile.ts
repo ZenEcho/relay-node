@@ -1,3 +1,4 @@
+import { reconcileHostedCheckout } from './hosted-checkout.js';
 import { form } from './http-utils.js';
 import type { ExecutionServices } from './services.js';
 export async function reconcilePayment(services: ExecutionServices) {
@@ -61,11 +62,7 @@ export async function reconcilePayment(services: ExecutionServices) {
       }
     }
   }
-  if (
-    services.context.intent?.id &&
-    services.context.intent.client_secret &&
-    services.context.key
-  ) {
+  if (services.context.intent?.id && services.context.intent.client_secret && services.context.key) {
     const old = services.context.intent;
     const result = await services.stripe(
       '只读核对原付款',
@@ -91,6 +88,10 @@ export async function reconcilePayment(services: ExecutionServices) {
     await services.handleIntent();
     return;
   }
+  if (services.context.checkout?.id?.startsWith('cs_') && services.context.key) {
+    await reconcileHostedCheckout(services);
+    return;
+  }
   if (services.context.checkout?.id) {
     const checkout = services.context.checkout;
     const data = await services.chat(
@@ -105,11 +106,7 @@ export async function reconcilePayment(services: ExecutionServices) {
     if (returnedId && returnedId !== checkout.id) throw new Error('商户查询返回了其他结账');
     if (snapshot.processor_entity && snapshot.processor_entity !== checkout.processor_entity)
       throw new Error('商户查询处理方不匹配');
-    if (
-      snapshot.status === 'complete' &&
-      snapshot.payment_status === 'paid' &&
-      returnedId === checkout.id
-    ) {
+    if (snapshot.status === 'complete' && snapshot.payment_status === 'paid' && returnedId === checkout.id) {
       await services.success();
       return;
     }
@@ -131,17 +128,14 @@ export async function reconcilePayment(services: ExecutionServices) {
       returnedId === checkout.id &&
       (!snapshot.account_id || snapshot.account_id === services.context.accountId) &&
       services.assignment.run.dispatches.merchant_confirm &&
-      Object.keys(services.assignment.run.dispatches).every(
-        (action) => action === 'merchant_confirm',
-      )
+      Object.keys(services.assignment.run.dispatches).every((action) => action === 'merchant_confirm')
     ) {
       const info = await services.chat(
         '复核商户拒绝后的原账号订阅',
         '/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-480',
       );
       const selected = (Object.values(info.accounts || {}) as any[]).find(
-        (account) =>
-          (account.account?.account_id || account.account?.id) === services.context.accountId,
+        (account) => (account.account?.account_id || account.account?.id) === services.context.accountId,
       );
       if (
         selected?.entitlement?.has_active_subscription === false &&
