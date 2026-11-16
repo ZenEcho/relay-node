@@ -1,13 +1,10 @@
-import type {
-  Assignment,
-  Control,
-  RuntimeContext,
-} from '../../../../packages/contracts/src/execution.js';
+import type { Assignment, Control, RuntimeContext } from '../../../../packages/contracts/src/execution.js';
 import type { AuditEntry } from '../../../../packages/runtime/src/audit.js';
 import type { HttpInput, HttpOutput } from '../transport/native.js';
 import type { SentinelFlow } from '../../../../packages/contracts/src/sentinel.js';
 export type ExecutionServices = {
   assignment: Assignment;
+  signal?: AbortSignal;
   context: RuntimeContext;
   command: Control['request'];
   log(entry: AuditEntry): Promise<void>;

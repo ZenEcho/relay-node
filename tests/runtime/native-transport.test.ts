@@ -17,6 +17,7 @@ async function fixture(
   t: any,
   scenario = 'recover',
   options: ConstructorParameters<typeof NativeTransport>[1] = {},
+  signal?: AbortSignal,
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'relay-native-retry-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -68,7 +69,7 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
   const environment = createEnvironment('PH', 'http://private-user:private-password@gateway.invalid:8080');
   environment.cookies = [{ name: 'login', value: 'private-cookie', domain: 'chatgpt.com' }];
   environment.headers.authorization = 'Bearer private-access';
-  await transport.initialize(environment);
+  await transport.initialize(environment, signal);
   return {
     transport,
     events,
@@ -241,6 +242,27 @@ test('close interrupts a retry wait and queued requests without starting another
   assert.equal(f.events.at(-1)?.retryStopReason, 'closed');
 });
 
+test('an execution signal immediately cancels a native retry backoff without another wire attempt', async (t) => {
+  const cancellation = new AbortController();
+  const f = await fixture(t, 'fail', { retryDelaysMs: [500, 1500] }, cancellation.signal);
+  let scheduled!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    scheduled = resolve;
+  });
+  const request = f.transport.request(get, {
+    onAttempt: (event) => {
+      f.events.push(event);
+      if (event.outcome === 'retrying') scheduled();
+    },
+  });
+  const rejected = assert.rejects(request, { code: 'TRANSPORT_CLOSED' });
+  await waiting;
+  cancellation.abort();
+  await rejected;
+  assert.equal((await f.records()).filter((x) => x.method === 'GET').length, 1);
+  assert.equal(f.events.at(-1)?.retryStopReason, 'closed');
+});
+
 test('the overall retry budget terminates a hanging helper and records budget exhaustion', async (t) => {
   const f = await fixture(t, 'budget', { retryBudgetMs: 40 });
   const started = Date.now();
@@ -275,6 +297,30 @@ test('a slow audit sink cannot start another request after the overall budget ex
     assert.equal(error.transportAttempts?.[0].retryStopReason, 'budget_exhausted');
     return true;
   });
+  assert.equal((await f.records()).filter((x) => x.method === 'GET').length, 1);
+});
+
+test('the fresh execution guard prevents a GET retry after its first failed attempt is taken over', async (t) => {
+  const cancellation = new AbortController();
+  const f = await fixture(t, 'fail', {}, cancellation.signal);
+  let takenOver = false;
+  const engine = new ProtocolEngine(
+    { context: { environment: f.environment }, run: {} } as any,
+    {
+      signal: cancellation.signal,
+      assertActive: async () => {
+        if (takenOver) {
+          cancellation.abort();
+          throw new Error('manual takeover');
+        }
+      },
+      request: async (_action, body) => {
+        if (body.step.response?.outcome === 'retrying') takenOver = true;
+      },
+    },
+    f.transport,
+  );
+  await assert.rejects((engine as any).request('只读请求', get), { code: 'EXECUTION_ABORTED' });
   assert.equal((await f.records()).filter((x) => x.method === 'GET').length, 1);
 });
 

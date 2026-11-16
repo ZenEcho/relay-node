@@ -18,6 +18,10 @@ import { authorizeSentinel } from './sentinel.js';
 import type { RuntimeContext } from '../../../../packages/contracts/src/execution.js';
 import type { StripeTokenProvider } from '../../../../packages/contracts/src/stripe.js';
 import {
+  executionOperation,
+  throwIfExecutionAborted,
+} from '../../../../packages/runtime/src/cancellation.js';
+import {
   transportAttempt,
   transportAttempts,
   transportDiagnostic,
@@ -41,6 +45,7 @@ export class ProtocolEngine {
   private get services(): ExecutionServices {
     return {
       assignment: this.assignment,
+      signal: this.control.signal,
       context: this.context,
       log: this.log,
       command: this.command.bind(this),
@@ -56,14 +61,19 @@ export class ProtocolEngine {
     };
   }
   private async checkpoint(stage: string) {
+    throwIfExecutionAborted(this.control.signal);
     this.stage = stage;
     this.context.phase = stage;
     await this.command('checkpoint', { context: this.context, stage });
   }
   private log = async (step: AuditEntry) => {
-    await this.control.request('step', { step: { ...step, source: 'worker' } });
+    if (this.control.signal?.aborted) return;
+    await executionOperation(this.control.signal, () =>
+      this.control.request('step', { step: { ...step, source: 'worker' } }),
+    );
   };
   private async command(action: string, body: any = {}): Promise<any> {
+    throwIfExecutionAborted(this.control.signal);
     if (action === 'step') return this.control.request(action, body);
     const names: Record<string, string> = {
       checkpoint: '保存执行进度',
@@ -82,13 +92,16 @@ export class ProtocolEngine {
         ...body,
       },
       async (capture) => {
-        const result = await this.control.request(action, body);
+        const result = await executionOperation(this.control.signal, () =>
+          this.control.request(action, body),
+        );
         capture(result);
         return result;
       },
     );
   }
   private async request(name: string, input: HttpInput) {
+    throwIfExecutionAborted(this.control.signal);
     const environment = this.context.environment;
     return trace(
       this.log,
@@ -108,52 +121,57 @@ export class ProtocolEngine {
         cookieNames: environment.cookies.map((cookie) => cookie.name),
       }),
       async (capture) => {
+        await this.assertActive();
         const origin = new URL(input.url).origin;
         const backoff = this.context.retryAfterByOrigin?.[origin];
         if (backoff && backoff > Date.now())
           throw new UpstreamError('上游仍在退避期限内，只保留原付款', 429, null);
-        const output = await this.transport.request(input, {
-          onAttempt: async (attempt) => {
-            const event = transportAttempt(attempt);
-            if (!event) return;
-            await this.log({
-              traceId: event.attemptId,
-              name: '原生 HTTP 传输尝试',
-              category: 'http',
-              status:
-                event.outcome === 'running'
-                  ? 'running'
-                  : event.outcome === 'succeeded' && (!event.httpStatus || event.httpStatus < 400)
-                    ? 'succeeded'
-                    : 'failed',
-              startedAt: event.startedAt,
-              ...(event.completedAt
-                ? {
-                    completedAt: event.completedAt,
-                    durationMs: event.elapsedMs,
-                  }
-                : {}),
-              request: {
-                requestId: event.requestId,
-                attempt: event.attempt,
-                method: event.method,
-                targetHost: event.targetHost,
-              },
-              response: event,
-              httpStatus: event.httpStatus,
-              ...(event.errorCode
-                ? {
-                    error: event.errorCode,
-                    errorDetail: {
-                      code: event.errorCode,
-                      transportDiagnostic: event.diagnostic,
-                      retryStopReason: event.retryStopReason,
-                    },
-                  }
-                : {}),
-            });
-          },
-        });
+        const output = await executionOperation(this.control.signal, () =>
+          this.transport.request(input, {
+            onAttempt: async (attempt) => {
+              const event = transportAttempt(attempt);
+              if (!event) return;
+              await this.log({
+                traceId: event.attemptId,
+                name: '原生 HTTP 传输尝试',
+                category: 'http',
+                status:
+                  event.outcome === 'running'
+                    ? 'running'
+                    : event.outcome === 'succeeded' && (!event.httpStatus || event.httpStatus < 400)
+                      ? 'succeeded'
+                      : 'failed',
+                startedAt: event.startedAt,
+                ...(event.completedAt
+                  ? {
+                      completedAt: event.completedAt,
+                      durationMs: event.elapsedMs,
+                    }
+                  : {}),
+                request: {
+                  requestId: event.requestId,
+                  attempt: event.attempt,
+                  method: event.method,
+                  targetHost: event.targetHost,
+                },
+                response: event,
+                httpStatus: event.httpStatus,
+                ...(event.errorCode
+                  ? {
+                      error: event.errorCode,
+                      errorDetail: {
+                        code: event.errorCode,
+                        transportDiagnostic: event.diagnostic,
+                        retryStopReason: event.retryStopReason,
+                      },
+                    }
+                  : {}),
+              });
+              if (event.outcome === 'running') await this.assertActive();
+            },
+          }),
+        );
+        throwIfExecutionAborted(this.control.signal);
         capture(
           {
             status: output.status,
@@ -242,7 +260,10 @@ export class ProtocolEngine {
     ).data;
   }
   async execute() {
+    const abort = () => this.transport.close();
+    this.control.signal?.addEventListener('abort', abort, { once: true });
     try {
+      throwIfExecutionAborted(this.control.signal);
       await trace(
         this.log,
         '初始化订单环境与凭证',
@@ -253,7 +274,9 @@ export class ProtocolEngine {
         },
         async (capture) => {
           loadCredential(this.context);
-          await this.transport.initialize(this.context.environment);
+          await executionOperation(this.control.signal, () =>
+            this.transport.initialize(this.context.environment, this.control.signal),
+          );
           capture({
             initialized: true,
             profile: this.context.environment.profile,
@@ -417,23 +440,26 @@ export class ProtocolEngine {
         const card = await this.command('card');
         try {
           if (this.stripeTokenProvider) {
+            await this.assertActive();
             const lastFour = card.lastFour || String(card.number || '').slice(-4);
             if (!/^\d{4}$/.test(lastFour)) throw new Error('本次卡片尾号无效');
-            const token = await this.stripeTokenProvider(
-              {
-                checkoutId: this.context.checkout!.id,
-                accountId: this.context.accountId!,
-                environmentId: this.context.environment.id,
-                deviceId: this.context.environment.deviceId,
-                publishableKey: this.context.key!,
-                customerSessionClientSecret: this.context.customerSessionClientSecret,
-                amountMinor: this.context.snapshot.amount_total,
-                currency: this.context.currency,
-                billing,
-                returnUrl: this.context.confirmReturnUrl || this.context.snapshot.return_url || CHAT + '/',
-                cardLastFour: lastFour,
-              },
-              card,
+            const token = await executionOperation(this.control.signal, () =>
+              this.stripeTokenProvider!(
+                {
+                  checkoutId: this.context.checkout!.id,
+                  accountId: this.context.accountId!,
+                  environmentId: this.context.environment.id,
+                  deviceId: this.context.environment.deviceId,
+                  publishableKey: this.context.key!,
+                  customerSessionClientSecret: this.context.customerSessionClientSecret,
+                  amountMinor: this.context.snapshot.amount_total,
+                  currency: this.context.currency,
+                  billing,
+                  returnUrl: this.context.confirmReturnUrl || this.context.snapshot.return_url || CHAT + '/',
+                  cardLastFour: lastFour,
+                },
+                card,
+              ),
             );
             if (!/^ctoken_[a-zA-Z0-9]+$/.test(token?.id || '') || token.lastFour !== lastFour)
               throw new Error('官方 Stripe SDK 返回的令牌或卡片尾号不匹配');
@@ -568,6 +594,7 @@ export class ProtocolEngine {
       await this.checkpoint('stripe_result');
       await this.handleIntent();
     } catch (error) {
+      if (this.control.signal?.aborted || (error as any)?.code === 'EXECUTION_ABORTED') return;
       const e = error as Error;
       await this.log({
         name: '执行失败 · ' + this.stage,
@@ -619,13 +646,17 @@ export class ProtocolEngine {
         });
       }
     } finally {
+      this.control.signal?.removeEventListener('abort', abort);
       this.transport.close();
-      await this.log({
-        name: '关闭订单传输会话',
-        status: 'succeeded',
-        category: 'event',
-        response: { environmentId: this.context.environment.id, closed: true },
-      });
+      if (!this.control.signal?.aborted)
+        await this.log({
+          name: '关闭订单传输会话',
+          status: 'succeeded',
+          category: 'event',
+          response: { environmentId: this.context.environment.id, closed: true },
+        }).catch((error) => {
+          if (!this.control.signal?.aborted) throw error;
+        });
     }
   }
   private async preflight() {
@@ -644,7 +675,10 @@ export class ProtocolEngine {
         ? (input) => this.chat('模拟 Sentinel 授权', '/backend-api/sentinel/req', input)
         : undefined);
     await trace(this.log, '取得本单 Sentinel 授权', { flow, pageUrl }, async (capture) => {
-      await authorizeSentinel(this.context, flow, pageUrl, authorize);
+      await this.assertActive();
+      await executionOperation(this.control.signal, () =>
+        authorizeSentinel(this.context, flow, pageUrl, authorize, this.control.signal),
+      );
       capture({
         flow,
         expiresAt: this.context.sentinelExpiresAt,
@@ -655,23 +689,31 @@ export class ProtocolEngine {
     await this.checkpoint('sentinel_ready');
   }
   private async reconcile() {
-    return reconcilePayment(this.services);
+    return executionOperation(this.control.signal, () => reconcilePayment(this.services));
+  }
+  private async assertActive() {
+    throwIfExecutionAborted(this.control.signal);
+    if (this.control.assertActive)
+      await executionOperation(this.control.signal, () => this.control.assertActive!());
+    throwIfExecutionAborted(this.control.signal);
   }
   private async acknowledgeVerification() {
-    return acknowledgeVerification(this.services);
+    return executionOperation(this.control.signal, () => acknowledgeVerification(this.services));
   }
   private async handleIntent() {
-    return handlePaymentIntent(this.services);
+    return executionOperation(this.control.signal, () => handlePaymentIntent(this.services));
   }
   private async park(status: string, error?: string) {
+    throwIfExecutionAborted(this.control.signal);
     await this.command('finish', { status, context: this.context, error });
   }
   private async success() {
+    throwIfExecutionAborted(this.control.signal);
     this.paid = true;
     await this.command('finish', { status: 'paid', context: this.context });
     await this.cleanup();
   }
   private async cleanup() {
-    return cleanupExecution(this.services);
+    return executionOperation(this.control.signal, () => cleanupExecution(this.services));
   }
 }

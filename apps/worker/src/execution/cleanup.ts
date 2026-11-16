@@ -2,10 +2,13 @@ import { trace } from '../../../../packages/runtime/src/audit.js';
 import { redact } from '../../../../packages/rules/src/privacy.js';
 import { verifySessionIdentity } from './credentials.js';
 import type { ExecutionServices } from './services.js';
+import { throwIfExecutionAborted } from '../../../../packages/runtime/src/cancellation.js';
 export async function cleanupExecution(services: ExecutionServices) {
+  throwIfExecutionAborted(services.signal);
   const cleanup = (services.context.cleanup ||= {});
   const config = services.assignment.run.workflow.cleanup;
   const perform = async (name: string, enabled: boolean, action: () => Promise<void>) => {
+    throwIfExecutionAborted(services.signal);
     if (cleanup[name]?.status === 'succeeded') return;
     if (!enabled) {
       cleanup[name] = { status: 'skipped' };
@@ -22,10 +25,12 @@ export async function cleanupExecution(services: ExecutionServices) {
       await services.checkpoint('cleanup_' + name);
       await trace(services.log, '收尾 · ' + name, { enabled }, async (capture) => {
         await action();
+        throwIfExecutionAborted(services.signal);
         capture({ status: 'succeeded' });
       });
       cleanup[name] = { status: 'succeeded' };
     } catch (error) {
+      throwIfExecutionAborted(services.signal);
       cleanup[name] = {
         status: 'failed',
         error: String(redact((error as Error).message)),
@@ -78,23 +83,15 @@ export async function cleanupExecution(services: ExecutionServices) {
       const accounts = Object.values(accountInfo.accounts || {}) as any[];
       if (
         services.context.accountId &&
-        !accounts.some(
-          (a) => (a.account?.account_id || a.account?.id) === services.context.accountId,
-        )
+        !accounts.some((a) => (a.account?.account_id || a.account?.id) === services.context.accountId)
       )
         throw new Error('刷新后的认证无法读取原账号');
-      if (
-        services.context.userId &&
-        accountInfo.user?.id &&
-        services.context.userId !== accountInfo.user.id
-      )
+      if (services.context.userId && accountInfo.user?.id && services.context.userId !== accountInfo.user.id)
         throw new Error('刷新后的认证属于其他用户');
       services.context.latestSession = JSON.stringify({
         ...refreshed,
         account: refreshed.account || { id: services.context.accountId },
-        cookies: services.context.environment.cookies.filter((c) =>
-          /(?:^|\.)chatgpt\.com$/.test(c.domain),
-        ),
+        cookies: services.context.environment.cookies.filter((c) => /(?:^|\.)chatgpt\.com$/.test(c.domain)),
       });
     } catch (error) {
       services.context.session = oldSession;
@@ -116,15 +113,13 @@ export async function cleanupExecution(services: ExecutionServices) {
       '核验自动续费已取消',
       '/backend-api/subscriptions?account_id=' + encodeURIComponent(services.context.accountId),
     );
-    if ((check.subscription || check).will_renew !== false)
-      throw new Error('取消请求未取得已关闭续费的确认');
+    if ((check.subscription || check).will_renew !== false) throw new Error('取消请求未取得已关闭续费的确认');
     services.context.renewalStatus = 'cancelled';
   });
   await perform('invoices', config.invoices, async () => {
     const result = await services.chat(
       '获取原账号账单',
-      '/backend-api/invoices?limit=4&account_id=' +
-        encodeURIComponent(services.context.accountId || ''),
+      '/backend-api/invoices?limit=4&account_id=' + encodeURIComponent(services.context.accountId || ''),
     );
     const list: any[] = result.invoices || result.data || result.items || [];
     services.context.billingExternalUrls = list

@@ -2,17 +2,19 @@ import type { Assignment, Control } from '../../../../packages/contracts/src/exe
 export type { Assignment, Control } from '../../../../packages/contracts/src/execution.js';
 import { WorkerLogs } from './logs.js';
 import { randomUUID } from 'node:crypto';
+import {
+  executionAborted,
+  executionOperation,
+  throwIfExecutionAborted,
+} from '../../../../packages/runtime/src/cancellation.js';
 export class HttpController {
   private logs: WorkerLogs;
   constructor(
     readonly origin: string,
     private token: string,
   ) {
-    this.logs = new WorkerLogs(
-      process.env.WORKER_LOG_DIR || '.data/worker-audit',
-      origin,
-      token,
-      (record) => this.request('logs', record),
+    this.logs = new WorkerLogs(process.env.WORKER_LOG_DIR || '.data/worker-audit', origin, token, (record) =>
+      this.request('logs', record),
     );
   }
   async initializeLogs() {
@@ -24,7 +26,8 @@ export class HttpController {
   get pendingLogs() {
     return this.logs.pending;
   }
-  async request(path: string, body: any = {}) {
+  async request(path: string, body: any = {}, signal?: AbortSignal) {
+    throwIfExecutionAborted(signal);
     const r = await fetch(this.origin.replace(/\/$/, '') + '/api/worker/' + path, {
       method: 'POST',
       headers: {
@@ -33,7 +36,7 @@ export class HttpController {
       },
       body: JSON.stringify(body),
       redirect: 'error',
-      signal: AbortSignal.timeout(45000),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(45000)]) : AbortSignal.timeout(45000),
     });
     let text: string;
     try {
@@ -71,20 +74,45 @@ export class HttpController {
           body: value,
         },
       });
+    throwIfExecutionAborted(signal);
     return value;
   }
-  forRun(assignment: Assignment): Control {
-    return {
-      request: (action, body = {}) =>
-        action === 'step'
-          ? this.logs.enqueue(assignment.run.id, assignment.run.workerLease!, {
-              ...body.step,
-              traceId: body.step.traceId || randomUUID(),
-            })
-          : this.request(`runs/${encodeURIComponent(assignment.run.id)}/${action}`, {
+  forRun(assignment: Assignment, cancellation = new AbortController()): Control {
+    const signal = cancellation.signal;
+    const request: Control['request'] = (action, body = {}) =>
+      executionOperation(signal, async () => {
+        if (action === 'step')
+          return this.logs.enqueue(assignment.run.id, assignment.run.workerLease!, {
+            ...body.step,
+            traceId: body.step.traceId || randomUUID(),
+          });
+        try {
+          return await this.request(
+            `runs/${encodeURIComponent(assignment.run.id)}/${action}`,
+            {
               ...body,
               lease: assignment.run.workerLease,
-            }),
+            },
+            signal,
+          );
+        } catch (error) {
+          const e = error as { status?: number; code?: string; httpResponse?: { status?: number } };
+          if (
+            [401, 403, 404].includes(e.status || e.httpResponse?.status || 0) ||
+            e.code === 'RUN_MANUAL_TAKEOVER'
+          ) {
+            cancellation.abort();
+            throw executionAborted();
+          }
+          throw error;
+        }
+      });
+    return {
+      signal,
+      request,
+      assertActive: async () => {
+        await request('check');
+      },
     };
   }
 }

@@ -3,6 +3,7 @@ import { createInterface } from 'node:readline';
 import { access } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { throwIfExecutionAborted } from '../../../../packages/runtime/src/cancellation.js';
 import type { Environment } from '../../../../packages/contracts/src/execution.js';
 import {
   nativeTransportErrorCode,
@@ -34,7 +35,7 @@ export type HttpOutput = {
   transportAttempts?: TransportAttempt[];
 };
 export interface Transport {
-  initialize(environment: Environment): Promise<void>;
+  initialize(environment: Environment, signal?: AbortSignal): Promise<void>;
   request(input: HttpInput, options?: TransportRequestOptions): Promise<HttpOutput>;
   close(): void;
 }
@@ -129,19 +130,29 @@ export class NativeTransport implements Transport {
   private environment?: Environment;
   private generation = 0;
   private cancellation = new AbortController();
+  private releaseExecutionSignal?: () => void;
   // A reset of idle connections must not race another request in this helper.
   private queue: Promise<void> = Promise.resolve();
   constructor(
     private binary: string,
     private options: NativeTransportOptions = {},
   ) {}
-  async initialize(environment: Environment) {
+  async initialize(environment: Environment, signal?: AbortSignal) {
+    throwIfExecutionAborted(signal);
     await access(this.binary);
+    throwIfExecutionAborted(signal);
+    this.releaseExecutionSignal?.();
+    this.releaseExecutionSignal = undefined;
     if (this.process) this.close();
     this.generation++;
     this.cancellation = new AbortController();
     this.queue = Promise.resolve();
     this.environment = environment;
+    if (signal) {
+      const abort = () => this.close();
+      signal.addEventListener('abort', abort, { once: true });
+      this.releaseExecutionSignal = () => signal.removeEventListener('abort', abort);
+    }
     const child = spawn(this.binary, [], { stdio: ['pipe', 'pipe', 'pipe'] });
     this.process = child;
     createInterface({ input: child.stdout }).on('line', (line) => {
@@ -346,6 +357,7 @@ export class NativeTransport implements Transport {
         }
         continue;
       }
+      this.active(generation);
       if (response.cookies) this.environment!.cookies = response.cookies;
       let data: any = null;
       try {
@@ -382,6 +394,8 @@ export class NativeTransport implements Transport {
     this.pending.clear();
   }
   close() {
+    this.releaseExecutionSignal?.();
+    this.releaseExecutionSignal = undefined;
     this.generation++;
     this.cancellation.abort();
     this.rejectAll(new NativeTransportError('TRANSPORT_CLOSED'));

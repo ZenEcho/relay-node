@@ -2,17 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createConnection } from 'node:net';
-import {
-  mkdtemp,
-  mkdir,
-  cp,
-  writeFile,
-  readFile,
-  rm,
-  symlink,
-  readlink,
-  stat,
-} from 'node:fs/promises';
+import { mkdtemp, mkdir, cp, writeFile, readFile, rm, symlink, readlink, stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { spawn, execFile, execFileSync } from 'node:child_process';
@@ -118,15 +108,7 @@ finally:
     const base = join(root, 'instances');
     const result = await exec(
       'python3',
-      [
-        '-c',
-        python,
-        process.execPath,
-        join(release, 'dist/apps/worker/src/cli.js'),
-        base,
-        address,
-        token,
-      ],
+      ['-c', python, process.execPath, join(release, 'dist/apps/worker/src/cli.js'), base, address, token],
       { timeout: 45000 },
     );
     assert.match(result.stdout, /without credential echo/);
@@ -177,8 +159,7 @@ test('install, menu commands, idle update, failed rebind and multiple instances 
       control.revision++;
       if (body.action === 'pause') control.desiredState = 'paused';
       if (body.action === 'resume') control.desiredState = 'running';
-      if (body.action === 'check_update')
-        control.update = { id: body.requestId, phase: 'draining' };
+      if (body.action === 'check_update') control.update = { id: body.requestId, phase: 'draining' };
       response.end(JSON.stringify({ control, blockers, protocolVersion: 1 }));
     } else if (request.url?.endsWith('/prepare')) {
       prepares++;
@@ -229,8 +210,7 @@ test('install, menu commands, idle update, failed rebind and multiple instances 
         () => false,
       )),
   );
-  const run = (action: string) =>
-    exec(process.execPath, [cli, '--instance', 'one', action], { env });
+  const run = (action: string) => exec(process.execPath, [cli, '--instance', 'one', action], { env });
   await run('pause');
   await until(async () => control.desiredState === 'paused');
   const count = heartbeats;
@@ -290,22 +270,13 @@ test('install, menu commands, idle update, failed rebind and multiple instances 
   }
   await candidate('0.2.0');
   await run('check_update');
-  await until(
-    async () => control.update?.phase === 'completed' && reportedVersion === '0.2.0',
-    25000,
-  );
+  await until(async () => control.update?.phase === 'completed' && reportedVersion === '0.2.0', 25000);
   assert.equal(control.desiredState, 'paused');
   assert.equal(await readFile(join(base, 'one/config.json'), 'utf8'), configBefore);
-  assert.equal(
-    await readFile(join(base, 'one/audit/preserved'), 'utf8'),
-    'encrypted-queue-sentinel',
-  );
+  assert.equal(await readFile(join(base, 'one/audit/preserved'), 'utf8'), 'encrypted-queue-sentinel');
   await candidate('0.3.0', true);
   await run('check_update');
-  await until(
-    async () => control.update?.phase === 'rolled_back' && reportedVersion === '0.2.0',
-    25000,
-  );
+  await until(async () => control.update?.phase === 'rolled_back' && reportedVersion === '0.2.0', 25000);
   assert.equal(control.desiredState, 'paused');
   assert.equal(await readFile(join(base, 'one/config.json'), 'utf8'), configBefore);
   await until(
@@ -429,11 +400,9 @@ test('a broken execution helper leaves management online without declaring start
     consoleUrl: 'http://127.0.0.1:' + (upstream.address() as any).port,
     token: 'relaynode.test.one.token',
   });
-  const manager = spawn(
-    process.execPath,
-    [join(release, 'dist/apps/worker/src/entry.js'), instance],
-    { stdio: 'ignore' },
-  );
+  const manager = spawn(process.execPath, [join(release, 'dist/apps/worker/src/entry.js'), instance], {
+    stdio: 'ignore',
+  });
   t.after(async () => {
     if (manager.exitCode === null) {
       const ended = new Promise<void>((resolve) => manager.once('exit', () => resolve()));
@@ -461,4 +430,100 @@ test('a broken execution helper leaves management online without declaring start
     ),
     false,
   );
+});
+
+test('a heartbeat cancellation aborts a blocked run and releases its in-flight slot without a finish write', async (t) => {
+  const root = await mkdtemp('/tmp/relay-cancel-runtime-');
+  const release = await fixture(root),
+    instance = join(root, 'instance');
+  await mkdir(instance);
+  await symlink(release, join(instance, 'current'));
+  let polled = false,
+    blocked = false,
+    cancelled = false,
+    released = false,
+    finishes = 0;
+  const lease = 'original-worker-lease';
+  const assignment = {
+    mode: 'execute',
+    demo: true,
+    paymentEnabled: true,
+    run: {
+      id: 'original-run',
+      workerLease: lease,
+      paymentSubmitted: false,
+      dispatches: {},
+      order: {},
+      workflow: { plan: 'gpt_plus', cleanup: {} },
+    },
+    context: {
+      environment: {
+        id: 'environment',
+        profile: 'chrome_146',
+        userAgent: 'test',
+        headers: {},
+        proxyUrl: '',
+        country: 'PH',
+        deviceId: 'device',
+        stripeIds: { guid: 'guid', muid: 'muid', sid: 'sid' },
+        cookies: [],
+      },
+      credential: JSON.stringify({
+        accessToken: 'test',
+        account: { id: 'demo-account' },
+        user: { email: 'test@example.invalid' },
+      }),
+    },
+  };
+  const upstream = createServer(async (request, response) => {
+    let raw = '';
+    for await (const chunk of request) raw += chunk;
+    const body = JSON.parse(raw || '{}');
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/api/worker/heartbeat') {
+      if (blocked) cancelled = true;
+      if (cancelled && body.inFlightCount === 0) released = true;
+      response.end(
+        JSON.stringify({
+          control: { revision: 0, desiredState: 'running' },
+          blockers: [],
+          protocolVersion: 1,
+          cancelledRuns: cancelled
+            ? [{ id: 'original-run', leaseDigest: createHash('sha256').update(lease).digest('hex') }]
+            : [],
+        }),
+      );
+    } else if (request.url === '/api/worker/poll') {
+      response.end(polled ? 'null' : JSON.stringify(assignment));
+      polled = true;
+    } else if (request.url?.endsWith('/checkpoint')) {
+      blocked = true;
+      // A force-takeover heartbeat must interrupt this pending response.
+    } else {
+      if (request.url?.endsWith('/finish')) finishes++;
+      response.end('{"ok":true}');
+    }
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  await saveJson(join(instance, 'config.json'), {
+    instance: 'one',
+    consoleUrl: 'http://127.0.0.1:' + (upstream.address() as any).port,
+    token: 'relaynode.test.one.token',
+  });
+  const manager = spawn(process.execPath, [join(release, 'dist/apps/worker/src/entry.js'), instance], {
+    stdio: 'ignore',
+  });
+  t.after(async () => {
+    if (manager.exitCode === null) {
+      const ended = new Promise<void>((resolve) => manager.once('exit', () => resolve()));
+      manager.kill('SIGTERM');
+      await Promise.race([ended, delay(4000)]);
+    }
+    upstream.closeAllConnections();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  });
+  await until(async () => released, 12000);
+  assert.equal(cancelled, true);
+  assert.equal(finishes, 0);
 });

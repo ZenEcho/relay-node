@@ -1,3 +1,4 @@
+import { executionAborted, throwIfExecutionAborted } from '../../../../packages/runtime/src/cancellation.js';
 type Waiter = {
   resolve(value: any): void;
   reject(error: Error): void;
@@ -18,8 +19,7 @@ export class SdkCdp {
           if (value.error) waiting.reject(new Error('官方 SDK 浏览器操作失败'));
           else waiting.resolve(value.result);
         } else if (value.method) {
-          for (const listener of this.listeners)
-            listener(value.method, value.params, value.sessionId);
+          for (const listener of this.listeners) listener(value.method, value.params, value.sessionId);
         }
       } catch {
         this.close();
@@ -28,7 +28,8 @@ export class SdkCdp {
     socket.addEventListener('close', () => this.fail());
     socket.addEventListener('error', () => this.fail());
   }
-  static async connect(endpoint: string) {
+  static async connect(endpoint: string, signal?: AbortSignal) {
+    throwIfExecutionAborted(signal);
     const url = new URL(endpoint);
     if (
       url.protocol !== 'ws:' ||
@@ -39,14 +40,29 @@ export class SdkCdp {
       throw new Error('SDK 浏览器调试端点无效');
     const socket = new WebSocket(endpoint);
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const abort = () => {
+        clean();
+        try {
+          socket.close();
+        } catch {}
+        reject(executionAborted());
+      };
+      signal?.addEventListener('abort', abort, { once: true });
+      const clean = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', abort);
+      };
+      timer = setTimeout(() => {
+        clean();
         socket.close();
         reject(new Error('SDK 浏览器连接超时'));
       }, 10000);
+      if (signal?.aborted) abort();
       socket.addEventListener(
         'open',
         () => {
-          clearTimeout(timer);
+          clean();
           resolve();
         },
         { once: true },
@@ -54,7 +70,7 @@ export class SdkCdp {
       socket.addEventListener(
         'error',
         () => {
-          clearTimeout(timer);
+          clean();
           reject(new Error('SDK 浏览器连接失败'));
         },
         { once: true },
@@ -68,8 +84,7 @@ export class SdkCdp {
   send(method: string, params: any = {}, sessionId?: string, timeout = 30000): Promise<any> {
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
-      if (this.socket.readyState !== WebSocket.OPEN)
-        return reject(new Error('SDK 浏览器连接已关闭'));
+      if (this.socket.readyState !== WebSocket.OPEN) return reject(new Error('SDK 浏览器连接已关闭'));
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error('SDK 浏览器操作超时'));

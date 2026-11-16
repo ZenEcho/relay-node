@@ -34,10 +34,7 @@ process.stdin.on('end', () => {
 `,
     { mode: 0o600 },
   );
-  const environment = createEnvironment(
-    'PH',
-    'http://private-user:private-password@127.0.0.1:12345',
-  );
+  const environment = createEnvironment('PH', 'http://private-user:private-password@127.0.0.1:12345');
   environment.deviceId = 'original-device';
   const context: RuntimeContext = {
     environment,
@@ -95,6 +92,51 @@ test('the one-shot reference bridge receives the exact original profile, device,
   assert.equal(JSON.parse(result.soToken!).flow, 'checkout_session_approval');
   assert.notEqual(JSON.parse(result.token).c, JSON.parse(result.soToken!).c);
   assert.equal(Date.parse(result.expiresAt) - Date.parse(result.issuedAt), 60000);
+});
+
+test('cancelling authorization kills the one-shot reference bridge and its child process group', async (t) => {
+  const f = await fixture(
+    t,
+    `
+const child=require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+fs.writeFileSync(__dirname+'/pids.json',JSON.stringify([process.pid,child.pid]));
+setInterval(()=>{},1000);
+`,
+  );
+  const cancellation = new AbortController();
+  t.after(() => cancellation.abort());
+  const authorize = createReferenceSentinelAuthorizer(
+    f.context,
+    { bridgePath: f.bridgePath },
+    cancellation.signal,
+  );
+  const pending = authorize(f.request);
+  let pids: number[] = [];
+  for (let i = 0; i < 200; i++) {
+    try {
+      pids = JSON.parse(await readFile(join(f.directory, 'pids.json'), 'utf8'));
+      break;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(pids.length, 2);
+  cancellation.abort();
+  await assert.rejects(pending, { code: 'EXECUTION_ABORTED' });
+  for (let i = 0; i < 100; i++) {
+    if (
+      pids.every((pid) => {
+        try {
+          process.kill(pid, 0);
+          return false;
+        } catch {
+          return true;
+        }
+      })
+    )
+      return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail('a cancelled reference process remained alive');
 });
 
 test('a Session-backed identity without login cookies still seeds its original DID and allows absent SO', async (t) => {
@@ -172,10 +214,7 @@ const rejectedOutputs = [
     'exhausted proof',
     "out.main = JSON.stringify({p:'gAAAAABwQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4Dfailure~S',c:'challenge',id:args.deviceId,flow:args.flow});",
   ],
-  [
-    'wrong main identity',
-    "out.main = JSON.stringify({p:'proof',c:'challenge',id:'wrong',flow:args.flow});",
-  ],
+  ['wrong main identity', "out.main = JSON.stringify({p:'proof',c:'challenge',id:'wrong',flow:args.flow});"],
   [
     'wrong main flow',
     "out.main = JSON.stringify({p:'proof',c:'challenge',id:args.deviceId,flow:'oauth_create_account'});",
@@ -189,19 +228,13 @@ const rejectedOutputs = [
     'wrong observer flow',
     "out.so = JSON.stringify({so:'observer',c:'challenge',id:args.deviceId,flow:'chatgpt_checkout'});",
   ],
-  [
-    'missing observer challenge',
-    "out.so = JSON.stringify({so:'observer',id:args.deviceId,flow:args.flow});",
-  ],
+  ['missing observer challenge', "out.so = JSON.stringify({so:'observer',id:args.deviceId,flow:args.flow});"],
   ['bridge error', "out.error = 'private-runtime-output';"],
 ];
 for (const [name, mutation] of rejectedOutputs) {
   test('reference authorization rejects ' + name, async (t) => {
     const f = await fixture(t, mutation + 'process.stdout.write(JSON.stringify(out));');
-    await assert.rejects(
-      f.authorize(f.request),
-      (error: any) => error.code === 'SENTINEL_AUTH_REQUIRED',
-    );
+    await assert.rejects(f.authorize(f.request), (error: any) => error.code === 'SENTINEL_AUTH_REQUIRED');
   });
 }
 

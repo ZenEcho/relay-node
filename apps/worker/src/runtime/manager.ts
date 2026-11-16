@@ -14,6 +14,7 @@ import { join, resolve } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { HttpController } from './controller.js';
+import { ExecutionCancellations } from './cancellation.js';
 import {
   executeWithOnDemandSdk,
   checkPaymentRuntime,
@@ -78,6 +79,7 @@ export async function runManager(root: string) {
     commands: [],
   });
   const pending = new Set<Promise<unknown>>();
+  const cancellations = new ExecutionCancellations();
   let stopping = false,
     ready = initialReady,
     lastProbe = Date.now(),
@@ -95,6 +97,11 @@ export async function runManager(root: string) {
     inFlightCount: pending.size,
     runtimeState: upgrading ? 'updating' : status.control?.desiredState || 'running',
   });
+  const heartbeat = async () => {
+    const value = await controller.request('heartbeat', metadata());
+    cancellations.apply(value.cancelledRuns);
+    return value;
+  };
   async function update(id: string) {
     const report = (phase: string, extra: object = {}) =>
       controller.request(`updates/${id}/report`, { phase, ...extra });
@@ -252,7 +259,7 @@ export async function runManager(root: string) {
             ready = false;
           }
         }
-        status = await controller.request('heartbeat', metadata());
+        status = await heartbeat();
         authenticated = true;
         const result = await jsonFile<any>(join(root, 'update-result.json'), null);
         if (result) {
@@ -262,14 +269,14 @@ export async function runManager(root: string) {
               error: result.error,
             });
           await rm(join(root, 'update-result.json'), { force: true });
-          status = await controller.request('heartbeat', metadata());
+          status = await heartbeat();
         }
         if (!upgrading && status.control?.update?.phase === 'installing') {
           await controller.request(`updates/${status.control.update.id}/report`, {
             phase: 'failed',
             error: '安装过程被中断，当前版本保持运行',
           });
-          status = await controller.request('heartbeat', metadata());
+          status = await heartbeat();
         }
         const upgrade = await jsonFile<any>(join(root, 'upgrade.json'), null);
         if (ready && !pending.size && status.control?.update?.phase === 'restarting') {
@@ -340,18 +347,24 @@ export async function runManager(root: string) {
         ) {
           const assignment = await controller.request('poll');
           if (assignment) {
-            const task = executeWithOnDemandSdk(
-              assignment,
-              controller.forRun(assignment),
-              assignment.demo
-                ? new DemoTransport()
-                : new NativeTransport(join(releaseRoot, 'bin/relay-transport')),
-              config.officialSdk,
-              config.sentinel,
-            )
-              .catch(() => console.error('执行回执未确认，保留原任务等待核对'))
-              .finally(() => pending.delete(task));
-            pending.add(task);
+            const handle = cancellations.register(assignment.run.id, assignment.run.workerLease);
+            if (handle && !handle.controller.signal.aborted) {
+              const task = executeWithOnDemandSdk(
+                assignment,
+                controller.forRun(assignment, handle.controller),
+                assignment.demo
+                  ? new DemoTransport()
+                  : new NativeTransport(join(releaseRoot, 'bin/relay-transport')),
+                config.officialSdk,
+                config.sentinel,
+              )
+                .catch(() => console.error('执行回执未确认，保留原任务等待核对'))
+                .finally(() => {
+                  handle.dispose();
+                  pending.delete(task);
+                });
+              pending.add(task);
+            } else handle?.dispose();
           }
         }
       } catch {

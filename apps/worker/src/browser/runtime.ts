@@ -1,6 +1,11 @@
 import { cardInputValues } from './card-input.js';
 import { defaultSentinelRuntime, findSdkBrowser, sdkLoginCookies } from './configuration.js';
-export { checkPaymentRuntime, defaultSentinelRuntime, findSdkBrowser, sdkLoginCookies } from './configuration.js';
+export {
+  checkPaymentRuntime,
+  defaultSentinelRuntime,
+  findSdkBrowser,
+  sdkLoginCookies,
+} from './configuration.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -15,6 +20,10 @@ import type { StripeTokenProvider } from '../../../../packages/contracts/src/str
 import type { Assignment, Control } from '../runtime/controller.js';
 import type { Transport } from '../transport/native.js';
 import { ProtocolEngine } from '../execution/engine.js';
+import {
+  executionOperation,
+  throwIfExecutionAborted,
+} from '../../../../packages/runtime/src/cancellation.js';
 
 export type OnDemandSdkOptions = {
   executablePath?: string;
@@ -49,6 +58,7 @@ export class OnDemandSdkRuntime {
   constructor(
     private assignment: Assignment,
     private options: OnDemandSdkOptions = {},
+    private signal?: AbortSignal,
   ) {}
 
   // Diagnostics expose lifecycle only, never debugger endpoints, cookies or card data.
@@ -64,6 +74,7 @@ export class OnDemandSdkRuntime {
   }
 
   private async open() {
+    throwIfExecutionAborted(this.signal);
     if (this.disposed) throw new Error('本单官方 SDK 环境已关闭');
     return (this.opening ||= this.launch().catch(async (error) => {
       await this.close();
@@ -72,12 +83,22 @@ export class OnDemandSdkRuntime {
   }
   private async launch() {
     const executablePath = await findSdkBrowser(this.options.executablePath);
+    throwIfExecutionAborted(this.signal);
+    if (this.disposed) throw new Error('本单官方 SDK 环境已关闭');
     const context = this.assignment.context;
     if (!context.environment.cookies.some((c) => /session-token(?:\.\d+)?$/.test(c.name)))
       throw Object.assign(new Error('本单缺少可供官方 SDK 登录的 Cookie/sessionToken'), {
         code: 'OFFICIAL_SDK_AUTH_REQUIRED',
       });
-    if (context.environment.proxyUrl) this.proxy = await startSdkProxy(context.environment.proxyUrl);
+    if (context.environment.proxyUrl) {
+      const proxy = await startSdkProxy(context.environment.proxyUrl);
+      if (this.disposed || this.signal?.aborted) {
+        await proxy.close();
+        throwIfExecutionAborted(this.signal);
+        throw new Error('本单官方 SDK 环境已关闭');
+      }
+      this.proxy = proxy;
+    }
     const host = (this.host = spawn(
       process.execPath,
       [fileURLToPath(new URL('./host.js', import.meta.url))],
@@ -113,10 +134,18 @@ export class OnDemandSdkRuntime {
         }) + '\n',
       );
     });
+    throwIfExecutionAborted(this.signal);
+    if (this.disposed) throw new Error('本单官方 SDK 环境已关闭');
     this.startedAt = Date.now();
     this.profile = info.profile;
     this.browserPid = info.pid;
-    const cdp = (this.cdp = await SdkCdp.connect(info.endpoint));
+    const cdp = await SdkCdp.connect(info.endpoint, this.signal);
+    if (this.disposed || this.signal?.aborted) {
+      cdp.close();
+      throwIfExecutionAborted(this.signal);
+      throw new Error('本单官方 SDK 环境已关闭');
+    }
+    this.cdp = cdp;
     cdp.on((method, params, session) => {
       if (method === 'Network.responseReceived' && session === this.session && params.type === 'Document')
         this.documentResponse = {
@@ -389,11 +418,17 @@ export class OnDemandSdkRuntime {
     }
     throw new Error('官方 Stripe 安全收卡框架未就绪');
   }
-  async close() {
+  async close(immediate = false) {
+    if (immediate) {
+      this.disposed = true;
+      this.cdp?.close();
+      this.host?.stdin.end();
+      if (this.host?.exitCode === null) this.host.kill('SIGTERM');
+    }
     return (this.closing ||= (async () => {
       this.disposed = true;
       try {
-        await this.cdp?.send('Browser.close', {}, undefined, 2000);
+        if (!immediate) await this.cdp?.send('Browser.close', {}, undefined, 2000);
       } catch {}
       this.cdp?.close();
       this.host?.stdin.end();
@@ -416,14 +451,24 @@ export async function executeWithOnDemandSdk(
   options: OnDemandSdkOptions = {},
   sentinel: SentinelRuntimeOptions = defaultSentinelRuntime(),
 ) {
-  const sdk = new OnDemandSdkRuntime(assignment, options);
+  const sdk = new OnDemandSdkRuntime(assignment, options, control.signal);
+  const abort = () => {
+    transport.close();
+    void sdk.close(true).catch(() => {});
+  };
+  control.signal?.addEventListener('abort', abort, { once: true });
   try {
+    throwIfExecutionAborted(control.signal);
     // Original-payment reconciliation/cleanup must remain available even if
     // the configured Sentinel runtime is missing or invalid.
     let reference: SentinelAuthorizer | undefined;
     const authorize: SentinelAuthorizer = async (request) => {
       if (sentinel?.mode === 'reference')
-        return (reference ||= createReferenceSentinelAuthorizer(assignment.context, sentinel))(request);
+        return (reference ||= createReferenceSentinelAuthorizer(
+          assignment.context,
+          sentinel,
+          control.signal,
+        ))(request);
       if (sentinel?.mode !== 'official') throw new Error('不支持的 Sentinel 运行模式');
       return sdk.authorize(request);
     };
@@ -437,7 +482,8 @@ export async function executeWithOnDemandSdk(
         : (request, card) => withSdkLease(assignment, control, () => sdk.prepareStripeToken(request, card)),
     ).execute();
   } finally {
-    await sdk.close();
+    control.signal?.removeEventListener('abort', abort);
+    await sdk.close(!!control.signal?.aborted);
   }
 }
 
@@ -446,15 +492,18 @@ export async function withSdkLease<T>(
   control: Control,
   action: () => Promise<T>,
 ): Promise<T> {
+  throwIfExecutionAborted(control.signal);
   let pending = Promise.resolve(),
     failure: Error | undefined;
   const timer = setInterval(() => {
     pending = pending
       .then(async () => {
-        await control.request('checkpoint', {
-          context: assignment.context,
-          stage: assignment.context.phase || 'official_sdk',
-        });
+        await executionOperation(control.signal, () =>
+          control.request('checkpoint', {
+            context: assignment.context,
+            stage: assignment.context.phase || 'official_sdk',
+          }),
+        );
       })
       .catch((error) => {
         failure = error;
@@ -462,8 +511,10 @@ export async function withSdkLease<T>(
   }, 30000);
   timer.unref();
   try {
-    const result = await action();
-    await pending;
+    if (control.assertActive) await executionOperation(control.signal, () => control.assertActive!());
+    const result = await executionOperation(control.signal, action);
+    await executionOperation(control.signal, () => pending);
+    throwIfExecutionAborted(control.signal);
     if (failure) throw failure;
     return result;
   } finally {

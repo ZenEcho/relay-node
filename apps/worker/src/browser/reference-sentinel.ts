@@ -5,10 +5,8 @@ import { access, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 import type { Cookie, RuntimeContext } from '../../../../packages/contracts/src/execution.js';
-import type {
-  SentinelAuthorizer,
-  SentinelRequest,
-} from '../../../../packages/contracts/src/sentinel.js';
+import { executionAborted, throwIfExecutionAborted } from '../../../../packages/runtime/src/cancellation.js';
+import type { SentinelAuthorizer, SentinelRequest } from '../../../../packages/contracts/src/sentinel.js';
 
 export type ReferenceSentinelOptions = {
   // Pinned packaged runtime, or an explicitly configured trusted local bridge.
@@ -25,32 +23,25 @@ function failure(reason: string): Error {
   });
 }
 function validHeader(value: unknown): value is string {
-  return (
-    typeof value === 'string' && !!value.trim() && value.length <= 100000 && !/[\r\n\0]/.test(value)
-  );
+  return typeof value === 'string' && !!value.trim() && value.length <= 100000 && !/[\r\n\0]/.test(value);
 }
 function header(context: RuntimeContext, name: string) {
-  const entries = Object.entries(context.environment.headers).filter(
-    ([key]) => key.toLowerCase() === name,
-  );
+  const entries = Object.entries(context.environment.headers).filter(([key]) => key.toLowerCase() === name);
   if (entries.some(([, value]) => value !== entries[0][1])) throw failure('PROFILE_BINDING');
   return entries[0]?.[1];
 }
 function platformFor(ua: string) {
-  if (/Android/i.test(ua))
-    return { platform: 'Linux armv8l', platformLabel: 'Android', maxTouchPoints: 1 };
+  if (/Android/i.test(ua)) return { platform: 'Linux armv8l', platformLabel: 'Android', maxTouchPoints: 1 };
   if (/iPhone|iPad|iPod/i.test(ua))
     return {
       platform: /iPad/.test(ua) ? 'iPad' : 'iPhone',
       platformLabel: 'iOS',
       maxTouchPoints: 1,
     };
-  if (/Windows/i.test(ua))
-    return { platform: 'Win32', platformLabel: 'Windows', maxTouchPoints: 0 };
+  if (/Windows/i.test(ua)) return { platform: 'Win32', platformLabel: 'Windows', maxTouchPoints: 0 };
   if (/Macintosh|Mac OS X/i.test(ua))
     return { platform: 'MacIntel', platformLabel: 'macOS', maxTouchPoints: 0 };
-  if (/Linux|X11/i.test(ua))
-    return { platform: 'Linux x86_64', platformLabel: 'Linux', maxTouchPoints: 0 };
+  if (/Linux|X11/i.test(ua)) return { platform: 'Linux x86_64', platformLabel: 'Linux', maxTouchPoints: 0 };
   throw failure('PROFILE_BINDING');
 }
 function matchesPath(path: string, cookiePath: string) {
@@ -108,8 +99,7 @@ function bound(context: RuntimeContext, request: SentinelRequest) {
     throw failure('IDENTITY_BINDING');
   if (
     (context.session?.account?.id && context.session.account.id !== context.accountId) ||
-    (context.session?.account?.account_id &&
-      context.session.account.account_id !== context.accountId)
+    (context.session?.account?.account_id && context.session.account.account_id !== context.accountId)
   )
     throw failure('IDENTITY_BINDING');
   let page: URL;
@@ -123,7 +113,13 @@ function bound(context: RuntimeContext, request: SentinelRequest) {
   return page;
 }
 
-async function runBridge(path: string, input: object, timeoutMs: number): Promise<unknown> {
+async function runBridge(
+  path: string,
+  input: object,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  throwIfExecutionAborted(signal);
   return new Promise((resolve, reject) => {
     let result = '',
       outputBytes = 0,
@@ -155,11 +151,15 @@ async function runBridge(path: string, input: object, timeoutMs: number): Promis
       killTimer = setTimeout(() => kill('SIGKILL'), 250);
     };
     const timer = setTimeout(() => stop(failure('TIMEOUT')), timeoutMs);
+    const abort = () => stop(executionAborted());
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
     const complete = (error?: Error) => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
       clearTimeout(killTimer);
+      signal?.removeEventListener('abort', abort);
       // Reference transports can launch a helper; reap any remaining process
       // group members after the one-shot bridge exits as well as on timeout.
       kill('SIGKILL');
@@ -188,7 +188,7 @@ async function runBridge(path: string, input: object, timeoutMs: number): Promis
     child.once('close', (code, signal) =>
       complete(reason || (code !== 0 || signal ? failure('BRIDGE_EXIT') : undefined)),
     );
-    child.stdin.end(JSON.stringify(input));
+    if (!stopping) child.stdin.end(JSON.stringify(input));
   });
 }
 
@@ -229,9 +229,7 @@ function configuration(options: ReferenceSentinelOptions) {
   return { bridgePath, version, timeoutMs };
 }
 
-export async function assertReferenceSentinelReady(
-  options: ReferenceSentinelOptions,
-): Promise<void> {
+export async function assertReferenceSentinelReady(options: ReferenceSentinelOptions): Promise<void> {
   const { bridgePath } = configuration(options);
   try {
     await access(bridgePath, constants.R_OK);
@@ -244,9 +242,11 @@ export async function assertReferenceSentinelReady(
 export function createReferenceSentinelAuthorizer(
   context: RuntimeContext,
   options: ReferenceSentinelOptions,
+  signal?: AbortSignal,
 ): SentinelAuthorizer {
   const { bridgePath, version, timeoutMs } = configuration(options);
   return async (request) => {
+    throwIfExecutionAborted(signal);
     request = Object.freeze({ ...request });
     const page = bound(context, request);
     const environment = context.environment;
@@ -255,19 +255,14 @@ export function createReferenceSentinelAuthorizer(
       throw failure('PROFILE_BINDING');
     const platform = platformFor(ua);
     const expectedPlatform = header(context, 'sec-ch-ua-platform')?.replace(/^"|"$/g, '');
-    if (expectedPlatform && expectedPlatform !== platform.platformLabel)
-      throw failure('PROFILE_BINDING');
-    const language = (header(context, 'accept-language') || 'en-US')
-      .split(',')[0]
-      .split(';')[0]
-      .trim();
+    if (expectedPlatform && expectedPlatform !== platform.platformLabel) throw failure('PROFILE_BINDING');
+    const language = (header(context, 'accept-language') || 'en-US').split(',')[0].split(';')[0].trim();
     if (!/^[a-zA-Z]{2,8}(?:-[a-zA-Z0-9]{1,8})*$/.test(language)) throw failure('PROFILE_BINDING');
     const proxy = environment.proxyUrl;
     if (environment.networkMode === 'proxy' && !proxy) throw failure('PROFILE_BINDING');
     if (proxy) {
       try {
-        if (!['http:', 'https:', 'socks5:', 'socks5h:'].includes(new URL(proxy).protocol))
-          throw new Error();
+        if (!['http:', 'https:', 'socks5:', 'socks5h:'].includes(new URL(proxy).protocol)) throw new Error();
       } catch {
         throw failure('PROFILE_BINDING');
       }
@@ -299,7 +294,9 @@ export function createReferenceSentinelAuthorizer(
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
       },
       timeoutMs,
+      signal,
     );
+    throwIfExecutionAborted(signal);
     bound(context, request);
     if (
       context.environment !== environment ||
@@ -313,12 +310,7 @@ export function createReferenceSentinelAuthorizer(
       cookieHeader(environment.cookies, page, request.deviceId) !== cookies
     )
       throw failure('IDENTITY_CHANGED');
-    if (
-      !output ||
-      typeof output !== 'object' ||
-      output.error ||
-      !validToken(output.main, request, 'p')
-    )
+    if (!output || typeof output !== 'object' || output.error || !validToken(output.main, request, 'p'))
       throw failure('MAIN_INVALID');
     if (
       output.so !== undefined &&
