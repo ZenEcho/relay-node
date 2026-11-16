@@ -22,8 +22,9 @@ export async function checkPaymentRuntime(
   sentinel: SentinelRuntimeOptions = defaultSentinelRuntime(),
 ) {
   if (sentinel?.mode === 'reference') await assertReferenceSentinelReady(sentinel);
-  else if (sentinel?.mode === 'official') await findSdkBrowser(options.executablePath);
-  else throw new Error('不支持的 Sentinel 运行模式');
+  else if (sentinel?.mode !== 'official') throw new Error('不支持的 Sentinel 运行模式');
+  // Stripe.js tokenization needs a browser independently of the Sentinel mode.
+  await findSdkBrowser(options.executablePath);
 }
 export function sdkLoginCookies(cookies: Cookie[]) {
   // Import identity, not another browser's caches, tracking or temporary site

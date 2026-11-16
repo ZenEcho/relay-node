@@ -59,7 +59,9 @@ export class OnDemandSdkRuntime {
     private assignment: Assignment,
     private options: OnDemandSdkOptions = {},
     private signal?: AbortSignal,
-  ) {}
+  ) {
+    this.prepareStripeToken = this.prepareStripeToken.bind(this);
+  }
 
   // Diagnostics expose lifecycle only, never debugger endpoints, cookies or card data.
   get lifecycle() {
@@ -328,7 +330,9 @@ export class OnDemandSdkRuntime {
     }
     return matched;
   }
-  readonly prepareStripeToken: StripeTokenProvider = async (request, card) => {
+  async prepareStripeToken(
+    ...[request, card]: Parameters<StripeTokenProvider>
+  ): ReturnType<StripeTokenProvider> {
     const values = cardInputValues(card, request.cardLastFour);
     await this.open();
     const cdp = this.cdp!;
@@ -397,7 +401,7 @@ export class OnDemandSdkRuntime {
       values.expiry = '';
       values.cvc = '';
     }
-  };
+  }
   private async cardFrame(signal?: AbortSignal) {
     const deadline = Date.now() + 20000;
     while (!this.disposed && !signal?.aborted && Date.now() < deadline) {
@@ -478,6 +482,13 @@ export async function executeWithOnDemandSdk(
       control,
       transport,
       assignment.demo ? undefined : (request) => withSdkLease(assignment, control, () => authorize(request)),
+      assignment.demo
+        ? undefined
+        : (request, card) =>
+            withSdkLease(assignment, control, () => {
+              sdk ||= new OnDemandSdkRuntime(assignment, options, control.signal);
+              return sdk.prepareStripeToken(request, card);
+            }),
     ).execute();
   } finally {
     control.signal?.removeEventListener('abort', abort);

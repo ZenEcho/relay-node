@@ -91,6 +91,8 @@ async function execute(
     elementsShape?: 'current' | 'conflicting';
     elements?: Record<string, unknown>;
     customerSession?: string;
+    snapshotCustomerSession?: string;
+    stripeAccount?: string;
     stripeProvider?: boolean;
     sdkWrongCard?: boolean;
     tokenResponse?: (input: HttpInput, cancellation: AbortController) => Promise<HttpOutput>;
@@ -196,6 +198,12 @@ async function execute(
           else response.data.id = 'another-elements-session';
         }
         Object.assign(response.data, options.elements);
+        return response;
+      }
+      if (url.pathname.endsWith('/checkout/taxes') && (options.snapshotCustomerSession || options.stripeAccount)) {
+        const response = await super.request(input);
+        response.data.checkout_session.customer_session_client_secret = options.snapshotCustomerSession;
+        response.data.checkout_session.stripe_account = options.stripeAccount;
         return response;
       }
       if (url.pathname.endsWith('/checkout/taxes') && options.nestedTaxQuote) {
@@ -577,11 +585,13 @@ test('a missing original Elements session stops before obtaining or sending card
   assert.ok(!result.requests.some((request) => request.url.endsWith('/confirmation_tokens')));
 });
 
-test('the nested real checkout total is passed to both Elements and the official SDK provider', async () => {
+test('the official SDK gets the real checkout quote and accepted email without creating another Elements session', async () => {
   const result = await execute({
     demo: false,
     stripeProvider: true,
     nestedTaxQuote: true,
+    credentialUserEmail: 'accepted@example.invalid',
+    defaultBillingEmail: 'default@example.invalid',
     authorizer: async (request) => ({
       ...request,
       token: 'opaque-from-official-sdk',
@@ -591,11 +601,27 @@ test('the nested real checkout total is passed to both Elements and the official
   });
   assert.equal(result.sdkRequest.amountMinor, 32100);
   assert.equal(result.sdkRequest.currency, 'PHP');
-  const url = new URL(result.requests.find((r) => r.url.includes('/elements/sessions'))!.url);
-  assert.equal(url.searchParams.get('deferred_intent[amount]'), '32100');
-  assert.equal(url.searchParams.get('deferred_intent[currency]'), 'php');
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  assert.equal(result.sdkRequest.billing.email, 'accepted@example.invalid');
+  assert.ok(!result.requests.some((r) => r.url.includes('/elements/sessions')));
   assert.ok(!result.requests.some((r) => r.url.endsWith('/confirmation_tokens')));
 });
+
+for (const customerSession of [undefined, 'cuss_context']) {
+  test(`Stripe.js receives the original connected account and customer session: ${customerSession || 'snapshot'}`, async () => {
+    const result = await execute({
+      demo: false,
+      stripeProvider: true,
+      authorizer: boundAuthorizer,
+      customerSession,
+      snapshotCustomerSession: 'cuss_snapshot',
+      stripeAccount: 'acct_original',
+    });
+    assert.equal(result.finish.status, 'completed', result.finish.error);
+    assert.equal(result.sdkRequest.stripeAccount, 'acct_original');
+    assert.equal(result.sdkRequest.customerSessionClientSecret, customerSession || 'cuss_snapshot');
+  });
+}
 
 test('production direct tokenization normalizes the assigned card and validates the matching API preview', async () => {
   const result = await execute({

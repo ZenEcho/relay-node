@@ -409,7 +409,7 @@ export class ProtocolEngine {
         throw new Error('原结账金额、币种或标识无法核验，停止准备卡片');
       this.context.snapshot.amount_total = amount;
       this.context.snapshot.currency = currency.toLowerCase();
-      if (!this.context.elements) {
+      if (!this.context.elements && !this.stripeTokenProvider) {
         this.context.clientSessionId ||= randomUUID();
         this.context.elements = await this.stripe(
           '初始化 Elements',
@@ -455,10 +455,13 @@ export class ProtocolEngine {
                   environmentId: this.context.environment.id,
                   deviceId: this.context.environment.deviceId,
                   publishableKey: this.context.key!,
-                  customerSessionClientSecret: this.context.customerSessionClientSecret,
+                  stripeAccount: this.context.snapshot.stripe_account,
+                  customerSessionClientSecret:
+                    this.context.customerSessionClientSecret ||
+                    this.context.snapshot.customer_session_client_secret,
                   amountMinor: this.context.snapshot.amount_total,
                   currency: this.context.currency,
-                  billing,
+                  billing: { ...billing, email: this.context.billingEmailBinding?.email },
                   returnUrl: this.context.confirmReturnUrl || this.context.snapshot.return_url || CHAT + '/',
                   cardLastFour: lastFour,
                 },

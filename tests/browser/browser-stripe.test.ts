@@ -12,6 +12,8 @@ function fixture(wrongCard = false) {
     environmentId: 'env-fixture',
     deviceId: 'device-fixture',
     publishableKey: 'pk_test_fixture',
+    stripeAccount: undefined as string | undefined,
+    customerSessionClientSecret: undefined as string | undefined,
     amountMinor: 98214,
     currency: 'PHP',
     cardLastFour: '4242',
@@ -19,6 +21,7 @@ function fixture(wrongCard = false) {
     billing: {
       name: 'Fixture',
       email: 'fixture@example.test',
+      phone: '',
       line1: '123 Fixture St',
       city: 'Cheyenne',
       state: 'WY',
@@ -128,8 +131,33 @@ test('the shipped page action uses official Elements and returns only the select
   assert.deepEqual(f.calls, ['elements', 'create', 'mount', 'submit', 'token', 'destroy']);
   assert.equal(f.options().mode, 'subscription');
   assert.equal(f.options().amount, 98214);
+  assert.deepEqual(Array.from(f.options().paymentMethodTypes), ['card']);
   assert.equal(f.tokenParams().params.payment_method_data.billing_details.address.state, 'WY');
   assert.ok(!JSON.stringify(f.request).includes('number'));
+});
+test('Stripe.js loads directly from Stripe with the original account and customer session', async () => {
+  const f = fixture();
+  const factory = f.page.Stripe;
+  let stripeOptions: any;
+  f.page.Stripe = undefined;
+  f.request.stripeAccount = 'acct_original';
+  f.request.customerSessionClientSecret = 'cuss_original';
+  f.request.billing.phone = '  +1 202 555 0148  ';
+  f.page.document.head = {
+    appendChild(script: any) {
+      assert.equal(script.src, 'https://js.stripe.com/v3/');
+      f.page.Stripe = (key: string, options: any) => {
+        assert.equal(key, f.request.publishableKey);
+        stripeOptions = options;
+        return factory();
+      };
+      script.onload();
+    },
+  };
+  assert.equal((await f.execute()).ok, true);
+  assert.equal(stripeOptions.stripeAccount, 'acct_original');
+  assert.equal(f.options().customerSessionClientSecret, 'cuss_original');
+  assert.equal(f.tokenParams().params.payment_method_data.billing_details.phone, '+1 202 555 0148');
 });
 test('another card token is rejected before it can reach merchant confirmation', async () => {
   const result = await fixture(true).execute();

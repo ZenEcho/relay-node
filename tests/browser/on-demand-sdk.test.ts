@@ -387,14 +387,15 @@ test('configured reference Sentinel completes preflight without starting the off
   assert.ok(!events.some((e) => e.action === 'card' || e.action === 'authorize'));
 });
 
-test('reference readiness requires its bridge without requiring Chrome', async (t) => {
+test('reference payment readiness requires both its bridge and the Stripe.js browser', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'relay-reference-readiness-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const bridgePath = join(directory, 'bridge.cjs');
   await writeFile(bridgePath, '');
-  await checkPaymentRuntime(
-    { executablePath: '/does-not-exist/Chrome' },
-    { mode: 'reference', bridgePath },
+  await checkPaymentRuntime({ executablePath: process.execPath }, { mode: 'reference', bridgePath });
+  await assert.rejects(
+    checkPaymentRuntime({ executablePath: '/does-not-exist/Chrome' }, { mode: 'reference', bridgePath }),
+    /需要 Chrome/,
   );
   await assert.rejects(
     checkPaymentRuntime(
@@ -413,66 +414,111 @@ test('official Sentinel readiness still requires Chrome', async () => {
   );
 });
 
-test('reference execution prepares the original card through the API without Chrome', async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), 'relay-reference-payment-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const bridgePath = join(directory, 'bridge.cjs');
-  await writeFile(
-    bridgePath,
-    `let input='';process.stdin.on('data',d=>input+=d);process.stdin.on('end',()=>{const p=JSON.parse(input);process.stdout.write(JSON.stringify({main:JSON.stringify({p:'reference-proof',c:'reference-challenge',id:p.deviceId,flow:p.flow})}));});`,
-  );
-  const assignment: any = {
-    run: {
-      id: 'reference-payment',
-      order: { cdkRedeemType: 'gpt_plus', cdkPaymentCurrency: 'PHP' },
-      workflow: { plan: 'gpt_plus', cleanup: {} },
-      paymentSubmitted: false,
-      dispatches: {},
-    },
-    context: {
-      environment: createEnvironment('PH', ''),
-      credential: JSON.stringify({
-        accessToken: 'test-access',
-        account: { id: 'demo-account' },
-        user: { email: 'test@example.invalid' },
-      }),
-    },
-    demo: false,
-    paymentEnabled: true,
-    mode: 'execute',
-    billing: { name: 'Test', line1: '123 Test St', city: 'Manila', postalCode: '1000', country: 'PH' },
-  };
-  const events: any[] = [],
-    requests: HttpInput[] = [];
-  class Transport extends DemoTransport {
-    override async request(input: HttpInput) {
-      requests.push(input);
-      return super.request(input);
-    }
-  }
-  await executeWithOnDemandSdk(
-    assignment,
-    {
-      request: async (action, body) => {
-        events.push({ action, body });
-        if (action === 'card') return { number: '4242424242424242', expiry: '12/30', cvc: '123' };
-        return {};
+for (const outcome of ['success', 'rejected', 'wrong-card', 'cancelled', 'missing-browser'] as const) {
+  test(`reference execution uses Stripe.js tokenization without an API fallback: ${outcome}`, async (t) => {
+    const directory = await mkdtemp(join(tmpdir(), 'relay-reference-payment-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const bridgePath = join(directory, 'bridge.cjs');
+    await writeFile(
+      bridgePath,
+      `let input='';process.stdin.on('data',d=>input+=d);process.stdin.on('end',()=>{const p=JSON.parse(input);process.stdout.write(JSON.stringify({main:JSON.stringify({p:'reference-proof',c:'reference-challenge',id:p.deviceId,flow:p.flow})}));});`,
+    );
+    const assignment: any = {
+      run: {
+        id: 'reference-payment',
+        order: { cdkRedeemType: 'gpt_plus', cdkPaymentCurrency: 'PHP' },
+        workflow: { plan: 'gpt_plus', cleanup: {} },
+        paymentSubmitted: false,
+        dispatches: {},
       },
-    },
-    new Transport(0),
-    { executablePath: '/does-not-exist/Chrome' },
-    { mode: 'reference', bridgePath },
-  );
-  const finish = events.findLast((event) => event.action === 'finish').body;
-  assert.equal(finish.status, 'completed', finish.error);
-  const tokenIndex = requests.findIndex((request) => request.url.endsWith('/v1/confirmation_tokens'));
-  assert.ok(tokenIndex >= 0);
-  const fields = new URLSearchParams(requests[tokenIndex].body);
-  assert.equal(fields.get('payment_method_data[card][number]'), '4242424242424242');
-  assert.equal(fields.get('payment_method_data[billing_details][email]'), 'test@example.invalid');
-  assert.ok(requests.findIndex((request) => request.url.endsWith('/checkout/confirm')) > tokenIndex);
-  assert.equal(JSON.parse(assignment.context.sentinel).p, 'reference-proof');
-});
+      context: {
+        environment: createEnvironment('PH', ''),
+        credential: JSON.stringify({
+          accessToken: 'test-access',
+          account: { id: 'demo-account' },
+          user: { email: 'test@example.invalid' },
+        }),
+      },
+      demo: false,
+      paymentEnabled: true,
+      mode: 'execute',
+      billing: {
+        name: 'Test',
+        line1: '123 Test St',
+        city: 'Manila',
+        postalCode: '1000',
+        country: 'PH',
+      },
+    };
+    const events: any[] = [],
+      requests: HttpInput[] = [],
+      cancellation = new AbortController(),
+      card = { number: '4242424242424242', expiry: '12/30', cvc: '123' };
+    let sdkRuntime: OnDemandSdkRuntime | undefined,
+      sdkCalls = 0;
+    if (outcome !== 'missing-browser')
+      t.mock.method(OnDemandSdkRuntime.prototype, 'prepareStripeToken', async function (request, localCard) {
+        sdkCalls++;
+        sdkRuntime = this;
+        assert.equal(request.checkoutId, assignment.context.checkout.id);
+        assert.equal(request.accountId, 'demo-account');
+        assert.equal(request.environmentId, assignment.context.environment.id);
+        assert.equal(request.deviceId, assignment.context.environment.deviceId);
+        assert.equal(request.billing.email, 'test@example.invalid');
+        assert.equal(request.cardLastFour, '4242');
+        assert.equal(localCard, card);
+        if (outcome === 'rejected') throw new Error('Stripe.js tokenization failed');
+        if (outcome === 'cancelled') cancellation.abort();
+        return {
+          id: 'ctoken_sdkfixture',
+          lastFour: outcome === 'wrong-card' ? '9999' : '4242',
+        };
+      });
+    class Transport extends DemoTransport {
+      override async request(input: HttpInput) {
+        requests.push(input);
+        return super.request(input);
+      }
+    }
+    await executeWithOnDemandSdk(
+      assignment,
+      {
+        signal: cancellation.signal,
+        request: async (action, body) => {
+          events.push({ action, body: structuredClone(body) });
+          if (action === 'card') return card;
+          return {};
+        },
+      },
+      new Transport(0),
+      { executablePath: '/does-not-exist/Chrome' },
+      { mode: 'reference', bridgePath },
+    );
+    assert.equal(sdkCalls, outcome === 'missing-browser' ? 0 : 1);
+    assert.ok(!requests.some((request) => /\/(confirmation_tokens|elements\/sessions)/.test(request.url)));
+    assert.deepEqual(card, { number: '', expiry: '', cvc: '' });
+    if (sdkRuntime) assert.equal(sdkRuntime.lifecycle.disposed, true);
+    const payment = requests.filter((request) => request.url.endsWith('/confirm'));
+    const finish = events.findLast((event) => event.action === 'finish')?.body;
+    if (outcome === 'success') {
+      assert.equal(finish.status, 'completed', finish.error);
+      assert.equal(payment.length, 2);
+      assert.equal(JSON.parse(payment[0].body!).confirm_token, 'ctoken_sdkfixture');
+    } else {
+      assert.equal(payment.length, 0);
+      assert.ok(!events.some((event) => event.action === 'authorize'));
+      assert.equal(assignment.run.paymentSubmitted, false);
+      assert.equal(assignment.context.confirmationToken, undefined);
+      if (outcome === 'cancelled') assert.equal(finish, undefined);
+      else {
+        assert.equal(finish.status, 'failed');
+        assert.match(finish.error, /Stripe.js tokenization failed|卡片尾号不匹配|需要 Chrome/);
+      }
+    }
+    assert.ok(!JSON.stringify(events).includes('4242424242424242'));
+    assert.equal(JSON.parse(assignment.context.sentinel).p, 'reference-proof');
+  });
+}
 
 test('a missing reference bridge stops execution before assigning a card or authorizing payment', async () => {
   const events: any[] = [];

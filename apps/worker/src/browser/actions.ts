@@ -311,11 +311,15 @@ export async function prepareStripeTokenInPage(
     panel.append(heading, quote, mount, status, submit, cancel);
     overlay.append(panel);
     page.document.body.append(overlay);
-    const stripe = page.Stripe(request.publishableKey);
+    const stripe = page.Stripe(
+      request.publishableKey,
+      request.stripeAccount ? { stripeAccount: request.stripeAccount } : undefined,
+    );
     const elements = stripe.elements({
       mode: 'subscription',
       amount: request.amountMinor,
       currency: request.currency.toLowerCase(),
+      paymentMethodTypes: ['card'],
       setupFutureUsage: 'off_session',
       ...(request.customerSessionClientSecret
         ? { customerSessionClientSecret: request.customerSessionClientSecret }
@@ -324,13 +328,12 @@ export async function prepareStripeTokenInPage(
     });
     payment = elements.create('payment', {
       layout: 'tabs',
-      // Only suppress fields provided below. Phone is not part of the imported
-      // billing address, so let Stripe decide whether it needs to collect it.
+      // Suppressed fields are supplied in createConfirmationToken below.
       fields: {
         billingDetails: {
           name: 'never',
           email: 'never',
-          phone: 'auto',
+          phone: request.billing.phone?.trim() ? 'never' : 'auto',
           address: 'never',
         },
       },
@@ -373,6 +376,7 @@ export async function prepareStripeTokenInPage(
                     billing_details: {
                       name: b.name,
                       email: b.email,
+                      ...(b.phone?.trim() ? { phone: b.phone.trim() } : {}),
                       address: {
                         line1: b.line1,
                         line2: b.line2 || '',
