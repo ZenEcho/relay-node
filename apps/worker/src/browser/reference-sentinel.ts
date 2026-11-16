@@ -11,7 +11,7 @@ import type {
 } from '../../../../packages/contracts/src/sentinel.js';
 
 export type ReferenceSentinelOptions = {
-  // Explicitly trusted local reference runtime, installed separately from this SDK.
+  // Pinned packaged runtime, or an explicitly configured trusted local bridge.
   bridgePath: string;
   version?: string;
   timeoutMs?: number;

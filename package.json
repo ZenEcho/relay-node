@@ -1,6 +1,6 @@
 {
   "name": "@relay/node",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Relay independent execution node and SDK",
   "type": "module",
   "main": "dist/sdk.js",
@@ -26,6 +26,10 @@
   "files": [
     "dist",
     "bin",
+    "runtime/reference-sentinel/*.js",
+    "runtime/reference-sentinel/*.py",
+    "runtime/reference-sentinel/package.json",
+    "runtime/reference-sentinel/source.json",
     "install.sh",
     "scripts/install-reference-sentinel.mjs",
     "scripts/probe-reference-sentinel.mjs",
@@ -39,11 +43,18 @@
     "test": "tsx --test tests/*/*.test.ts",
     "native:build": "node scripts/build-native.mjs",
     "sentinel:install-reference": "node scripts/install-reference-sentinel.mjs",
+    "sentinel:prepare": "node scripts/prepare-reference-sentinel.mjs",
     "check": "npm run build && npm test"
   },
   "devDependencies": {
     "@types/node": "24.0.0",
-    "typescript": "6.0.3",
-    "tsx": "4.19.4"
-  }
+    "tsx": "4.19.4",
+    "typescript": "6.0.3"
+  },
+  "dependencies": {
+    "undici": "8.12.3"
+  },
+  "bundleDependencies": [
+    "undici"
+  ]
 }

@@ -16,9 +16,24 @@ import {
   sdkLoginCookies,
   withSdkLease,
   checkPaymentRuntime,
+  defaultSentinelRuntime,
 } from '../../apps/worker/src/browser/runtime.js';
 import { DemoTransport } from '../../apps/worker/src/testing/demo-transport.js';
 import { createEnvironment } from '../../packages/runtime/src/environment.js';
+
+test('omitted Sentinel configuration selects the packaged reference bridge', () => {
+  assert.deepEqual(defaultSentinelRuntime(), {
+    mode: 'reference',
+    bridgePath: new URL('../../runtime/reference-sentinel/sentinel_bridge.js', import.meta.url).pathname,
+  });
+});
+
+test('a null Sentinel configuration cannot silently select the official browser', async () => {
+  await assert.rejects(
+    checkPaymentRuntime({ executablePath: process.execPath }, null as any),
+    /不支持的 Sentinel 运行模式/,
+  );
+});
 
 async function listen(server: any) {
   server.listen(0, '127.0.0.1');

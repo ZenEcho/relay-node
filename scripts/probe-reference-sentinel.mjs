@@ -1,4 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, stat, writeFile } from 'node:fs/promises';
 import { resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -28,8 +28,36 @@ const session = JSON.parse(await readFile(sessionFile, 'utf8'));
 const cookies = option('--cookie-file')
   ? JSON.parse(await readFile(option('--cookie-file'), 'utf8'))
   : session.cookies || [];
+const environmentFile = option('--environment-file') || option('--proxy-file');
+if (option('--environment-file') && option('--proxy-file'))
+  throw new Error('仅指定一个 --environment-file 或 --proxy-file');
+let privateEnvironment = {};
+if (environmentFile) {
+  const info = await stat(environmentFile);
+  if (!info.isFile() || (process.platform !== 'win32' && (info.mode & 0o077)))
+    throw new Error('环境配置必须是仅当前用户可读的私有文件（0600）');
+  const content = (await readFile(environmentFile, 'utf8')).trim();
+  if (content.startsWith('{')) {
+    try {
+      const value = JSON.parse(content);
+      privateEnvironment = value.environment || value;
+    } catch {
+      throw new Error('环境配置文件不是可识别的 JSON');
+    }
+  } else if (option('--proxy-file')) privateEnvironment = { proxyUrl: content };
+  else throw new Error('--environment-file 需要 JSON 配置');
+  if (
+    !privateEnvironment || typeof privateEnvironment !== 'object' ||
+    (privateEnvironment.proxyUrl !== undefined && typeof privateEnvironment.proxyUrl !== 'string') ||
+    (privateEnvironment.country !== undefined && !/^[a-z]{2}$/i.test(privateEnvironment.country))
+  )
+    throw new Error('环境配置需要有效的 proxyUrl 和两位国家代码');
+}
 const context = {
-  environment: createEnvironment(option('--country') || 'PH', option('--proxy') || ''),
+  environment: createEnvironment(
+    (option('--country') || privateEnvironment.country || 'PH').toUpperCase(),
+    privateEnvironment.proxyUrl ?? option('--proxy') ?? '',
+  ),
   credential: JSON.stringify({ ...session, cookies }),
 };
 loadCredential(context);
@@ -60,7 +88,9 @@ const headers = (path, sentinel = false) => ({
   'oai-session-id': context.environment.id,
   'oai-language': 'en-US',
   origin: 'https://chatgpt.com',
-  referer: 'https://chatgpt.com/',
+  referer: context.checkout
+    ? 'https://chatgpt.com/checkout/' + context.checkout.processor_entity + '/' + context.checkout.id
+    : 'https://chatgpt.com/',
   'sec-fetch-site': 'same-origin',
   'sec-fetch-mode': 'cors',
   'sec-fetch-dest': 'empty',
@@ -146,8 +176,11 @@ try {
     if (account.entitlement?.has_active_subscription !== false) fail('subscription_not_free');
     const country = context.environment.country;
     const pricing = await get('/backend-api/checkout_pricing_config/configs/' + country);
-    const currency = pricing.data?.currency_config?.symbol_code;
-    if (pricing.status !== 200 || !currency) fail('pricing');
+    const pricingCurrency = pricing.data?.currency_config?.symbol_code;
+    if (pricing.status !== 200 || typeof pricingCurrency !== 'string' || !/^[a-z]{3}$/i.test(pricingCurrency))
+      fail('pricing');
+    const currency = pricingCurrency.toUpperCase();
+    report.pricingCurrency = currency;
     await authorizeSentinel(context, 'chatgpt_checkout', 'https://chatgpt.com/', authorize);
     const path = '/backend-api/payments/checkout';
     const response = await transport.request({
@@ -197,10 +230,48 @@ try {
     };
     report.checkoutCreated = response.status === 200 && /^(oaics_|cs_)[a-zA-Z0-9_]+$/.test(id || '');
     report.merchantAccepted = report.checkoutCreated;
-    // An unpaid checkout ID is safe evidence; never save its client secrets or
-    // the response body, and never continue into taxes, card access or confirm.
-    if (report.checkoutCreated) report.checkoutId = id;
-    else fail('merchant_checkout');
+    if (!report.checkoutCreated) fail('merchant_checkout');
+    report.checkoutId = id;
+    const processor = value.processor_entity || 'openai_llc';
+    if (typeof processor !== 'string' || !/^[a-z][a-z0-9_]{0,63}$/.test(processor))
+      fail('checkout_processor');
+    context.checkout = { id, processor_entity: processor };
+    const checkoutResponse = await get('/backend-api/payments/checkout/' + processor + '/' + id);
+    report.checkoutReadHttpStatus = checkoutResponse.status;
+    const snapshot = checkoutResponse.data?.checkout_session || checkoutResponse.data;
+    const returnedId = snapshot?.checkout_session_id || snapshot?.id;
+    const actualCurrency =
+      snapshot?.currency || snapshot?.checkout_state?.currency || snapshot?.billing_details?.currency;
+    if (
+      checkoutResponse.status !== 200 ||
+      returnedId !== id ||
+      (snapshot.account_id && snapshot.account_id !== context.accountId) ||
+      (snapshot.processor_entity && snapshot.processor_entity !== processor) ||
+      typeof actualCurrency !== 'string' ||
+      !/^[a-z]{3}$/i.test(actualCurrency) ||
+      actualCurrency.toUpperCase() !== currency
+    )
+      fail('checkout_currency');
+    report.currency = actualCurrency.toUpperCase();
+    report.checkoutCurrencyVerified = true;
+    const amount = snapshot.amount_total ?? snapshot.checkout_state?.total?.total?.minorUnitsAmount;
+    if (amount !== undefined) {
+      if (!Number.isSafeInteger(amount) || amount < 0) fail('checkout_amount');
+      report.amountMinor = amount;
+    }
+    // Match the production engine's first-party checkout URL. Keep the full
+    // link in an optional private file; never persist response client secrets.
+    const checkoutUrl = 'https://chatgpt.com/checkout/' + processor + '/' + id;
+    report.paymentLinkCreated = true;
+    report.paymentLinkHost = 'chatgpt.com';
+    if (option('--checkout-file')) {
+      await writeFile(
+        option('--checkout-file'),
+        JSON.stringify({ checkoutId: id, checkoutUrl, currency: report.currency, ...(amount !== undefined ? { amountMinor: amount } : {}) }, null, 2) + '\n',
+        { mode: 0o600, flag: 'wx' },
+      );
+      report.paymentLinkSaved = true;
+    }
   }
 } catch (error) {
   report.errorCode =

@@ -2,6 +2,7 @@ import { access, mkdir, rm, cp, readFile, writeFile, realpath } from 'node:fs/pr
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { resolve, join } from 'node:path';
+import { prepareReferenceSentinel } from './prepare-reference-sentinel.mjs';
 const { version } = JSON.parse(await readFile('package.json', 'utf8'));
 const nodeVersion = '24.22.1',
   platform = process.platform,
@@ -19,6 +20,8 @@ await mkdir(join(stage, 'runtime/bin'), { recursive: true });
 await mkdir(join(stage, 'bin'));
 execFileSync('npm', ['run', 'build'], { stdio: 'inherit' });
 await cp('dist', join(stage, 'dist'), { recursive: true });
+await prepareReferenceSentinel();
+await cp('runtime/reference-sentinel', join(stage, 'runtime/reference-sentinel'), { recursive: true });
 for (const file of ['runtime/manager.js', 'browser/runtime.js', 'browser/configuration.js', 'browser/host.js'])
   await access(join(stage, 'dist/apps/worker/src', file));
 await cp('bin', join(stage, 'bin'), { recursive: true });
@@ -78,5 +81,14 @@ const packs = JSON.parse(
     encoding: 'utf8',
   }),
 );
+for (const path of [
+  'runtime/reference-sentinel/sentinel_bridge.js',
+  'runtime/reference-sentinel/sentinel_bootstrap.js',
+  'runtime/reference-sentinel/sentinel_sdk.js',
+  'node_modules/undici/index.js',
+]) {
+  if (!packs[0].files.some((file) => file.path === path))
+    throw new Error('SDK package is missing reference runtime file: ' + path);
+}
 await cp('release/' + packs[0].filename, `release/relay-node-sdk-${version}.tgz`);
 console.log(`Packaged ${version} ${platform}/${arch}`);

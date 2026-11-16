@@ -213,6 +213,10 @@ test('install, menu commands, idle update, failed rebind and multiple instances 
     env: { ...env, NODE_TOKEN: 'relaynode.tenant.second.original' },
   });
   assert.equal((await stat(join(base, 'one/config.json'))).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(await readFile(join(base, 'one/config.json'), 'utf8')).sentinel, {
+    mode: 'reference',
+    bridgePath: join(base, 'one/current/runtime/reference-sentinel/sentinel_bridge.js'),
+  });
   launcher = spawn('sh', [join(base, 'one/launcher.sh'), join(base, 'one')], {
     env,
     stdio: 'ignore',

@@ -2,6 +2,7 @@ node_modules/
 dist/
 .data/
 release/
+/runtime/
 *.tgz
 .env
 native/transport/relay-transport

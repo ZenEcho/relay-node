@@ -157,6 +157,10 @@ async function install() {
   await chmod(root, 0o700);
   const target = join(root, 'releases', manifest.version);
   await cp(releaseRoot, target, { recursive: true });
+  config.sentinel = {
+    mode: 'reference',
+    bridgePath: join(root, 'current/runtime/reference-sentinel/sentinel_bridge.js'),
+  };
   await saveJson(join(root, 'config.json'), config);
   await switchCurrent(root, target);
   await cp(join(target, 'bin/launcher.sh'), join(root, 'launcher.sh'));

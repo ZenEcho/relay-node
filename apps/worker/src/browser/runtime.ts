@@ -1,6 +1,6 @@
 import { cardInputValues } from './card-input.js';
-import { findSdkBrowser, sdkLoginCookies } from './configuration.js';
-export { checkPaymentRuntime, findSdkBrowser, sdkLoginCookies } from './configuration.js';
+import { defaultSentinelRuntime, findSdkBrowser, sdkLoginCookies } from './configuration.js';
+export { checkPaymentRuntime, defaultSentinelRuntime, findSdkBrowser, sdkLoginCookies } from './configuration.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -414,7 +414,7 @@ export async function executeWithOnDemandSdk(
   control: Control,
   transport: Transport,
   options: OnDemandSdkOptions = {},
-  sentinel?: SentinelRuntimeOptions,
+  sentinel: SentinelRuntimeOptions = defaultSentinelRuntime(),
 ) {
   const sdk = new OnDemandSdkRuntime(assignment, options);
   try {
@@ -424,7 +424,7 @@ export async function executeWithOnDemandSdk(
     const authorize: SentinelAuthorizer = async (request) => {
       if (sentinel?.mode === 'reference')
         return (reference ||= createReferenceSentinelAuthorizer(assignment.context, sentinel))(request);
-      if (sentinel && sentinel.mode !== 'official') throw new Error('不支持的 Sentinel 运行模式');
+      if (sentinel?.mode !== 'official') throw new Error('不支持的 Sentinel 运行模式');
       return sdk.authorize(request);
     };
     await new ProtocolEngine(

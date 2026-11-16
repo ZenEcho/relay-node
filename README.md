@@ -33,6 +33,7 @@ macOS LaunchAgent 在当前用户登录后运行；Linux systemd 服务随系统
 
 ```sh
 npm ci
+npm run sentinel:prepare
 npm run check
 npm run native:build
 ```
@@ -51,19 +52,19 @@ import { createBrowserSentinelAuthorizer } from '@relay/node/browser';
 
 源码按 `execution/`、`browser/`、`transport/`、`runtime/` 分工，命令行与安装入口保留在 worker 根目录。`packages/contracts`、`packages/rules`、`packages/runtime` 分别提供协议、纯函数和 Node 基础设施；测试按相同职责分组，开发探针集中在 `scripts/probes/`。开发依赖使用 npm 与唯一的 package-lock.json。
 
-SDK 的 `createBrowserSentinelAuthorizer(execute)` 可配合现有可信扩展，在匹配本单账号、设备和页面的真实登录文档中调用官方 Sentinel SDK。主令牌和 SO 的 flow 分开处理，保持 SDK 原始值；运行期间身份改变、SDK 未就绪或超时会停止。该模块不创建浏览器、不导入登录凭证、不模拟设备或求解挑战；`execute` 需由已有授权运行时提供。独立节点管理器现已接入按需官方 SDK：每单需要时启动独立临时 Chrome/Chromium，结束或进入 CDK 验证等待后关闭，原单只读核对和收尾不启动浏览器。节点需安装 Chrome/Chromium；可在实例 config.json 的 officialSdk 中指定 executablePath 和 headless，默认 Linux 无界面、macOS 临时有界面。登录 Cookie/设备与本单绑定；官方授权被拒绝时停在建单和取卡前等待处理。后端 HTTP 引擎继续负责付款确认和收尾，浏览器只准备真实官方令牌。
+SDK 的 `createBrowserSentinelAuthorizer(execute)` 可配合现有可信扩展，在匹配本单账号、设备和页面的真实登录文档中调用官方 Sentinel SDK。主令牌和 SO 的 flow 分开处理，保持 SDK 原始值；运行期间身份改变、SDK 未就绪或超时会停止。该模块不创建浏览器、不导入登录凭证、不模拟设备或求解挑战；`execute` 需由已有授权运行时提供。独立节点默认使用下述 reference Sentinel；Chrome/Chromium 仅在 Stripe 官方组件需要时按单启动，结束或进入 CDK 验证等待后关闭。原单只读核对和收尾不启动浏览器。可在实例 config.json 的 officialSdk 中指定浏览器 executablePath 和 headless，默认 Linux 无界面、macOS 临时有界面。显式配置 `sentinel.mode: "official"` 时保留原官方登录页 SDK 路径；后端 HTTP 引擎继续负责付款确认和收尾。
 
 ## 后端 Sentinel 参考运行时
 
-节点也支持 [gpt-subscribe-studio-1](https://github.com/crhywun/gpt-subscribe-studio-1/tree/adccdfc993e368f2c09bad7081885c6daff2d320) 的 Node VM、浏览器环境 shim 和 PoW 方案。显式选择 `reference` 模式后，Sentinel 由后端桥签发，浏览器仅在需要 Stripe 官方组件时启动。默认仍使用 `official`；失败不会自动切换模式、代理或账号。
+节点默认使用 [gpt-subscribe-studio-1](https://github.com/crhywun/gpt-subscribe-studio-1/tree/adccdfc993e368f2c09bad7081885c6daff2d320) 的 Node VM、浏览器环境 shim 和 PoW 方案。Sentinel 由后端 reference 桥签发，浏览器仅在需要 Stripe 官方组件时启动。正式节点包与 SDK 已包含固定校验的参考桥及 undici；新安装节点自动配置 `reference`，未配置 Sentinel 的旧节点更新后使用新版随包参考桥。安装和更新无需系统 npm。参考桥失败或缺失会停止，不会自动切换模式、代理或账号。
 
-先用系统 Node.js 24 和 npm 安装独立参考运行时（SDK/Release 不包含第三方修改版 Sentinel SDK）：
+如需指定独立参考运行时，可用系统 Node.js 24 和 npm 安装：
 
 ```sh
 node scripts/install-reference-sentinel.mjs --directory /absolute/path/reference-sentinel
 ```
 
-安装器固定上游提交、四个文件的 SHA-256 和 undici 版本，下载校验后安装，生成 `source.json`，不覆盖现有目录。然后在实例 `config.json` 中添加，保留已有对接信息：
+发布准备与独立安装器固定上游提交、四个文件的 SHA-256 和 undici 版本，下载校验后安装，生成 `source.json`。独立安装器不覆盖现有目录；需要覆盖默认路径时，在实例 `config.json` 中添加，保留已有对接信息：
 
 ```json
 {
