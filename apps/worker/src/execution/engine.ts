@@ -495,7 +495,6 @@ export class ProtocolEngine {
       }
       if (!this.context.confirmationToken) {
         await this.checkpoint('card_preparation');
-        await this.requireSentinel('chatgpt_checkout');
         const card = await this.command('card');
         try {
           if (this.stripeTokenProvider) {
@@ -789,7 +788,10 @@ export class ProtocolEngine {
     return preflightExecution(this.services);
   }
   private async requireSentinel(flow: SentinelFlow) {
-    await this.checkpoint('sentinel_authorization');
+    // Authorization is a step within its business phase, not a return to preflight.
+    const prefix =
+      flow === 'checkout_session_approval' ? 'payment_' : this.context.checkout ? 'checkout_' : '';
+    await this.checkpoint(prefix + 'sentinel_authorization');
     // The configured adapter uses this order's identity and environment.
     // Merchant requests keep their own checkout referer in headers().
     const pageUrl = CHAT + '/';
@@ -802,17 +804,18 @@ export class ProtocolEngine {
         : undefined);
     await trace(this.log, '取得本单 Sentinel 授权', { flow, pageUrl }, async (capture) => {
       await this.assertActive();
-      await executionOperation(this.control.signal, () =>
+      const diagnostic = await executionOperation(this.control.signal, () =>
         authorizeSentinel(this.context, flow, pageUrl, authorize, this.control.signal),
       );
       capture({
         flow,
+        ...diagnostic,
         expiresAt: this.context.sentinelExpiresAt,
         token: this.context.sentinel,
         soToken: this.context.sentinelSo,
       });
     });
-    await this.checkpoint('sentinel_ready');
+    await this.checkpoint(prefix + 'sentinel_ready');
   }
   private async reconcile() {
     return executionOperation(this.control.signal, () => reconcilePayment(this.services));

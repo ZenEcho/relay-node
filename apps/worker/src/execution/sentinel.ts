@@ -1,4 +1,5 @@
 import type { RuntimeContext } from '../../../../packages/contracts/src/execution.js';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   executionOperation,
   throwIfExecutionAborted,
@@ -46,7 +47,27 @@ export async function authorizeSentinel(
     environmentId: context.environment.id,
     accountId: context.accountId,
   });
-  const authorization = await executionOperation(signal, () => authorize(request));
+  let authorization,
+    retryReason: string | undefined,
+    attempts = 0;
+  for (;;) {
+    attempts++;
+    try {
+      authorization = await executionOperation(signal, () => authorize(request));
+      break;
+    } catch (error) {
+      throwIfExecutionAborted(signal);
+      const diagnostic = (error as any)?.runtimeDiagnostic;
+      const transient =
+        (error as any)?.code === 'SENTINEL_AUTH_REQUIRED' &&
+        diagnostic?.component === 'reference_bridge' &&
+        diagnostic.retryable === true &&
+        ['UPSTREAM_TIMEOUT', 'UPSTREAM_UNAVAILABLE'].includes(diagnostic.reason);
+      if (!transient || attempts >= 2) throw error;
+      retryReason = diagnostic.reason;
+      await executionOperation(signal, () => delay(250));
+    }
+  }
   throwIfExecutionAborted(signal);
   if (
     !authorization ||
@@ -75,4 +96,5 @@ export async function authorizeSentinel(
   context.sentinelSo = validHeader(authorization.soToken) ? authorization.soToken : undefined;
   context.sentinelFlow = flow;
   context.sentinelExpiresAt = authorization.expiresAt;
+  return { attempts, ...(retryReason ? { retryReason } : {}) };
 }

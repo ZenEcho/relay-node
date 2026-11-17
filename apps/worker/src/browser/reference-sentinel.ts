@@ -20,6 +20,11 @@ function failure(reason: string): Error {
   // Never include bridge output, arguments, credentials or its private path.
   return Object.assign(new Error('参考 Sentinel 授权未完成：' + reason), {
     code: 'SENTINEL_AUTH_REQUIRED',
+    runtimeDiagnostic: {
+      component: 'reference_bridge',
+      reason,
+      retryable: ['UPSTREAM_TIMEOUT', 'UPSTREAM_UNAVAILABLE'].includes(reason),
+    },
   });
 }
 function validHeader(value: unknown): value is string {
@@ -31,7 +36,12 @@ function header(context: RuntimeContext, name: string) {
   return entries[0]?.[1];
 }
 function platformFor(ua: string) {
-  if (/Android/i.test(ua)) return { platform: 'Linux armv8l', platformLabel: 'Android', maxTouchPoints: 1 };
+  if (/Android/i.test(ua))
+    return {
+      platform: 'Linux armv8l',
+      platformLabel: 'Android',
+      maxTouchPoints: 1,
+    };
   if (/iPhone|iPad|iPod/i.test(ua))
     return {
       platform: /iPad/.test(ua) ? 'iPad' : 'iPhone',
@@ -41,7 +51,12 @@ function platformFor(ua: string) {
   if (/Windows/i.test(ua)) return { platform: 'Win32', platformLabel: 'Windows', maxTouchPoints: 0 };
   if (/Macintosh|Mac OS X/i.test(ua))
     return { platform: 'MacIntel', platformLabel: 'macOS', maxTouchPoints: 0 };
-  if (/Linux|X11/i.test(ua)) return { platform: 'Linux x86_64', platformLabel: 'Linux', maxTouchPoints: 0 };
+  if (/Linux|X11/i.test(ua))
+    return {
+      platform: 'Linux x86_64',
+      platformLabel: 'Linux',
+      maxTouchPoints: 0,
+    };
   throw failure('PROFILE_BINDING');
 }
 function matchesPath(path: string, cookiePath: string) {
@@ -128,7 +143,10 @@ async function runBridge(
       reason: Error | undefined;
     const decoder = new StringDecoder('utf8');
     let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const env: NodeJS.ProcessEnv = { ...process.env, SENTINEL_CURL_DAEMON_DIR: ' ' };
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      SENTINEL_CURL_DAEMON_DIR: ' ',
+    };
     delete env.SENTINEL_DAEMON_SOCKET;
     delete env.SENTINEL_CURL_DAEMON_SOCKET;
     const child = spawn(process.execPath, [path], {
@@ -192,24 +210,29 @@ async function runBridge(
   });
 }
 
-function validToken(value: unknown, request: SentinelRequest, kind: 'p' | 'so'): value is string {
-  if (!validHeader(value)) return false;
+function upstreamFailure(value: unknown): string | undefined {
+  if (typeof value !== 'string') return;
+  if (/ETIMEDOUT|UND_ERR_.*TIMEOUT|req_timeout|timed?\s*out|AbortError/i.test(value))
+    return 'UPSTREAM_TIMEOUT';
+  if (/ECONNRESET|ECONNREFUSED|EAI_AGAIN|UND_ERR_SOCKET|fetch failed/i.test(value))
+    return 'UPSTREAM_UNAVAILABLE';
+}
+
+function tokenFailure(value: unknown, request: SentinelRequest, kind: 'p' | 'so'): string | undefined {
+  const prefix = kind === 'p' ? 'MAIN' : 'OBSERVER';
+  if (!validHeader(value)) return prefix + '_HEADER_INVALID';
   try {
     const token = JSON.parse(value);
-    return (
-      token &&
-      typeof token === 'object' &&
-      !Array.isArray(token) &&
-      typeof token[kind] === 'string' &&
-      !!token[kind].trim() &&
-      (kind !== 'p' || !token.p.startsWith('gAAAAABwQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D')) &&
-      typeof token.c === 'string' &&
-      !!token.c.trim() &&
-      token.id === request.deviceId &&
-      token.flow === request.flow
-    );
+    if (!token || typeof token !== 'object' || Array.isArray(token)) return prefix + '_SHAPE_INVALID';
+    if (token.id !== request.deviceId) return prefix + '_IDENTITY_MISMATCH';
+    if (token.flow !== request.flow) return prefix + '_FLOW_MISMATCH';
+    if (token.e) return upstreamFailure(token.e) || prefix + '_SDK_ERROR';
+    if (typeof token[kind] !== 'string' || !token[kind].trim()) return prefix + '_PROOF_MISSING';
+    if (kind === 'p' && token.p.startsWith('gAAAAABwQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D'))
+      return 'MAIN_PROOF_EXHAUSTED';
+    if (typeof token.c !== 'string' || !token.c.trim()) return prefix + '_CHALLENGE_MISSING';
   } catch {
-    return false;
+    return prefix + '_JSON_INVALID';
   }
 }
 
@@ -310,15 +333,22 @@ export function createReferenceSentinelAuthorizer(
       cookieHeader(environment.cookies, page, request.deviceId) !== cookies
     )
       throw failure('IDENTITY_CHANGED');
-    if (!output || typeof output !== 'object' || output.error || !validToken(output.main, request, 'p'))
-      throw failure('MAIN_INVALID');
-    if (
-      output.so !== undefined &&
-      output.so !== null &&
-      output.so !== '' &&
-      !validToken(output.so, request, 'so')
-    )
-      throw failure('OBSERVER_INVALID');
+    if (!output || typeof output !== 'object' || Array.isArray(output)) throw failure('OUTPUT_SHAPE_INVALID');
+    if (output.error) {
+      // Classify known transport errors without retaining the bridge's private output.
+      const reason =
+        upstreamFailure(output.error) ||
+        (typeof output.error === 'string' && output.error.startsWith('driver 无 c')
+          ? 'DRIVER_CHALLENGE_MISSING'
+          : 'BRIDGE_RUNTIME_ERROR');
+      throw failure(reason);
+    }
+    const mainFailure = tokenFailure(output.main, request, 'p');
+    if (mainFailure) throw failure(mainFailure);
+    if (output.so !== undefined && output.so !== null && output.so !== '') {
+      const observerFailure = tokenFailure(output.so, request, 'so');
+      if (observerFailure) throw failure(observerFailure);
+    }
     const issuedAt = Date.now();
     return {
       ...request,

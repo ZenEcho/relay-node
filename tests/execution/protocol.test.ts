@@ -122,7 +122,11 @@ async function execute(
     run: {
       id: 'custom-order',
       order: { cdkRedeemType: 'gpt_plus', cdkPaymentCurrency: 'PHP' },
-      workflow: { plan: 'gpt_plus', cleanup: {}, checkoutMode: options.checkoutMode },
+      workflow: {
+        plan: 'gpt_plus',
+        cleanup: {},
+        checkoutMode: options.checkoutMode,
+      },
       paymentSubmitted: false,
       dispatches: {},
     },
@@ -433,13 +437,18 @@ test('an authenticated-runtime adapter supplies fresh bound credentials before t
   };
   const result = await execute({ demo: false, authorizer });
   assert.equal(result.finish.status, 'completed', result.finish.error);
-  assert.equal(authorizations, 4);
+  assert.equal(authorizations, 3);
   assert.ok(!result.requests.some((r) => r.url.includes('/sentinel/req')));
   assert.equal(result.requests.filter((r) => r.url.endsWith('/confirmation_tokens')).length, 1);
   const checkout = result.requests.find((r) => r.url.endsWith('/payments/checkout'))!;
   const confirm = result.requests.find((r) => r.url.endsWith('/payments/checkout/confirm'))!;
   assert.equal(JSON.parse(checkout.headers!['openai-sentinel-token']).c, 'test-auth-1');
-  assert.equal(JSON.parse(confirm.headers!['openai-sentinel-token']).c, 'test-auth-4');
+  assert.equal(JSON.parse(confirm.headers!['openai-sentinel-token']).c, 'test-auth-3');
+  const stages = result.commands.filter((c) => c.action === 'checkpoint').map((c) => c.body.stage);
+  assert.ok(stages.includes('checkout_sentinel_authorization'));
+  assert.ok(stages.includes('payment_sentinel_authorization'));
+  const cardStart = stages.indexOf('card_preparation');
+  assert.equal(stages.slice(cardStart).includes('sentinel_authorization'), false);
   const logs = JSON.stringify(result.commands.filter((c) => c.action === 'step'));
   assert.ok(!logs.includes('test-authentication') && !logs.includes('test-session-observer'));
 });
@@ -544,7 +553,11 @@ test('direct tokenization forwards only the provided billing phone', async () =>
 });
 
 test('direct tokenization omits a blank billing phone instead of manufacturing one', async () => {
-  const result = await execute({ demo: false, authorizer: boundAuthorizer, billingPhone: '   ' });
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    billingPhone: '   ',
+  });
   assert.equal(result.finish.status, 'completed', result.finish.error);
   const token = result.requests.find((request) => request.url.endsWith('/confirmation_tokens'))!;
   assert.equal(new URLSearchParams(token.body).has('payment_method_data[billing_details][phone]'), false);
@@ -568,7 +581,11 @@ for (const methods of [
   },
   {
     name: 'original nested Elements preference enables Link',
-    elements: { payment_method_preference: { ordered_payment_method_types: ['card', 'link', 'ideal'] } },
+    elements: {
+      payment_method_preference: {
+        ordered_payment_method_types: ['card', 'link', 'ideal'],
+      },
+    },
     expected: ['card', 'link'],
   },
   {
@@ -797,7 +814,12 @@ for (const status of [200, 402]) {
         };
         const responseStatus = input.method === 'POST' ? status : 200;
         const data = responseStatus === 402 ? { error: { ...lastError, payment_intent: intent } } : intent;
-        return { status: responseStatus, headers: {}, data, body: JSON.stringify(data) };
+        return {
+          status: responseStatus,
+          headers: {},
+          data,
+          body: JSON.stringify(data),
+        };
       },
     });
     assert.equal(result.finish.status, 'failed');
@@ -940,17 +962,28 @@ test('an explicit subscription limit fails immediately without another payment o
 
 test('a subscription limit carrying an Intent remains pending for original-payment reconciliation', async () => {
   for (const data of [
-    { status: 'subscription_limit', client_secret: 'pi_original_secret_fixture' },
+    {
+      status: 'subscription_limit',
+      client_secret: 'pi_original_secret_fixture',
+    },
     { status: 'subscription_limit', payment_intent: { id: 'pi_original' } },
   ]) {
-    const result = await execute({ demo: false, authorizer: boundAuthorizer, merchantData: data });
+    const result = await execute({
+      demo: false,
+      authorizer: boundAuthorizer,
+      merchantData: data,
+    });
     assert.equal(result.finish.status, 'pending_confirmation');
     assert.notEqual(result.finish.paymentOutcome, 'failed');
   }
 });
 
 test('hosted uses Stripe payment pages and merchant approval, records its type, and never calls custom confirmation', async () => {
-  const result = await execute({ demo: false, authorizer: boundAuthorizer, checkoutMode: 'hosted' });
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    checkoutMode: 'hosted',
+  });
   assert.equal(result.finish.status, 'completed', result.finish.error);
   const checkout = result.requests.find((r) => r.url.endsWith('/payments/checkout'))!;
   assert.equal(JSON.parse(checkout.body!).checkout_ui_mode, 'hosted');
@@ -984,7 +1017,11 @@ test('a checkout of another selected type stops before card access and never swi
 });
 
 test('hosted recovery reads the original page and never replays confirmation or approval', async () => {
-  const result = await execute({ demo: false, authorizer: boundAuthorizer, checkoutMode: 'hosted' });
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    checkoutMode: 'hosted',
+  });
   const before = result.requests.length;
   result.assignment.mode = 'reconcile';
   await new ProtocolEngine(result.assignment, result.control, result.transport, boundAuthorizer).execute();

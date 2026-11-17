@@ -60,6 +60,8 @@ import { createBrowserSentinelAuthorizer } from '@relay/node/browser';
 
 SDK 的 `createBrowserSentinelAuthorizer(execute)` 可配合现有可信扩展，在匹配本单账号、设备和页面的真实登录文档中调用官方 Sentinel SDK。主令牌和 SO 的 flow 分开处理，保持 SDK 原始值；运行期间身份改变、SDK 未就绪或超时会停止。该模块不创建浏览器、不导入登录凭证、不模拟设备或求解挑战；`execute` 需由已有授权运行时提供。默认节点不注入浏览器 StripeTokenProvider；显式配置 `sentinel.mode: "official"` 时，仅 Sentinel 使用本单临时浏览器。在实例 config.json 的 officialSdk 中可指定 executablePath 和 headless。
 
+Custom 流程在建单、更新税费和商户付款确认前分别获取授权；选卡与 Stripe 卡片令牌创建不额外刷新 Sentinel。后续授权检查点属于建单或付款阶段，进度不会跳回账号检查。参考桥错误只记录固定的脱敏分类；仅已识别的临时网络错误在当前阶段重试一次，身份、flow、令牌格式和证明校验失败不进行阶段重试。
+
 ## 后端 Sentinel 参考运行时
 
 节点默认使用 [gpt-subscribe-studio-1](https://github.com/crhywun/gpt-subscribe-studio-1/tree/adccdfc993e368f2c09bad7081885c6daff2d320) 的 Node VM、浏览器环境 shim 和 PoW 方案。Sentinel 由后端 reference 桥签发，Stripe 令牌通过 HTTP API 创建。正式节点包与 SDK 已包含固定校验的参考桥及 undici；新安装节点自动配置 `reference`，未配置 Sentinel 的旧节点更新后使用新版随包参考桥。安装和更新无需系统 npm。参考桥失败或缺失会停止，不会自动切换模式、代理或账号。

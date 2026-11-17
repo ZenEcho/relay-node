@@ -125,6 +125,17 @@ export function auditError(error: unknown, depth = 0): any {
     hostname: e?.hostname,
     address: e?.address,
     port: e?.port,
+    ...(e?.runtimeDiagnostic
+      ? {
+          runtimeDiagnostic: {
+            component: e.runtimeDiagnostic.component === 'reference_bridge' ? 'reference_bridge' : undefined,
+            reason: /^[A-Z_]{1,64}$/.test(e.runtimeDiagnostic.reason || '')
+              ? e.runtimeDiagnostic.reason
+              : undefined,
+            retryable: e.runtimeDiagnostic.retryable === true,
+          },
+        }
+      : {}),
     ...(e?.diagnostic ? { transportDiagnostic: transportDiagnostic(e.diagnostic) } : {}),
     ...(e?.transportAttempts ? { transportAttempts: transportAttempts(e.transportAttempts) } : {}),
     ...(e?.cause ? { cause: auditError(e.cause, depth + 1) } : {}),

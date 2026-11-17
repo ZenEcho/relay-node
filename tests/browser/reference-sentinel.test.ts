@@ -39,7 +39,10 @@ process.stdin.on('end', () => {
   const context: RuntimeContext = {
     environment,
     accountId: 'original-account',
-    session: { accessToken: 'private-access-token', account: { id: 'original-account' } },
+    session: {
+      accessToken: 'private-access-token',
+      account: { id: 'original-account' },
+    },
   };
   const request: SentinelRequest = {
     accountId: context.accountId,
@@ -82,7 +85,12 @@ test('the one-shot reference bridge receives the exact original profile, device,
   const f = await fixture(t);
   f.context.environment.headers['accept-language'] = 'fr-CA,fr;q=0.9,en;q=0.5';
   f.context.environment.cookies = [
-    { name: 'oai-did', value: 'original-device', domain: '.chatgpt.com', secure: true },
+    {
+      name: 'oai-did',
+      value: 'original-device',
+      domain: '.chatgpt.com',
+      secure: true,
+    },
     {
       name: '__Secure-next-auth.session-token',
       value: 'private-login',
@@ -90,11 +98,21 @@ test('the one-shot reference bridge receives the exact original profile, device,
       secure: true,
       expires: Date.now() / 1000 + 600,
     },
-    { name: 'specific', value: 'included', domain: '.chatgpt.com', path: '/checkout' },
+    {
+      name: 'specific',
+      value: 'included',
+      domain: '.chatgpt.com',
+      path: '/checkout',
+    },
     { name: 'expired', value: 'excluded', domain: 'chatgpt.com', expires: 1 },
     { name: 'wrong-host', value: 'excluded', domain: 'auth.openai.com' },
     { name: 'wrong-subdomain', value: 'excluded', domain: '.evil.chatgpt.com' },
-    { name: 'wrong-path', value: 'excluded', domain: 'chatgpt.com', path: '/check' },
+    {
+      name: 'wrong-path',
+      value: 'excluded',
+      domain: 'chatgpt.com',
+      path: '/check',
+    },
   ];
   const result = await f.authorize(f.request);
   const args = JSON.parse(await readFile(join(f.directory, 'input.json'), 'utf8'));
@@ -201,7 +219,11 @@ test('identity, page, cookie and profile mismatches are rejected before launchin
   f.context.environment.cookies = [{ name: 'oai-did', value: 'different', domain: 'chatgpt.com' }];
   await assert.rejects(f.authorize(f.request), /COOKIE_BINDING/);
   f.context.environment.cookies = [
-    { name: 'unsafe', value: 'private\r\nCookie: injected', domain: 'chatgpt.com' },
+    {
+      name: 'unsafe',
+      value: 'private\r\nCookie: injected',
+      domain: 'chatgpt.com',
+    },
   ];
   await assert.rejects(f.authorize(f.request), /COOKIE_BINDING/);
   f.context.environment.cookies = [];
@@ -256,6 +278,29 @@ const rejectedOutputs = [
   ['missing observer challenge', "out.so = JSON.stringify({so:'observer',id:args.deviceId,flow:args.flow});"],
   ['bridge error', "out.error = 'private-runtime-output';"],
 ];
+
+test('bridge diagnostics distinguish transient transport failures from invalid credentials without private output', async (t) => {
+  for (const [mutation, reason, retryable] of [
+    ["out.error = 'proto2: ETIMEDOUT private-secret';", 'UPSTREAM_TIMEOUT', true],
+    ["out.error = 'proto2: fetch failed private-secret';", 'UPSTREAM_UNAVAILABLE', true],
+    ["out.error = 'driver 无 c private-secret';", 'DRIVER_CHALLENGE_MISSING', false],
+    [
+      "out.main = JSON.stringify({p:'private-secret',id:'wrong',flow:args.flow});",
+      'MAIN_IDENTITY_MISMATCH',
+      false,
+    ],
+    ['out.main = JSON.stringify({id:args.deviceId,flow:args.flow});', 'MAIN_PROOF_MISSING', false],
+  ] as const) {
+    const f = await fixture(t, mutation + 'process.stdout.write(JSON.stringify(out));');
+    await assert.rejects(f.authorize(f.request), (error: any) => {
+      assert.equal(error.runtimeDiagnostic.reason, reason);
+      assert.equal(error.runtimeDiagnostic.retryable, retryable);
+      assert.equal(JSON.stringify(error).includes('private-secret'), false);
+      assert.equal(error.message.includes('private-secret'), false);
+      return true;
+    });
+  }
+});
 for (const [name, mutation] of rejectedOutputs) {
   test('reference authorization rejects ' + name, async (t) => {
     const f = await fixture(t, mutation + 'process.stdout.write(JSON.stringify(out));');
