@@ -1,4 +1,5 @@
 export * from './apps/worker/src/execution/engine.js';
+export { verificationSourceUrl } from './apps/worker/src/execution/intent-binding.js';
 export * from './apps/worker/src/execution/sentinel.js';
 export * from './apps/worker/src/execution/credentials.js';
 export * from './apps/worker/src/browser/runtime.js';

@@ -291,6 +291,8 @@ async function execute(
     async request(action, body = {}) {
       commands.push({ action, body: structuredClone(body) });
       if (action === 'card') return card;
+      if (action === 'verification' && body.action === 'start')
+        return { challengeId: 'customer-challenge', kind: 'stripe', state: 'waiting', expiresAt: Date.now() + 300000 };
       return {};
     },
   };
@@ -981,6 +983,66 @@ test('an explicit subscription limit fails immediately without another payment o
   assert.equal(result.requests.filter((r) => r.url.endsWith('/checkout/confirm')).length, 1);
   assert.ok(!result.requests.some((r) => /\/v1\/payment_intents\//.test(r.url)));
   assert.equal(result.assignment.run.paymentSubmitted, true);
+});
+
+for (const status of [200, 402]) {
+  test(`Stripe confirmation HTTP ${status} publishes its original action for the customer`, async () => {
+    const result = await execute({
+      stripeAccount: 'acct_original',
+      intentResponse(input) {
+        const url = new URL(input.url);
+        const intent = { id: url.pathname.split('/')[3],
+          client_secret: new URLSearchParams(input.body ?? url.search).get('client_secret'),
+          status: 'requires_action', next_action: { type: 'use_stripe_sdk' } };
+        const responseStatus = input.method === 'POST' ? status : 200;
+        const data = responseStatus === 402 ? { error: { payment_intent: intent } } : intent;
+        return { status: responseStatus, headers: {}, data, body: JSON.stringify(data) };
+      },
+    });
+    assert.equal(result.finish.status, 'awaiting_captcha', result.finish.error);
+    const start = result.commands.find((c) => c.action === 'verification' && c.body.action === 'start')!.body.body;
+    assert.equal(start.params.paymentIntentId, result.assignment.context.intent!.id);
+    assert.equal(start.params.stripeAccount, 'acct_original');
+    assert.ok(result.requests.filter((r) => new URL(r.url).hostname === 'api.stripe.com')
+      .every((r) => r.headers?.['Stripe-Account'] === 'acct_original'));
+    assert.equal(result.requests.filter((r) => /\/payment_intents\/[^/]+\/confirm$/.test(r.url)).length, 1);
+    assert.ok(!result.requests.some((r) => /verify_challenge|createTask/.test(r.url)));
+  });
+}
+
+for (const shape of ['nested', 'checkout_session', 'error']) {
+  test(`merchant ${shape} action is read back and handed to CDK without another confirmation`, async () => {
+    const intent = { id: 'pi_original', client_secret: 'pi_original_secret_original',
+      status: 'requires_action', next_action: { type: 'use_stripe_sdk' } };
+    const result = await execute({
+      merchantStatus: shape === 'error' ? 402 : 200,
+      merchantData: shape === 'checkout_session' ? { status: 'success', checkout_session: { payment_intent: intent } }
+        : shape === 'error' ? { error: { payment_intent: intent } }
+        : { status: 'success', payment_intent: intent },
+      intentResponse(input) {
+        assert.equal(input.method, 'GET');
+        return { status: 200, headers: {}, data: intent, body: JSON.stringify(intent) };
+      },
+    });
+    assert.equal(result.finish.status, 'awaiting_captcha', result.finish.error);
+    assert.equal(result.assignment.context.challenge!.id, 'customer-challenge');
+    assert.equal(result.requests.filter((r) => /\/checkout\/confirm$/.test(r.url)).length, 1);
+    assert.ok(!result.commands.some((c) => c.action === 'authorize' && c.body.action === 'stripe_confirm'));
+    assert.ok(!result.requests.some((r) => /\/payment_intents\/[^/]+\/confirm$/.test(r.url)));
+  });
+}
+
+test('an error response carrying a foreign Intent cannot replace the original or publish its challenge', async () => {
+  const result = await execute({
+    intentResponse() {
+      const data = { error: { payment_intent: { id: 'pi_foreign', client_secret: 'pi_foreign_secret_foreign',
+        status: 'requires_action' } } };
+      return { status: 402, headers: {}, data, body: JSON.stringify(data) };
+    },
+  });
+  assert.equal(result.finish.status, 'pending_confirmation');
+  assert.notEqual(result.assignment.context.intent!.id, 'pi_foreign');
+  assert.ok(!result.commands.some((c) => c.action === 'verification'));
 });
 
 test('a subscription limit carrying an Intent remains pending for original-payment reconciliation', async () => {

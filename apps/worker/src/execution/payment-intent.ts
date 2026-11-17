@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-const CHAT = 'https://chatgpt.com';
+import { verificationSourceUrl } from './intent-binding.js';
 import type { ExecutionServices } from './services.js';
 export async function handlePaymentIntent(services: ExecutionServices) {
   const intent = services.context.intent!;
@@ -22,7 +22,7 @@ export async function handlePaymentIntent(services: ExecutionServices) {
     const prior = services.context.challenge;
     if (
       prior?.nextActionSignature &&
-      (prior.completed || prior.expired) &&
+      intent.next_action != null &&
       prior.nextActionSignature !== signature
     ) {
       delete services.context.challenge;
@@ -54,12 +54,7 @@ export async function handlePaymentIntent(services: ExecutionServices) {
         documentNonce: services.context.environment.id,
         widgetId: intent.id,
         revision,
-        url:
-          CHAT +
-          '/checkout/' +
-          services.context.checkout!.processor_entity +
-          '/' +
-          services.context.checkout!.id,
+        url: verificationSourceUrl(services.context.checkout!),
         canApply: true,
         mode: 'stripe',
       };

@@ -10,6 +10,7 @@ import { preflightExecution } from './preflight.js';
 import { reconcilePayment } from './reconcile.js';
 import { acknowledgeVerification } from './verification-receipt.js';
 import { handlePaymentIntent } from './payment-intent.js';
+import { paymentIntentFromResponse } from './intent-binding.js';
 import { cleanupExecution } from './cleanup.js';
 import { UpstreamError, form } from './http-utils.js';
 import { trace, auditError, auditRequest, type AuditEntry } from '../../../../packages/runtime/src/audit.js';
@@ -315,6 +316,9 @@ export class ProtocolEngine {
           'cache-control': 'no-cache',
           pragma: 'no-cache',
           dnt: '1',
+          ...(this.context.snapshot?.stripe_account
+            ? { 'Stripe-Account': this.context.snapshot.stripe_account }
+            : {}),
         },
         body: body === undefined ? undefined : form(body),
       })
@@ -702,6 +706,15 @@ export class ProtocolEngine {
         throw error;
       }
       this.context.merchantConfirmation = confirm;
+      const observedIntent = paymentIntentFromResponse(confirm, this.context.intent);
+      if (observedIntent) {
+        this.context.intent = observedIntent;
+        await this.checkpoint('merchant_intent_ready');
+        if (observedIntent.status && observedIntent.status !== 'requires_confirmation' && observedIntent.client_secret) {
+          await this.reconcile();
+          return;
+        }
+      }
       // An explicit refusal without an Intent is terminal, not a lost response.
       if (confirm.status === 'subscription_limit' && !confirm.client_secret && !confirm.payment_intent) {
         await this.command('finish', {
@@ -716,7 +729,7 @@ export class ProtocolEngine {
         throw new Error(
           '商户确认未成功：' + String(confirm.status || confirm.error?.message || '响应缺少状态'),
         );
-      let clientSecret = confirm.client_secret;
+      let clientSecret = observedIntent?.client_secret;
       if (!clientSecret && this.context.checkout!.id.startsWith('cs_')) {
         const page = await this.stripe(
           '核对原 Custom Checkout',
@@ -828,7 +841,20 @@ export class ProtocolEngine {
           error: e.message,
         });
       } else {
-        const intent = error instanceof UpstreamError ? error.data?.error?.payment_intent : null;
+        let intent;
+        try {
+          if (this.assignment.run.paymentSubmitted && error instanceof UpstreamError)
+            intent = paymentIntentFromResponse(error.data, this.context.intent);
+          if (intent) this.context.intent = intent;
+          if (intent?.status === 'requires_action' && intent.client_secret && this.context.key) {
+            await this.checkpoint('verification_intent_recovered');
+            await this.reconcile();
+            return;
+          }
+        } catch (recoveryError) {
+          intent = undefined;
+          await this.log({ name: '原付款验证恢复待核对', status: 'pending', error: (recoveryError as Error).message });
+        }
         const declined =
           intent?.status === 'requires_payment_method' &&
           Boolean(intent.last_payment_error || (error instanceof UpstreamError && error.status === 402));

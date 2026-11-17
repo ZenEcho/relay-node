@@ -42,6 +42,7 @@ function fixture() {
     status: 'requires_action',
     next_action: { type: 'use_stripe_sdk', revision: 1 },
   };
+  let hostedPage: any;
   let notification: any;
   let receiptFailures = 0;
   let resultFailures = 0;
@@ -105,7 +106,9 @@ function fixture() {
           'Verification recovery must never confirm/capture a payment',
         );
         data = structuredClone(intent);
-      } else if (path.endsWith('/payments/checkout_session'))
+      } else if (path.startsWith('/v1/payment_pages/') && hostedPage)
+        data = structuredClone(hostedPage);
+      else if (path.endsWith('/payments/checkout_session'))
         data = { success: registrationSuccess };
       else if (path.endsWith('/subscriptions/cancel')) {
         if (cancellationWorks) renew = false;
@@ -128,6 +131,7 @@ function fixture() {
     intent: (v: any) => {
       intent = v;
     },
+    page: (v: any) => { hostedPage = v; },
     notify: (overrides: any = {}) => {
       notification = {
         challengeId: assignment.run.challengeId,
@@ -267,6 +271,49 @@ test('only a changed original next_action starts a new verification revision', a
   const starts = f.commands.filter((c) => c.action === 'verification' && c.body.action === 'start');
   assert.equal(starts.length, 2);
   assert.equal(starts[1].body.body.source.revision, 2);
+});
+
+test('a changed action replaces a waiting challenge while partial reads keep the same customer page', async () => {
+  const f = fixture();
+  await f.execute();
+  f.intent({ id: 'pi_original', status: 'requires_action' });
+  assert.equal((await f.execute()).status, 'awaiting_captcha');
+  assert.equal(f.assignment.run.challengeId, 'challenge-1');
+  f.intent({ id: 'pi_original', status: 'requires_action', next_action: { type: 'use_stripe_sdk', revision: 2 } });
+  assert.equal((await f.execute()).status, 'awaiting_captcha');
+  assert.equal(f.assignment.run.challengeId, 'challenge-2');
+  assert.equal(f.assignment.context.challenge.source.revision, 2);
+  assert.ok(f.requests.every((r) => r.method === 'GET'));
+});
+
+test('read-only verification uses the original Stripe account and rejects a changed client secret', async () => {
+  const f = fixture();
+  f.assignment.context.snapshot = { stripe_account: 'acct_original' };
+  await f.execute();
+  assert.equal(f.requests.at(-1).headers['Stripe-Account'], 'acct_original');
+  f.intent({ id: 'pi_original', client_secret: 'pi_original_secret_foreign', status: 'succeeded' });
+  const result = await f.execute();
+  assert.equal(result.status, 'pending_confirmation');
+  assert.equal(f.assignment.context.intent.client_secret, 'pi_original_secret_original');
+  assert.ok(!f.commands.some((c) => c.action === 'finish' && c.body.status === 'paid'));
+});
+
+test('Hosted page recovery binds its separate Intent secret and publishes the original Hosted source', async () => {
+  const f = fixture();
+  f.assignment.context.checkout = { id: 'cs_test_original', processor_entity: 'openai_llc',
+    url: 'https://pay.openai.com/c/pay/cs_test_original?locale=en#private-config' };
+  f.assignment.context.checkoutMode = 'hosted';
+  delete f.assignment.context.intent;
+  f.page({ id: 'cs_test_original', status: 'open', payment_status: 'unpaid',
+    payment_intent: 'pi_original', payment_intent_client_secret: 'pi_original_secret_original',
+    payment_intent_status: 'requires_action', next_action: { type: 'use_stripe_sdk', revision: 1 } });
+  assert.equal((await f.execute()).status, 'awaiting_captcha');
+  const start = f.commands.find((c) => c.action === 'verification' && c.body.action === 'start').body.body;
+  assert.equal(start.source.url, 'https://pay.openai.com/c/pay/cs_test_original');
+  assert.equal(start.params.paymentIntentId, 'pi_original');
+  assert.equal(start.params.clientSecret, 'pi_original_secret_original');
+  assert.ok(f.requests.some((r) => /\/v1\/payment_intents\/pi_original\?/.test(r.url)));
+  assert.ok(f.requests.every((r) => r.method === 'GET'));
 });
 
 test('paid cleanup recovery registers once and cancellation failure never turns payment into failure', async () => {

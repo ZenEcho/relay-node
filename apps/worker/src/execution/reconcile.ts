@@ -1,6 +1,7 @@
 import { reconcileHostedCheckout } from './hosted-checkout.js';
 import { form } from './http-utils.js';
 import type { ExecutionServices } from './services.js';
+import { paymentIntentFromResponse } from './intent-binding.js';
 export async function reconcilePayment(services: ExecutionServices) {
   const challenge = services.context.challenge;
   if (
@@ -71,8 +72,9 @@ export async function reconcilePayment(services: ExecutionServices) {
         '?' +
         form({ key: services.context.key, client_secret: old.client_secret }),
     );
-    if (result.id !== old.id) throw new Error('付款查询返回了其他 Intent');
-    services.context.intent = { ...result, client_secret: old.client_secret };
+    const current = paymentIntentFromResponse(result, old);
+    if (!current || result.id !== old.id) throw new Error('付款查询返回了其他 Intent');
+    services.context.intent = current;
     if (services.context.verificationReceipt) {
       try {
         await services.acknowledgeVerification();
@@ -110,7 +112,15 @@ export async function reconcilePayment(services: ExecutionServices) {
       await services.success();
       return;
     }
-    if (snapshot.payment_intent?.client_secret) services.context.intent = snapshot.payment_intent;
+    const intent = paymentIntentFromResponse(snapshot, services.context.intent);
+    if (intent) {
+      services.context.intent = intent;
+      await services.checkpoint('merchant_intent_ready');
+      if (intent.client_secret && services.context.key) {
+        await reconcilePayment(services);
+        return;
+      }
+    }
     // An explicit merchant refusal is distinct from a lost confirmation
     // response. Resolve only this known refusal after checking the original
     // unpaid checkout and current account; never infer failure from unpaid

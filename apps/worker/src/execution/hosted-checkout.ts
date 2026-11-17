@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { form } from './http-utils.js';
 import type { ExecutionServices } from './services.js';
+import { paymentIntentFromResponse } from './intent-binding.js';
 
 const VERSION = '2025-03-31.basil; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1';
 // Public merchant key from oa-pay-protocol-go; the original payment page must accept it before card access.
@@ -129,6 +130,8 @@ export async function submitHostedCheckout(services: ExecutionServices) {
     },
   );
   c.paymentPage = bindPage(services, data);
+  const intent = paymentIntentFromResponse(c.paymentPage, c.intent);
+  if (intent) c.intent = intent;
   await services.checkpoint('hosted_submitted');
   await services.requireSentinel('checkout_session_approval');
   await services.command('authorize', { action: 'merchant_approve' });
@@ -162,19 +165,7 @@ export async function reconcileHostedCheckout(services: ExecutionServices) {
     await services.success();
     return;
   }
-  const raw = page.payment_intent;
-  const secret = (typeof raw === 'object' && raw?.client_secret) || page.payment_intent_client_secret;
-  const intent =
-    typeof raw === 'object' && raw
-      ? raw
-      : secret
-        ? {
-            id: String(secret).split('_secret_')[0],
-            client_secret: secret,
-            status: page.payment_intent_status || page.payment_object_status,
-            next_action: page.next_action,
-          }
-        : undefined;
+  const intent = paymentIntentFromResponse(page, c.intent);
   if (
     intent &&
     /^pi_[a-zA-Z0-9]+$/.test(intent.id || '') &&
@@ -182,6 +173,12 @@ export async function reconcileHostedCheckout(services: ExecutionServices) {
   ) {
     c.intent = intent;
     await services.checkpoint('hosted_intent_ready');
+    // Page status and customer reports only wake an authoritative Intent read.
+    const result = await services.stripe('只读核对 Hosted 原付款', '/v1/payment_intents/' + intent.id +
+      '?' + form({ key: c.key, client_secret: intent.client_secret }));
+    const current = paymentIntentFromResponse(result, intent);
+    if (!current || result.id !== intent.id) throw new Error('付款查询返回了其他 Intent');
+    c.intent = current;
     await services.handleIntent();
     return;
   }
