@@ -62,21 +62,35 @@ export async function runManager(root: string) {
   const releaseRoot = await realpath(join(root, 'current'));
   const manifest = await readManifest(releaseRoot);
   let initialReady = false;
+  let transportError: unknown;
   try {
     await checkNativeTransport(releaseRoot);
     initialReady = true;
-  } catch {
+  } catch (error) {
+    transportError = error;
     console.error('原生传输组件未就绪，管理与更新功能保持可用');
   }
   let config = await jsonFile<InstanceConfig>(join(root, 'config.json'));
+  let runtimeError: unknown;
   let sdkReady = await checkPaymentRuntime(config.officialSdk, config.sentinel).then(
     () => true,
-    () => false,
+    (error) => {
+      runtimeError = error;
+      return false;
+    },
   );
   Object.assign(process.env, config.environment || {});
   process.env.WORKER_LOG_DIR = join(root, 'audit');
   let controller = new HttpController(config.consoleUrl, config.token);
   await controller.initializeLogs();
+  // Only state transitions are logged; normal heartbeats/polls do not flood the outbox.
+  const log: HttpController['logEvent'] = (...args) =>
+    controller.logEvent(...args).catch(() => {
+      console.error('节点运行日志写入失败');
+    });
+  await log('节点 · 启动', { request: { instance: config.instance, version: manifest.version } });
+  if (transportError) await log('节点 · 原生传输组件未就绪', { error: transportError });
+  if (runtimeError) await log('节点 · 支付运行环境未就绪', { error: runtimeError });
   const state = await jsonFile<State>(join(root, 'state.json'), {
     commands: [],
   });
@@ -87,7 +101,9 @@ export async function runManager(root: string) {
     lastProbe = Date.now(),
     status: any = { blockers: [] },
     upgrading: Promise<void> | undefined,
-    authenticated = false;
+    authenticated = false,
+    connectionFailed = false,
+    connectedOnce = false;
   const persist = () => saveJson(join(root, 'state.json'), state);
   const metadata = (): WorkerMetadata => ({
     version: manifest.version,
@@ -186,6 +202,7 @@ export async function runManager(root: string) {
       await report('failed', { error: result.error })
         .then(() => rm(join(root, 'update-result.json'), { force: true }))
         .catch(() => {});
+      await log('节点 · 更新失败', { error });
       console.error('节点更新失败，保留当前版本：' + (error as Error).message);
     }
   }
@@ -243,6 +260,9 @@ export async function runManager(root: string) {
           config = candidate;
           stopMetrics();
           controller = replacement;
+          await log('节点 · 对接控制台', {
+            request: { instance: config.instance, version: manifest.version },
+          });
           return { ok: true };
         }
         if (!['pause', 'resume', 'check_update', 'cancel_update'].includes(command.action))
@@ -274,16 +294,30 @@ export async function runManager(root: string) {
         void controller.flushLogs();
         if (Date.now() - lastProbe > 60000) {
           lastProbe = Date.now();
+          const wasSdkReady = sdkReady,
+            wasReady = ready;
           sdkReady = await checkPaymentRuntime(config.officialSdk, config.sentinel).then(
             () => true,
-            () => false,
+            (error) => {
+              runtimeError = error;
+              return false;
+            },
           );
           try {
             await selfTest(releaseRoot);
             ready = true;
-          } catch {
+          } catch (error) {
+            transportError = error;
             ready = false;
           }
+          if (wasReady !== ready)
+            await log(ready ? '节点 · 原生传输组件恢复' : '节点 · 原生传输组件未就绪', {
+              error: ready ? undefined : transportError,
+            });
+          if (wasSdkReady !== sdkReady)
+            await log(sdkReady ? '节点 · 支付运行环境恢复' : '节点 · 支付运行环境未就绪', {
+              error: sdkReady ? undefined : runtimeError,
+            });
         }
         status = await heartbeat();
         authenticated = true;
@@ -341,6 +375,7 @@ export async function runManager(root: string) {
             });
           } catch (error) {
             if (![400, 404, 409, 422].includes((error as any).status)) throw error;
+            await log('节点 · 管理操作未执行', { request: { action: command.action }, error });
             console.error('节点管理操作未执行：' + (error as Error).message);
           }
           state.commands.shift();
@@ -373,37 +408,66 @@ export async function runManager(root: string) {
           await pollBatch(
             () => controller.request('poll'),
             (assignment: import('../../../../packages/contracts/src/execution.js').Assignment) => {
-            const handle = cancellations.register(assignment.run.id, assignment.run.workerLease);
-            if (handle && !handle.controller.signal.aborted) {
-              const task = executeWithOnDemandSdk(
-                assignment,
-                controller.forRun(assignment, handle.controller),
-                assignment.demo
-                  ? new DemoTransport()
-                  : new NativeTransport(join(releaseRoot, 'bin/relay-transport')),
-                config.officialSdk,
-                config.sentinel,
-              )
-                .catch(() => console.error('执行回执未确认，保留原任务等待核对'))
-                .finally(() => {
-                  handle.dispose();
-                  pending.delete(task);
-                });
-              pending.add(task);
-            } else handle?.dispose();
+              const handle = cancellations.register(assignment.run.id, assignment.run.workerLease);
+              if (handle && !handle.controller.signal.aborted) {
+                const task = log('执行节点接收订单', { request: { mode: assignment.mode } }, assignment)
+                  .then(() =>
+                    executeWithOnDemandSdk(
+                      assignment,
+                      controller.forRun(assignment, handle.controller),
+                      assignment.demo
+                        ? new DemoTransport()
+                        : new NativeTransport(join(releaseRoot, 'bin/relay-transport')),
+                      config.officialSdk,
+                      config.sentinel,
+                    ),
+                  )
+                  .then(() =>
+                    log(
+                      handle.controller.signal.aborted ? '执行节点任务已中断' : '执行节点结束本次任务',
+                      { status: handle.controller.signal.aborted ? 'skipped' : 'succeeded' },
+                      assignment,
+                    ),
+                  )
+                  .catch(async (error) => {
+                    await log(
+                      handle.controller.signal.aborted ? '执行节点任务已中断' : '执行节点任务异常',
+                      {
+                        status: handle.controller.signal.aborted ? 'skipped' : 'failed',
+                        error,
+                      },
+                      assignment,
+                    );
+                    console.error('执行回执未确认，保留原任务等待核对');
+                  })
+                  .finally(() => {
+                    handle.dispose();
+                    pending.delete(task);
+                  });
+                pending.add(task);
+              } else handle?.dispose();
             },
             () => !stopping && !upgrading && ready && !state.commands.length,
           );
         }
-      } catch {
+        if (!connectedOnce || connectionFailed)
+          await log(connectionFailed ? '节点 · 控制台连接恢复' : '节点 · 已连接控制台');
+        connectedOnce = true;
+        connectionFailed = false;
+      } catch (error) {
         stopMetrics();
         authenticated = false;
-        console.error('控制台暂不可用；停止领取新任务，保留原节点状态');
+        if (!connectionFailed) {
+          await log('节点 · 控制台通信异常', { error });
+          console.error('控制台暂不可用；停止领取新任务，保留原节点状态');
+        }
+        connectionFailed = true;
       }
       await delay(1500);
     }
     await Promise.allSettled(pending);
     await upgrading;
+    await log('节点 · 停止');
     await controller.flushLogs();
   } finally {
     stopMetrics();

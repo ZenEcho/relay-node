@@ -9,17 +9,29 @@ type EgressRequest = (input: {
 
 export async function inspectEgress(request: EgressRequest) {
   // Both checks use the same transport/session, so an explicit workflow proxy stays pinned.
-  const primary = await request({
-    method: 'GET',
-    url: 'https://ipapi.co/json/',
-    headers: { accept: 'application/json' },
-  });
+  let primary: Awaited<ReturnType<EgressRequest>> | undefined;
+  let primaryError: unknown;
+  try {
+    primary = await request({
+      method: 'GET',
+      url: 'https://ipapi.co/json/',
+      headers: { accept: 'application/json' },
+    });
+  } catch (error) {
+    const e = error as { code?: string; name?: string };
+    if (e?.code === 'EXECUTION_ABORTED' || e?.code === 'TRANSPORT_CLOSED' || e?.name === 'AbortError')
+      throw error;
+    primaryError = error;
+  }
   if (
-    primary.status === 200 &&
+    primary?.status === 200 &&
     isIP(primary.data?.ip || '') &&
     /^[A-Z]{2}$/.test(primary.data?.country_code || '')
   )
-    return { ip: primary.data.ip as string, country: primary.data.country_code as string };
+    return {
+      ip: primary.data.ip as string,
+      country: primary.data.country_code as string,
+    };
   const fallback = await request({
     method: 'GET',
     url: 'https://chatgpt.com/cdn-cgi/trace',
@@ -34,10 +46,13 @@ export async function inspectEgress(request: EgressRequest) {
     !isIP(ip) ||
     !/^[A-Z]{2}$/.test(country)
   )
-    throw new AppError(
-      502,
-      `无法确认网络出口（主查询 HTTP ${primary.status}，备用查询 HTTP ${fallback.status}）`,
-      'EGRESS_UNAVAILABLE',
+    throw Object.assign(
+      new AppError(
+        502,
+        `无法确认网络出口（主查询${primary ? ' HTTP ' + primary.status : '未收到响应'}，备用查询 HTTP ${fallback.status}）`,
+        'EGRESS_UNAVAILABLE',
+      ),
+      primaryError ? { cause: primaryError } : {},
     );
   return { ip, country };
 }

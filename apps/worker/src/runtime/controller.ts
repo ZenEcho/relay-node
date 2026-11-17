@@ -2,6 +2,7 @@ import type { Assignment, Control } from '../../../../packages/contracts/src/exe
 export type { Assignment, Control } from '../../../../packages/contracts/src/execution.js';
 import { WorkerLogs } from './logs.js';
 import { randomUUID } from 'node:crypto';
+import { auditError } from '../../../../packages/runtime/src/audit.js';
 import {
   executionAborted,
   executionOperation,
@@ -13,8 +14,19 @@ export class HttpController {
     readonly origin: string,
     private token: string,
   ) {
-    this.logs = new WorkerLogs(process.env.WORKER_LOG_DIR || '.data/worker-audit', origin, token, (record) =>
-      this.request('logs', record),
+    this.logs = new WorkerLogs(
+      process.env.WORKER_LOG_DIR || '.data/worker-audit',
+      origin,
+      token,
+      async (record) => {
+        if (record.runId) return this.request('logs', record);
+        try {
+          return await this.request('node-logs', { step: record.step });
+        } catch (error) {
+          // Older consoles lack runtime logging; never let that block order receipts.
+          if (![404, 405].includes((error as any).status)) throw error;
+        }
+      },
     );
   }
   async initializeLogs() {
@@ -25,6 +37,34 @@ export class HttpController {
   }
   get pendingLogs() {
     return this.logs.pending;
+  }
+  async logEvent(
+    name: string,
+    detail: {
+      status?: 'succeeded' | 'failed' | 'pending' | 'skipped';
+      request?: unknown;
+      error?: unknown;
+    } = {},
+    assignment?: Assignment,
+  ) {
+    const at = new Date().toISOString();
+    const step = {
+      traceId: randomUUID(),
+      name,
+      category: 'event',
+      status: detail.status || (detail.error ? 'failed' : 'succeeded'),
+      request: detail.request,
+      startedAt: at,
+      completedAt: at,
+      ...(detail.error
+        ? {
+            error: (detail.error as Error).message || String(detail.error),
+            errorDetail: auditError(detail.error),
+          }
+        : {}),
+    };
+    if (assignment) await this.logs.enqueue(assignment.run.id, assignment.run.workerLease!, step);
+    else await this.logs.enqueueNode(step);
   }
   async request(path: string, body: any = {}, signal?: AbortSignal) {
     throwIfExecutionAborted(signal);

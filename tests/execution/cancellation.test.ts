@@ -10,6 +10,7 @@ import { createEnvironment } from '../../packages/runtime/src/environment.js';
 import { digest } from '../../packages/runtime/src/security.js';
 import type { Assignment, Control } from '../../packages/contracts/src/execution.js';
 import type { HttpInput, HttpOutput } from '../../apps/worker/src/transport/native.js';
+import { NativeTransportError } from '../../apps/worker/src/transport/native.js';
 import type { SentinelAuthorizer, SentinelRequest } from '../../packages/contracts/src/sentinel.js';
 
 function deferred<T>() {
@@ -89,7 +90,12 @@ function setup(pausePath?: string, authorizer?: SentinelAuthorizer) {
     request: async (action, body) => {
       commands.push({ action, body: structuredClone(body) });
       if (action === 'card')
-        return { number: '4242424242424242', cvc: '123', expiry: '12/30', lastFour: '4242' };
+        return {
+          number: '4242424242424242',
+          cvc: '123',
+          expiry: '12/30',
+          lastFour: '4242',
+        };
       return {};
     },
   };
@@ -107,6 +113,26 @@ function setup(pausePath?: string, authorizer?: SentinelAuthorizer) {
     engine: new ProtocolEngine(assignment, control, transport, authorizer),
   };
 }
+
+test('failed proxy connections mark the next attempt for reacquisition without marking unrelated failures', async (t) => {
+  for (const [error, proxied, expected] of [
+    [new NativeTransportError('UPSTREAM_TLS_FAILED'), true, true],
+    [new NativeTransportError('UPSTREAM_READ_FAILED'), true, undefined],
+    [new Error('unrelated failure'), true, undefined],
+    [new NativeTransportError('UPSTREAM_TLS_FAILED'), false, undefined],
+  ] as const) {
+    const f = setup();
+    f.assignment.context.environment.proxyUrl = proxied ? 'http://proxy.invalid:8080/' : '';
+    t.mock.method(f.transport, 'request', async () => {
+      throw error;
+    });
+    await f.engine.execute();
+    const finish = f.commands.find((command) => command.action === 'finish')!;
+    assert.equal(finish.body.status, 'failed');
+    assert.equal(finish.body.context.proxyConnectionFailed, expected);
+    assert.ok(!f.commands.some((command) => command.action === 'card' || command.action === 'authorize'));
+  }
+});
 
 test('an already cancelled execution performs no initialization, request or completion write', async () => {
   const f = setup();
@@ -271,8 +297,12 @@ for (const status of [401, 403, 404, 409])
     const control = new HttpController(
       'http://127.0.0.1:' + (upstream.address() as any).port,
       'test-node-token',
-    ).forRun({ run: { id: 'original-run', workerLease: 'original-lease' } } as Assignment);
-    await assert.rejects(control.assertActive!(), { code: 'EXECUTION_ABORTED' });
+    ).forRun({
+      run: { id: 'original-run', workerLease: 'original-lease' },
+    } as Assignment);
+    await assert.rejects(control.assertActive!(), {
+      code: 'EXECUTION_ABORTED',
+    });
     assert.equal(control.signal!.aborted, true);
     await assert.rejects(control.request('authorize', { action: 'merchant_confirm' }), {
       code: 'EXECUTION_ABORTED',
@@ -282,7 +312,12 @@ for (const status of [401, 403, 404, 409])
 test('an unrelated conflict does not become a manual-cancellation signal', async (t) => {
   const upstream = createServer((_request, response) => {
     response.writeHead(409, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({ error: 'DISPATCH_ALREADY_STARTED', message: 'original dispatch exists' }));
+    response.end(
+      JSON.stringify({
+        error: 'DISPATCH_ALREADY_STARTED',
+        message: 'original dispatch exists',
+      }),
+    );
   });
   await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
   t.after(async () => {
@@ -292,7 +327,11 @@ test('an unrelated conflict does not become a manual-cancellation signal', async
   const control = new HttpController(
     'http://127.0.0.1:' + (upstream.address() as any).port,
     'test-node-token',
-  ).forRun({ run: { id: 'original-run', workerLease: 'original-lease' } } as Assignment);
-  await assert.rejects(control.request('authorize'), { code: 'DISPATCH_ALREADY_STARTED' });
+  ).forRun({
+    run: { id: 'original-run', workerLease: 'original-lease' },
+  } as Assignment);
+  await assert.rejects(control.request('authorize'), {
+    code: 'DISPATCH_ALREADY_STARTED',
+  });
   assert.equal(control.signal!.aborted, false);
 });

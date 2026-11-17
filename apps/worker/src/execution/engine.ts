@@ -16,7 +16,7 @@ import { trace, auditError, auditRequest, type AuditEntry } from '../../../../pa
 import { retryAfterMs } from '../../../../packages/rules/src/http.js';
 import { randomInt, randomUUID } from 'node:crypto';
 import type { Assignment, Control } from '../runtime/controller.js';
-import type { Transport, HttpInput } from '../transport/native.js';
+import { NativeTransportError, type Transport, type HttpInput } from '../transport/native.js';
 import { loadCredential } from './credentials.js';
 import { paymentPlan } from '../../../../packages/rules/src/plans.js';
 import { billingPostalCodeOptional } from '../../../../packages/rules/src/billing.js';
@@ -368,7 +368,9 @@ export class ProtocolEngine {
           id,
           processor_entity: result.processor_entity || 'openai_llc',
           ...(mode === 'hosted'
-            ? { url: result.url || result.checkout_url || result.checkout_session?.url }
+            ? {
+                url: result.url || result.checkout_url || result.checkout_session?.url,
+              }
             : {}),
         };
         await this.checkpoint('checkout_created');
@@ -379,7 +381,10 @@ export class ProtocolEngine {
           name: '支付链接类型 · ' + this.context.checkoutMode,
           category: 'event',
           status: 'succeeded',
-          response: { checkoutMode: this.context.checkoutMode, checkoutId: this.context.checkout!.id },
+          response: {
+            checkoutMode: this.context.checkoutMode,
+            checkoutId: this.context.checkout!.id,
+          },
         });
         this.context.checkoutTypeLogged = true;
         await this.checkpoint('checkout_type_ready');
@@ -511,7 +516,10 @@ export class ProtocolEngine {
                     this.context.snapshot.customer_session_client_secret,
                   amountMinor: this.context.snapshot.amount_total,
                   currency: this.context.currency,
-                  billing: { ...billing, email: this.context.billingEmailBinding?.email },
+                  billing: {
+                    ...billing,
+                    email: this.context.billingEmailBinding?.email,
+                  },
                   returnUrl: this.context.confirmReturnUrl || this.context.snapshot.return_url || CHAT + '/',
                   cardLastFour: lastFour,
                 },
@@ -703,6 +711,14 @@ export class ProtocolEngine {
     } catch (error) {
       if (this.control.signal?.aborted || (error as any)?.code === 'EXECUTION_ABORTED') return;
       const e = error as Error;
+      if (
+        this.context.environment.proxyUrl &&
+        error instanceof NativeTransportError &&
+        /^(?:PROXY_|UPSTREAM_(?:TIMEOUT|DNS_FAILED|CONNECTION_FAILED|TLS_FAILED|CONNECTION_CLOSED|TRANSPORT_FAILED)$|NATIVE_TRANSPORT_TIMEOUT$)/.test(
+          error.code,
+        )
+      )
+        this.context.proxyConnectionFailed = true;
       await this.log({
         name: '执行失败 · ' + this.stage,
         status: 'failed',
@@ -760,7 +776,10 @@ export class ProtocolEngine {
           name: '关闭订单传输会话',
           status: 'succeeded',
           category: 'event',
-          response: { environmentId: this.context.environment.id, closed: true },
+          response: {
+            environmentId: this.context.environment.id,
+            closed: true,
+          },
         }).catch((error) => {
           if (!this.control.signal?.aborted) throw error;
         });

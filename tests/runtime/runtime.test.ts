@@ -227,7 +227,11 @@ test('install, menu commands, idle update, failed rebind and multiple instances 
   const reportsAfterStop = metricReports;
   const afterStop = heartbeats;
   await until(async () => heartbeats > afterStop + 1);
-  assert.equal(metricReports, reportsAfterStop, 'closing the last viewer stops monitoring while heartbeats continue');
+  assert.equal(
+    metricReports,
+    reportsAfterStop,
+    'closing the last viewer stops monitoring while heartbeats continue',
+  );
   const run = (action: string) => exec(process.execPath, [cli, '--instance', 'one', action], { env });
   await run('pause');
   await until(async () => control.desiredState === 'paused');
@@ -392,6 +396,7 @@ test('a broken execution helper leaves management online without declaring start
   await symlink(release, join(instance, 'current'));
   let reports = 0,
     polls = 0;
+  const nodeLogs: any[] = [];
   const upstream = createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
@@ -407,6 +412,9 @@ test('a broken execution helper leaves management online without declaring start
           protocolVersion: 1,
         }),
       );
+    } else if (req.url === '/api/worker/node-logs') {
+      nodeLogs.push(meta.step);
+      res.end('{"ok":true}');
     } else {
       polls++;
       res.end('null');
@@ -441,6 +449,9 @@ test('a broken execution helper leaves management online without declaring start
   assert.equal(status.connected, true);
   assert.equal(status.transportReady, false);
   assert.equal(polls, 0);
+  await until(async () => nodeLogs.some((step) => step.name === '节点 · 已连接控制台'));
+  assert.equal(nodeLogs.filter((step) => step.name === '节点 · 启动').length, 1);
+  assert.equal(nodeLogs.filter((step) => step.name === '节点 · 原生传输组件未就绪').length, 1);
   assert.equal(
     await stat(join(instance, 'healthy')).then(
       () => true,
@@ -461,6 +472,7 @@ test('a heartbeat cancellation aborts a blocked run and releases its in-flight s
     cancelled = false,
     released = false,
     finishes = 0;
+  const orderEvents: any[] = [];
   const lease = 'original-worker-lease';
   const assignment = {
     mode: 'execute',
@@ -518,6 +530,7 @@ test('a heartbeat cancellation aborts a blocked run and releases its in-flight s
       blocked = true;
       // A force-takeover heartbeat must interrupt this pending response.
     } else {
+      if (request.url === '/api/worker/logs') orderEvents.push(body.step);
       if (request.url?.endsWith('/finish')) finishes++;
       response.end('{"ok":true}');
     }
@@ -544,4 +557,60 @@ test('a heartbeat cancellation aborts a blocked run and releases its in-flight s
   await until(async () => released, 12000);
   assert.equal(cancelled, true);
   assert.equal(finishes, 0);
+  await until(async () => orderEvents.some((step) => step.name === '执行节点任务已中断'));
+  assert.equal(orderEvents.find((step) => step.name === '执行节点任务已中断').status, 'skipped');
+});
+
+test('repeated polling failures log one outage and one recovery after communication succeeds', async (t) => {
+  const root = await mkdtemp('/tmp/relay-node-outage-');
+  const release = await fixture(root),
+    instance = join(root, 'instance');
+  await mkdir(instance);
+  await symlink(release, join(instance, 'current'));
+  let polls = 0;
+  const events: any[] = [];
+  const upstream = createServer(async (request, response) => {
+    let raw = '';
+    for await (const chunk of request) raw += chunk;
+    response.setHeader('content-type', 'application/json');
+    if (request.url === '/api/worker/heartbeat') {
+      response.end(
+        JSON.stringify({
+          control: { revision: 0, desiredState: 'running' },
+          blockers: [],
+          protocolVersion: 1,
+        }),
+      );
+    } else if (request.url === '/api/worker/poll') {
+      polls++;
+      response.statusCode = polls <= 3 ? 503 : 200;
+      response.end(polls <= 3 ? '{"message":"poll unavailable"}' : 'null');
+    } else {
+      if (request.url === '/api/worker/node-logs') events.push(JSON.parse(raw).step);
+      response.end('{"ok":true}');
+    }
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  await saveJson(join(instance, 'config.json'), {
+    instance: 'one',
+    consoleUrl: 'http://127.0.0.1:' + (upstream.address() as any).port,
+    token: 'relaynode.test.one.token',
+  });
+  const manager = spawn(process.execPath, [join(release, 'dist/apps/worker/src/entry.js'), instance], {
+    stdio: 'ignore',
+  });
+  t.after(async () => {
+    if (manager.exitCode === null) {
+      const ended = new Promise<void>((resolve) => manager.once('exit', () => resolve()));
+      manager.kill('SIGTERM');
+      await Promise.race([ended, delay(4000)]);
+    }
+    upstream.closeAllConnections();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  });
+  await until(async () => polls >= 5 && events.some((step) => step.name === '节点 · 控制台连接恢复'));
+  assert.equal(events.filter((step) => step.name === '节点 · 控制台通信异常').length, 1);
+  assert.equal(events.filter((step) => step.name === '节点 · 控制台连接恢复').length, 1);
+  assert.equal(events.find((step) => step.name === '节点 · 控制台通信异常').status, 'failed');
 });
