@@ -87,6 +87,8 @@ node scripts/install-reference-sentinel.mjs --directory /absolute/path/reference
 
 新环境固定使用原生组件支持的 Chrome 146 TLS/UA，已有订单的环境不改写。reference 模式签发 Sentinel 无需 Chrome/Chromium；浏览器收尾和 official Sentinel 模式需要 Chrome/Chromium，可通过 officialSdk.executablePath 指定可执行文件。原付款核对不依赖浏览器就绪；收尾失败保留付款成功。收尾先强制刷新 Session 并验证原账号，再完成原登记、取消续费和获取账单；浏览器轮换后的 Cookie 整体保存，防止混入旧登录分片。刷新失败不继续使用旧 Token，明确的 401 仅在重新刷新后重试一次。
 
+付款前的只读请求明确返回 `401 / token_expired` 时，使用本单 Session Cookie 读取并强制刷新 accessToken，核对原账号与原用户后重试原查询一次。正式节点复用本单代理下的临时浏览器；SDK 未注入浏览器通道时使用原 HTTP 会话。刷新成功后同步轮换 Cookie 到 HTTP 传输并保存检查点；身份不符、无登录 Cookie、响应仍为旧 Token 或刷新失败时停止。普通 401/403 不触发此恢复，结账创建及付款 POST 不自动重放；accessToken 过期也不直接等同于登录 Session 过期。
+
 独立预检默认只核对原账号并签发两个 flow；可用 `--sdk-root` 指定安装节点。额外传 `--verify-checkout` 才创建一个未付款 Plus 结账并核验商户接受情况，始终不取卡、不确认付款：
 
 ```sh

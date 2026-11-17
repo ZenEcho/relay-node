@@ -18,6 +18,7 @@ import { randomInt, randomUUID } from 'node:crypto';
 import type { Assignment, Control } from '../runtime/controller.js';
 import { NativeTransportError, type Transport, type HttpInput } from '../transport/native.js';
 import { loadCredential } from './credentials.js';
+import { isExpiredAccessToken, refreshExpiredAccessToken } from './session-refresh.js';
 import { paymentPlan } from '../../../../packages/rules/src/plans.js';
 import { billingPostalCodeOptional } from '../../../../packages/rules/src/billing.js';
 import { authorizeSentinel } from './sentinel.js';
@@ -42,6 +43,7 @@ export class ProtocolEngine {
   private context: RuntimeContext;
   private stage = 'preflight';
   private paid = false;
+  private accessTokenRefreshAttempted = false;
   constructor(
     private assignment: Assignment,
     private control: Control,
@@ -247,7 +249,9 @@ export class ProtocolEngine {
         : path.startsWith('/backend-api/checkout_pricing_config/configs/')
           ? '/backend-api/checkout_pricing_config/configs/{country_code}'
           : path.split('?')[0],
-      ...(c.session?.accessToken ? { authorization: 'Bearer ' + c.session.accessToken } : {}),
+      ...(c.session?.accessToken && path.split('?')[0] !== '/api/auth/session'
+        ? { authorization: 'Bearer ' + c.session.accessToken }
+        : {}),
       ...(c.accountId ? { 'chatgpt-account-id': c.accountId } : {}),
       ...(c.sentinel ? { 'openai-sentinel-token': c.sentinel } : {}),
       ...(c.sentinelSo ? { 'openai-sentinel-so-token': c.sentinelSo } : {}),
@@ -257,6 +261,35 @@ export class ProtocolEngine {
     };
   }
   private async chat(name: string, path: string, body?: any, extra?: Record<string, string>) {
+    try {
+      return await this.rawChat(name, path, body, extra);
+    } catch (error) {
+      // Recover a read before payment once. Never replay checkout or payment writes.
+      if (
+        body !== undefined ||
+        !path.startsWith('/backend-api/') ||
+        this.assignment.mode !== 'execute' ||
+        this.paid ||
+        this.assignment.run.paymentSubmitted ||
+        this.accessTokenRefreshAttempted ||
+        !isExpiredAccessToken(error)
+      )
+        throw error;
+      this.accessTokenRefreshAttempted = true;
+      await refreshExpiredAccessToken(
+        this.context,
+        this.services.cleanupChat || this.rawChat.bind(this),
+        path,
+        this.control.signal,
+      );
+      await executionOperation(this.control.signal, () =>
+        this.transport.initialize(this.context.environment, this.control.signal),
+      );
+      await this.checkpoint(this.stage);
+      return this.rawChat(name, path, body, extra);
+    }
+  }
+  private async rawChat(name: string, path: string, body?: any, extra?: Record<string, string>) {
     return (
       await this.request(name, {
         method: body === undefined ? 'GET' : 'POST',

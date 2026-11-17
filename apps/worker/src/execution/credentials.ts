@@ -112,13 +112,18 @@ export function loadCredential(context: RuntimeContext) {
   context.userId = session.user?.id;
 }
 export function verifySessionIdentity(context: RuntimeContext, session: any) {
+  const accessToken = session?.accessToken || session?.access_token;
   if (
     !session ||
     typeof session !== 'object' ||
-    !String(session.accessToken || session.access_token || '').trim()
+    typeof accessToken !== 'string' ||
+    !accessToken.trim()
   )
     throw new Error('刷新响应缺少 accessToken，不能视为最新 Session');
-  if (context.accountId && session.account?.id && context.accountId !== session.account.id)
+  if (
+    context.accountId &&
+    [session.account?.id, session.account?.account_id].some((id) => id && context.accountId !== id)
+  )
     throw new Error('刷新后的账号与原订单不一致');
   if (context.userId && session.user?.id && context.userId !== session.user.id)
     throw new Error('刷新后的用户与原订单不一致');
