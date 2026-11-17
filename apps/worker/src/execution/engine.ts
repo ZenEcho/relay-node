@@ -355,7 +355,7 @@ export class ProtocolEngine {
       }
       await this.preflight();
       if (!this.assignment.paymentEnabled && !this.assignment.demo)
-        throw new Error('真实付款未启用：请同时开启控制台付款开关与 COMMIT_PAYMENTS');
+        throw new Error('真实付款未启用：请检查服务端 COMMIT_PAYMENTS 配置');
       const billing = this.assignment.billing;
       if (
         !billing ||
