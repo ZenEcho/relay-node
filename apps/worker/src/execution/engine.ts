@@ -51,9 +51,14 @@ export class ProtocolEngine {
     private transport: Transport,
     private sentinelAuthorizer?: SentinelAuthorizer,
     private stripeTokenProvider?: StripeTokenProvider,
-    private browserCleanupChat?: ExecutionServices['chat'],
+    private browserCleanupChat?: ExecutionServices['cleanupChat'],
   ) {
     this.context = assignment.context;
+    this.stage = assignment.mode === 'reconcile'
+      ? 'stripe_result'
+      : assignment.mode === 'cleanup'
+        ? 'post_payment'
+        : this.context.phase || 'preflight';
   }
   private get services(): ExecutionServices {
     return {
@@ -66,15 +71,28 @@ export class ProtocolEngine {
       request: this.request.bind(this),
       chat: this.chat.bind(this),
       cleanupChat: this.browserCleanupChat
-        ? (name, path, body, headers) =>
-            trace(this.log, name, { method: body ? 'POST' : 'GET', path, transport: 'browser' }, async (capture) => {
+        ? (name, path, body, headers) => {
+            const request = auditRequest({
+              method: body ? 'POST' : 'GET', url: CHAT + path,
+              body: body ? JSON.stringify(body) : undefined,
+              transport: 'browser',
+            });
+            return trace(this.log, name, request, async (capture) => {
               await this.assertActive();
+              let observed = false;
               const data = await executionOperation(this.control.signal, () =>
-                this.browserCleanupChat!(name, path, body, headers),
+                this.browserCleanupChat!(name, path, body, headers, (exchange) => {
+                  observed = true;
+                  Object.assign(request, auditRequest(exchange.request));
+                  capture(exchange.networkFailure
+                    ? { received: false, reason: '未收到响应' }
+                    : { status: exchange.status, headers: exchange.headers, body: exchange.data ?? exchange.body, ...(exchange.partial ? { partial: true } : {}) }, exchange.status);
+                }),
               );
-              capture(data);
+              if (!observed) capture(data);
               return data;
-            }, 'http')
+            }, 'http');
+          }
         : undefined,
       stripe: this.stripe.bind(this),
       requireSentinel: this.requireSentinel.bind(this),
@@ -93,7 +111,9 @@ export class ProtocolEngine {
   private log = async (step: AuditEntry) => {
     if (this.control.signal?.aborted) return;
     await executionOperation(this.control.signal, () =>
-      this.control.request('step', { step: { ...step, source: 'worker' } }),
+      this.control.request('step', {
+        step: { ...step, request: { stage: this.stage, ...(step.request as object) }, source: 'worker' },
+      }),
     );
   };
   private async command(action: string, body: any = {}): Promise<any> {
@@ -119,6 +139,10 @@ export class ProtocolEngine {
         const result = await executionOperation(this.control.signal, () =>
           this.control.request(action, body),
         );
+        if (action === 'authorize' && ['merchant_confirm', 'merchant_approve', 'stripe_confirm', 'registration'].includes(body.action)) {
+          this.assignment.run.dispatches[body.action] ||= new Date().toISOString();
+          if (body.action !== 'registration') this.assignment.run.paymentSubmitted = true;
+        }
         capture(result);
         return result;
       },
@@ -422,6 +446,12 @@ export class ProtocolEngine {
               }
             : {}),
         };
+        // Preserve the original response's configuration across checkpoints;
+        // subsequent tax snapshots may omit these optional fields.
+        this.context.confirmReturnUrl = result.confirm_return_url;
+        this.context.customerSessionClientSecret ||= result.customer_session_client_secret;
+        this.context.key ||= result.publishable_key || result.stripe_publishable_key;
+        this.context.stripeAccount = result.stripe_account;
         await this.checkpoint('checkout_created');
       }
       this.context.checkoutMode ||= this.context.checkout!.id.startsWith('cs_') ? 'hosted' : 'custom';
@@ -458,6 +488,10 @@ export class ProtocolEngine {
         });
         this.context.snapshot = taxes.checkout_session || taxes.checkoutSession;
         if (!this.context.snapshot) throw new Error('计税响应缺少原结账快照');
+        this.context.confirmReturnUrl =
+          this.context.snapshot.confirm_return_url || taxes.confirm_return_url || this.context.confirmReturnUrl;
+        this.context.customerSessionClientSecret ||= this.context.snapshot.customer_session_client_secret;
+        this.context.snapshot.stripe_account ||= this.context.stripeAccount;
         this.context.snapshot.amount_total ??= taxes.snapshot?.amount_total;
         this.context.snapshot.currency ??= taxes.snapshot?.currency;
         if (this.context.snapshot.id && this.context.snapshot.id !== this.context.checkout!.id)
@@ -486,6 +520,9 @@ export class ProtocolEngine {
         if (!this.context.key) throw new Error('原结账缺少 Stripe publishable key');
         await this.checkpoint('taxes_ready');
       }
+      // Older checkpoints may carry these only on the checkout snapshot.
+      this.context.confirmReturnUrl ||= this.context.snapshot.confirm_return_url;
+      this.context.customerSessionClientSecret ||= this.context.snapshot.customer_session_client_secret;
       if (this.context.checkoutMode === 'hosted') {
         this.context.key ||= hostedPublishableKey(
           this.context.snapshot.url || this.context.checkout!.url,
@@ -670,6 +707,7 @@ export class ProtocolEngine {
         return;
       }
       await this.requireSentinel('checkout_session_approval');
+      await this.checkpoint('merchant_confirm');
       await this.command('authorize', { action: 'merchant_confirm' });
       this.assignment.run.paymentSubmitted = true;
       let confirm;
@@ -715,14 +753,11 @@ export class ProtocolEngine {
           return;
         }
       }
-      // An explicit refusal without an Intent is terminal, not a lost response.
+      // A known refusal can be resolved through read-only original-payment checks.
       if (confirm.status === 'subscription_limit' && !confirm.client_secret && !confirm.payment_intent) {
-        await this.command('finish', {
-          status: 'failed',
-          paymentOutcome: 'failed',
-          context: this.context,
-          error: '商户确认未成功：subscription_limit',
-        });
+        // Match the observed PH chain: verify the original checkout and
+        // account before releasing the card or allowing another attempt.
+        await this.reconcile();
         return;
       }
       if (confirm.error || confirm.success === false || confirm.status !== 'success')
@@ -767,7 +802,9 @@ export class ProtocolEngine {
         client_secret: clientSecret,
       };
       await this.checkpoint('intent_ready');
-      const returnUrl = confirm.confirm_return_url || this.context.snapshot.return_url || CHAT + '/';
+      const returnUrl =
+        confirm.confirm_return_url || this.context.snapshot.confirm_return_url ||
+        this.context.confirmReturnUrl || this.context.snapshot.return_url || CHAT + '/';
       const parsed = new URL(returnUrl);
       if (parsed.origin !== CHAT) throw new Error('付款返回地址不属于原商户');
       await this.command('authorize', { action: 'stripe_confirm' });
@@ -907,7 +944,10 @@ export class ProtocolEngine {
       '取得本单 Sentinel 授权',
       {
         flow,
+        observerFlow: 'chatgpt_checkout',
         pageUrl,
+        deviceId: environment.deviceId,
+        accountId: this.context.accountId,
         environmentId: environment.id,
         profile: environment.profile,
         networkMode: environment.proxyUrl ? 'proxy' : 'direct',

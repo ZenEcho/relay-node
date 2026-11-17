@@ -34,6 +34,7 @@ const diagnostic={phase:'tls_handshake',reason:'connection_closed',requestWritte
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const message=JSON.parse(line);fs.appendFileSync(records,JSON.stringify(message)+'\\n');
  const send=value=>process.stdout.write(JSON.stringify({id:message.id,...value})+'\\n');
+ if(scenario==='invalid-init'&&message.method==='initialize'){process.stdout.write(JSON.stringify({error:'invalid transport message'})+'\\n');return;}
  if(message.method==='initialize'||message.method==='reset_connections'){send({ready:true});return;}
  requests++;
  if(scenario==='budget'){setTimeout(()=>send({status:200,headers:{},body:'{}'}),1000);return;}
@@ -85,6 +86,26 @@ const get: HttpInput = {
   method: 'GET',
   url: 'https://chatgpt.com/backend-api/accounts/check/v4?token=private-query',
 };
+
+test('browser cookie expiry fractions are normalized before reinitializing the native helper', async (t) => {
+  const f = await fixture(t);
+  f.environment.cookies = [
+    { name: 'rotated', value: 'session', domain: 'chatgpt.com', expires: 1794906795.273 },
+    { name: 'temporary', value: 'session', domain: 'chatgpt.com', expires: -1 },
+    { name: 'invalid', value: 'session', domain: 'chatgpt.com', expires: NaN },
+  ];
+  await f.transport.initialize(f.environment);
+  const message = (await f.records()).at(-1);
+  assert.equal(message.method, 'initialize');
+  assert.equal(message.cookies[0].expires, 1794906795);
+  assert.equal('expires' in message.cookies[1], false);
+  assert.equal('expires' in message.cookies[2], false);
+  assert.equal(f.environment.cookies[0].expires, 1794906795.273);
+});
+
+test('an uncorrelated helper initialization rejection fails immediately', async (t) => {
+  await assert.rejects(fixture(t, 'invalid-init'), (error: NativeTransportError) => error.code === 'NATIVE_TRANSPORT_FAILED');
+});
 function assertNoSecrets(value: unknown) {
   const text = JSON.stringify(value);
   for (const secret of [

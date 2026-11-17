@@ -16,7 +16,10 @@ export type ExecutionServices = {
     body?: Record<string, any>,
     extraHeaders?: Record<string, string>,
   ): Promise<any>;
-  cleanupChat?: ExecutionServices['chat'];
+  cleanupChat?: (
+    name: string, path: string, body?: Record<string, any>, extraHeaders?: Record<string, string>,
+    observe?: (exchange: { request: HttpInput; status?: number; headers?: Record<string, string[]>; body?: string; data?: any; partial?: boolean; networkFailure?: boolean }) => void,
+  ) => Promise<any>;
   stripe(name: string, path: string, body?: Record<string, any>): Promise<any>;
   requireSentinel(flow: SentinelFlow): Promise<void>;
   acknowledgeVerification(): Promise<void>;

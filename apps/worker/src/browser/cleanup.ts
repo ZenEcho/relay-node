@@ -46,20 +46,30 @@ export async function requestCleanupInPage(request: CleanupPageRequest) {
     headers['chatgpt-account-id'] = request.accountId;
   }
   if (request.body) headers['content-type'] = 'application/json';
-  const response = await page.fetch(target.href, {
-    method: request.body ? 'POST' : 'GET',
+  const method = request.body ? 'POST' : 'GET';
+  const body = request.body ? JSON.stringify(request.body) : undefined;
+  const sent = { method, url: target.href, headers, body, credentials: 'include', cache: 'no-store', redirect: 'error' };
+  let response: any;
+  try { response = await page.fetch(target.href, {
+    method,
     credentials: 'include',
     cache: 'no-store',
     redirect: 'error',
     signal: page.AbortSignal.timeout(20000),
     headers,
-    ...(request.body ? { body: JSON.stringify(request.body) } : {}),
-  });
+    ...(body ? { body } : {}),
+  }); } catch { return { request: sent, networkFailure: true }; }
+  const responseHeaders: Record<string, string[]> = {};
+  response.headers.forEach((value: string, key: string) => { responseHeaders[key] = [value]; });
+  const exchange = { request: sent, status: response.status, headers: responseHeaders };
+  let text: string;
+  try { text = await response.text(); }
+  catch { return { ...exchange, body: '[响应读取中断]', partial: true }; }
   let data: any;
   try {
-    data = await response.json();
-  } catch {
-    throw new Error('浏览器收尾接口未返回 JSON（HTTP ' + response.status + '）');
-  }
-  return { status: response.status, data };
+    data = JSON.parse(text);
+  } catch {}
+  return {
+    ...exchange, body: text, data,
+  };
 }

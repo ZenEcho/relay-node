@@ -159,7 +159,15 @@ export class NativeTransport implements Transport {
       try {
         const message = JSON.parse(line),
           pending = this.pending.get(message.id);
-        if (!pending) return;
+        if (!pending) {
+          // Older helpers cannot correlate a rejected initialize payload.
+          // Surface the protocol failure immediately instead of a 45s timeout.
+          if (!message.id && message.error && this.process === child) {
+            this.rejectAll(new NativeTransportError('NATIVE_TRANSPORT_FAILED'));
+            this.close();
+          }
+          return;
+        }
         clearTimeout(pending.timer);
         this.pending.delete(message.id);
         if (message.error)
@@ -201,7 +209,14 @@ export class NativeTransport implements Transport {
       method: 'initialize',
       profile: environment.profile,
       proxyUrl: environment.proxyUrl,
-      cookies: environment.cookies,
+      // CDP exports fractional epoch seconds; the Go helper decodes int64.
+      // Session cookies use -1, which must remain session scoped in the jar.
+      cookies: environment.cookies.map(({ expires, ...cookie }) => ({
+        ...cookie,
+        ...(typeof expires === 'number' && Number.isFinite(expires) && expires > 0
+          ? { expires: Math.trunc(expires) }
+          : {}),
+      })),
     });
   }
   private rpc(payload: any, timeoutMs = 45000, timeoutCode = 'NATIVE_TRANSPORT_TIMEOUT'): Promise<any> {

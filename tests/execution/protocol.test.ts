@@ -6,6 +6,7 @@ import type { HttpInput, HttpOutput } from '../../apps/worker/src/transport/nati
 import type { Assignment, Control } from '../../apps/worker/src/runtime/controller.js';
 import { createEnvironment } from '../../packages/runtime/src/environment.js';
 import type { SentinelAuthorizer } from '../../packages/contracts/src/sentinel.js';
+import type { ExecutionServices } from '../../apps/worker/src/execution/services.js';
 
 const boundAuthorizer: SentinelAuthorizer = async (request) => ({
   ...request,
@@ -84,6 +85,7 @@ test('an invalid authenticated Session email falls back after the Session read a
 async function execute(
   options: {
     checkoutMode?: 'custom' | 'hosted';
+    cleanupChat?: ExecutionServices['cleanupChat'];
     returnedCheckoutId?: string;
     apiStatus?: number;
     active?: boolean;
@@ -94,6 +96,9 @@ async function execute(
     elements?: Record<string, unknown>;
     customerSession?: string;
     snapshotCustomerSession?: string;
+    checkoutConfigurationOnly?: boolean;
+    snapshotConfirmReturnUrl?: string;
+    omitMerchantReturnUrl?: boolean;
     stripeAccount?: string;
     stripeProvider?: boolean;
     sdkWrongCard?: boolean;
@@ -184,6 +189,19 @@ async function execute(
     override async request(input: HttpInput) {
       requests.push(input);
       const url = new URL(input.url);
+      if (url.pathname.endsWith('/payments/checkout') && options.checkoutConfigurationOnly) {
+        const response = await super.request(input);
+        Object.assign(response.data, { publishable_key: 'pk_test_original', customer_session_client_secret: 'cuss_original', confirm_return_url: 'https://chatgpt.com/checkout/verify?stripe_session_id=' + response.data.internal_checkout_session_id });
+        return response;
+      }
+      if (url.pathname.endsWith('/checkout/taxes') && options.checkoutConfigurationOnly) {
+        const response = await super.request(input);
+        delete response.data.checkout_session.publishable_key;
+        return response;
+      }
+      if (url.pathname.includes('/checkout/openai_llc/') && options.merchantData?.status === 'subscription_limit' && !options.merchantData.client_secret && !options.merchantData.payment_intent) {
+        return { status: 200, headers: {}, body: '', data: { checkout_session: { id: JSON.parse(requests.find(request => request.url.endsWith('/checkout/confirm'))!.body!).checkout_session_id, status: 'open', payment_status: 'unpaid' } } };
+      }
       if (url.pathname === '/api/auth/session' && options.refreshedUserEmail) {
         const response = await super.request(input);
         response.data.user = { email: options.refreshedUserEmail };
@@ -200,6 +218,7 @@ async function execute(
           };
         const response = await super.request(input);
         response.data.accounts.default.entitlement.has_active_subscription = !!options.active;
+        response.data.accounts.default.account.plan_type = options.active ? 'plus' : 'free';
         return response;
       }
       if (url.pathname.endsWith('/elements/sessions') && (options.elementsShape || options.elements)) {
@@ -210,6 +229,17 @@ async function execute(
           else response.data.id = 'another-elements-session';
         }
         Object.assign(response.data, options.elements);
+        return response;
+      }
+      if (url.pathname.endsWith('/checkout/taxes') && options.snapshotConfirmReturnUrl) {
+        const response = await super.request(input);
+        response.data.checkout_session.confirm_return_url = options.snapshotConfirmReturnUrl;
+        delete response.data.checkout_session.return_url;
+        return response;
+      }
+      if (url.pathname.endsWith('/checkout/confirm') && options.omitMerchantReturnUrl) {
+        const response = await super.request(input);
+        delete response.data.confirm_return_url;
         return response;
       }
       if (
@@ -290,6 +320,7 @@ async function execute(
     signal: cancellation.signal,
     async request(action, body = {}) {
       commands.push({ action, body: structuredClone(body) });
+      if (action === 'authorize') assignment.run.dispatches[(body as any).action] = new Date().toISOString();
       if (action === 'card') return card;
       if (action === 'verification' && body.action === 'start')
         return { challengeId: 'customer-challenge', kind: 'stripe', state: 'waiting', expiresAt: Date.now() + 300000 };
@@ -311,6 +342,7 @@ async function execute(
           };
         }
       : undefined,
+    options.cleanupChat,
   ).execute();
   return {
     assignment,
@@ -371,7 +403,12 @@ test('Sentinel and merchant audits identify the same frozen proxy without exposi
     assert.equal(entry.request.profile, merchant.request.profile);
     assert.equal(entry.request.proxyUrl, merchant.request.proxyUrl);
     assert.equal(entry.request.networkMode, 'proxy');
+    assert.equal(entry.request.observerFlow, 'chatgpt_checkout');
+    assert.equal(entry.request.deviceId, result.assignment.context.environment.deviceId);
+    assert.equal(entry.request.accountId, result.assignment.context.accountId);
+    assert.match(entry.request.stage, /sentinel_authorization$/);
   }
+  assert.equal(merchant.request.stage, 'merchant_confirm');
   assert.equal(JSON.stringify(logs).includes('private-proxy-user'), false);
   assert.equal(JSON.stringify(logs).includes('private-proxy-password'), false);
 });
@@ -714,6 +751,20 @@ for (const customerSession of [undefined, 'cuss_context']) {
   });
 }
 
+test('the live custom snapshot confirm_return_url reaches SDK preparation and the original Intent confirmation', async () => {
+  const returnUrl = 'https://chatgpt.com/checkout/verify?stripe_session_id=oaics_original&processor_entity=openai_llc&plan_type=plus';
+  for (const stripeProvider of [false, true]) {
+    const result = await execute({
+      demo: false, authorizer: boundAuthorizer, stripeProvider,
+      snapshotConfirmReturnUrl: returnUrl, omitMerchantReturnUrl: true,
+    });
+    assert.equal(result.finish.status, 'completed', result.finish.error);
+    if (stripeProvider) assert.equal(result.sdkRequest.returnUrl, returnUrl);
+    const confirm = result.requests.find(request => request.url.includes('/payment_intents/') && request.url.endsWith('/confirm'))!;
+    assert.equal(new URLSearchParams(confirm.body).get('return_url'), returnUrl);
+  }
+});
+
 test('production direct tokenization normalizes the assigned card and validates the matching API preview', async () => {
   const result = await execute({
     demo: false,
@@ -971,7 +1022,7 @@ test('an official SDK login rejection pauses an unsubmitted order before checkou
   assert.ok(!result.requests.some((r) => r.url.includes('/payments/checkout')));
 });
 
-test('an explicit subscription limit fails immediately without another payment or read-only round', async () => {
+test('an explicit subscription limit checks the original unpaid checkout and free account without another payment', async () => {
   const result = await execute({
     demo: false,
     authorizer: boundAuthorizer,
@@ -979,10 +1030,40 @@ test('an explicit subscription limit fails immediately without another payment o
   });
   assert.equal(result.finish.status, 'failed');
   assert.equal(result.finish.paymentOutcome, 'failed');
-  assert.equal(result.finish.error, '商户确认未成功：subscription_limit');
+  assert.match(result.finish.error, /subscription_limit；原结账未付款，原账号无有效订阅/);
   assert.equal(result.requests.filter((r) => r.url.endsWith('/checkout/confirm')).length, 1);
   assert.ok(!result.requests.some((r) => /\/v1\/payment_intents\//.test(r.url)));
   assert.equal(result.assignment.run.paymentSubmitted, true);
+  const merchantIndex = result.requests.findIndex(request => request.url.endsWith('/checkout/confirm'));
+  assert.ok(result.requests.slice(merchantIndex + 1).some(request => request.url.includes('/checkout/openai_llc/')));
+  assert.ok(result.requests.slice(merchantIndex + 1).every(request => request.method === 'GET'));
+});
+
+test('initial checkout configuration remains available when a tax snapshot omits it', async () => {
+  for (const stripeProvider of [false, true]) {
+    const result = await execute({ demo: false, authorizer: boundAuthorizer, stripeProvider, checkoutConfigurationOnly: true });
+    assert.equal(result.finish.status, 'completed', result.finish.error);
+    assert.ok(!result.requests.some(request => request.url.endsWith('/stripe_client_bootstrap')));
+    if (stripeProvider) {
+      assert.equal(result.sdkRequest.publishableKey, 'pk_test_original');
+      assert.equal(result.sdkRequest.customerSessionClientSecret, 'cuss_original');
+      assert.match(result.sdkRequest.returnUrl, /checkout\/verify/);
+    } else assert.equal(new URL(result.requests.find(request => request.url.includes('/elements/sessions'))!.url).searchParams.get('customer_session_client_secret'), 'cuss_original');
+  }
+});
+
+test('browser cleanup audit retains actual headers, status and a non-JSON failure response', async () => {
+  const result = await execute({ cleanupChat: async (_name, path, body, _headers, observe) => {
+    observe?.({ request: { method: 'POST', url: 'https://chatgpt.com' + path, headers: { authorization: 'Bearer browser-private', 'content-type': 'application/json' }, body: JSON.stringify(body) }, status: 503, headers: { 'x-request-id': ['browser-response-fixture'] }, body: '<html>upstream unavailable</html>' });
+    throw new Error('browser cleanup failed');
+  } });
+  const step = result.commands.filter(command => command.action === 'step').map(command => command.body.step).find(step => step.name === '原订阅完成登记' && step.status === 'failed');
+  assert.equal(step.httpStatus, 503);
+  assert.equal(step.request.stage, 'cleanup_registration');
+  assert.equal(step.request.headers.authorization, '[REDACTED]');
+  assert.equal(step.response.headers['x-request-id'][0], 'browser-response-fixture');
+  assert.equal(step.response.body, '<html>upstream unavailable</html>');
+  assert.ok(!JSON.stringify(step).includes('browser-private'));
 });
 
 for (const status of [200, 402]) {
@@ -1162,12 +1243,16 @@ test('hosted recovery reads the original page and never replays confirmation or 
     checkoutMode: 'hosted',
   });
   const before = result.requests.length;
+  const beforeCommands = result.commands.length;
   result.assignment.mode = 'reconcile';
   await new ProtocolEngine(result.assignment, result.control, result.transport, boundAuthorizer).execute();
   const replay = result.requests.slice(before);
   assert.ok(replay.length > 0);
   assert.ok(replay.every((r) => r.method === 'GET'));
   assert.ok(replay.some((r) => r.url.includes('/payment_pages/' + result.assignment.context.checkout!.id)));
+  const readLogs = result.commands.slice(beforeCommands).filter(c => c.action === 'step' && c.body.step.category === 'http');
+  assert.ok(readLogs.length > 0);
+  assert.ok(readLogs.every(c => c.body.step.request.stage === 'stripe_result'));
 });
 
 test('hosted takes the public Stripe key from its own returned URL without a bootstrap request', async () => {

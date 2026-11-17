@@ -301,7 +301,7 @@ export class OnDemandSdkRuntime {
     }
     return result;
   };
-  readonly cleanupChat: ExecutionServices['chat'] = async (_name, path, body, headers) => {
+  readonly cleanupChat: NonNullable<ExecutionServices['cleanupChat']> = async (_name, path, body, headers, observe) => {
     await this.open();
     const context = this.assignment.context;
     const result = await this.cdp!.evaluate(
@@ -319,6 +319,10 @@ export class OnDemandSdkRuntime {
       this.session,
       25000,
     );
+    // Capture the received response before cookie synchronization or JSON/
+    // business validation can fail, including non-JSON upstream errors.
+    if (result?.request) observe?.(result);
+    if (result?.networkFailure) throw new Error('浏览器收尾请求未收到响应');
     // A refresh may rotate HttpOnly cookies, including changing chunk counts.
     // Replace the whole origin cookie set instead of appending another generation.
     const exported = await this.cdp!.send(
@@ -339,6 +343,10 @@ export class OnDemandSdkRuntime {
         result?.status || 0,
         result?.data,
       );
+    if (result.partial)
+      throw new UpstreamError('浏览器收尾接口响应读取中断（HTTP ' + result.status + '）', result.status, result.body);
+    if (result.data === undefined)
+      throw new UpstreamError('浏览器收尾接口未返回 JSON（HTTP ' + result.status + '）', result.status, result.body);
     return result.data;
   };
   private async verifySessionNavigation(accountId?: string) {

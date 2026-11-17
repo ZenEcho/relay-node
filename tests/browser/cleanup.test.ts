@@ -55,9 +55,45 @@ test('page Session refresh includes browser cookies but never sends the expired 
       assert.equal(init.redirect, 'error');
       assert.equal(init.headers.authorization, undefined);
       assert.ok(init.signal);
-      return { status: 200, json: async () => ({ accessToken: 'fresh' }) };
+      return new Response(JSON.stringify({ accessToken: 'fresh' }), { status: 200 });
     },
   );
+});
+
+test('browser cleanup returns the exact request and non-JSON error response for auditing', async () => {
+  const result = await execute({ path: '/backend-api/subscriptions/cancel', accountId: 'original', accessToken: 'fresh', body: { account_id: 'original' } }, async () => new Response('<html>upstream denied</html>', { status: 403, headers: { 'x-request-id': 'request-fixture' } }));
+  assert.equal(result.request.method, 'POST');
+  assert.equal(result.request.headers.authorization, 'Bearer fresh');
+  assert.equal(result.request.body, '{"account_id":"original"}');
+  assert.equal(result.status, 403);
+  assert.deepEqual(Array.from(result.headers['x-request-id']), ['request-fixture']);
+  assert.equal(result.body, '<html>upstream denied</html>');
+});
+
+test('browser response-read failure retains its real status and headers', async () => {
+  const result = await execute({ path: '/api/auth/session', accountId: 'original' }, async () => ({ status: 200, headers: new Headers({ 'x-request-id': 'partial-fixture' }), text: async () => { throw new Error('connection closed'); } }));
+  assert.equal(result.status, 200);
+  assert.equal(result.partial, true);
+  assert.equal(result.headers['x-request-id'][0], 'partial-fixture');
+});
+
+test('a browser network failure retains the attempted request without inventing an HTTP status', async () => {
+  const result = await execute({ path: '/backend-api/invoices?account_id=original', accountId: 'original', accessToken: 'fresh' }, async () => { throw new Error('network disconnected'); });
+  assert.equal(result.networkFailure, true);
+  assert.equal(result.status, undefined);
+  assert.equal(result.request.url, 'https://chatgpt.com/backend-api/invoices?account_id=original');
+  assert.equal(result.request.headers.authorization, 'Bearer fresh');
+});
+
+test('received browser errors are observed even when cookie synchronization fails afterward', async () => {
+  const runtime: any = new OnDemandSdkRuntime({ context: { accountId: 'original', session: { accessToken: 'fresh' }, environment: { cookies: [] } } } as any);
+  const response = { request: { method: 'GET', url: 'https://chatgpt.com/backend-api/invoices', headers: { accept: 'application/json' } }, status: 503, headers: { 'retry-after': ['5'] }, body: '<html>unavailable</html>' };
+  runtime.open = async () => {};
+  runtime.cdp = { evaluate: async () => response, send: async () => { throw new Error('cookie synchronization failed'); } };
+  let observed: any;
+  await assert.rejects(runtime.cleanupChat('invoices', '/backend-api/invoices', undefined, undefined, (exchange: any) => { observed = exchange; }), /cookie synchronization failed/);
+  assert.equal(observed.status, 503);
+  assert.equal(observed.body, response.body);
 });
 for (const request of [
   { path: 'https://other.example/api/auth/session' },

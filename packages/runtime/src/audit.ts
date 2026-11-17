@@ -13,14 +13,23 @@ function safeUrl(value: string) {
   return value.replace(/(?:https?|socks5h?):\/\/[^\s"'<>]+/gi, (address) => {
     try {
       const url = new URL(address);
+      let changed = false;
       if (url.username || url.password) {
         url.username = 'REDACTED';
         url.password = '';
+        changed = true;
       }
       for (const key of [...url.searchParams.keys()])
-        if (secretParameter.test(key) || sensitive.test(key)) url.searchParams.set(key, '[REDACTED]');
-      if (/access|token|secret|session/i.test(url.hash)) url.hash = '[REDACTED]';
-      return url.href;
+        if (secretParameter.test(key) || sensitive.test(key)) {
+          url.searchParams.set(key, '[REDACTED]');
+          changed = true;
+        }
+      if (/access|token|secret|session/i.test(url.hash)) {
+        url.hash = '[REDACTED]';
+        changed = true;
+      }
+      // Preserve exact Origin/header values and benign query encoding.
+      return changed ? url.href : address;
     } catch {
       return '[INVALID URL]';
     }
@@ -151,7 +160,7 @@ export function auditRequest(input: {
   const type = Object.entries(input.headers || {}).find(([key]) => key.toLowerCase() === 'content-type')?.[1];
   let body: any = input.body;
   if (body && String(type).includes('application/x-www-form-urlencoded')) {
-    body = {};
+    body = Object.create(null);
     for (const [key, value] of new URLSearchParams(input.body))
       body[key] = key in body ? [...(Array.isArray(body[key]) ? body[key] : [body[key]]), value] : value;
   } else if (body) {
@@ -159,7 +168,10 @@ export function auditRequest(input: {
       body = JSON.parse(body);
     } catch {}
   }
-  return { ...input, body };
+  const query: Record<string, string | string[]> = Object.create(null);
+  for (const [key, value] of new URL(input.url).searchParams)
+    query[key] = key in query ? [...(Array.isArray(query[key]) ? query[key] : [query[key]]), value] : value;
+  return { ...input, ...(Object.keys(query).length ? { query } : {}), body };
 }
 
 export type AuditEntry = Omit<Step, 'id' | 'runId' | 'at'>;
