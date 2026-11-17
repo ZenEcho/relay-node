@@ -16,6 +16,26 @@ const boundAuthorizer: SentinelAuthorizer = async (request) => ({
   expiresAt: new Date(Date.now() + 60000).toISOString(),
 });
 
+for (const [name, hints, expected] of [
+  ['explicit non-retryable failure', { retryable: false }, false],
+  ['non-retryable runtime diagnostic', { runtimeDiagnostic: { retryable: false } }, false],
+  ['retryable runtime diagnostic', { runtimeDiagnostic: { retryable: true } }, true],
+  ['conflicting retry hints', { retryable: true, runtimeDiagnostic: { retryable: false } }, false],
+  ['unclassified failure', {}, undefined],
+  ['non-boolean retry hint', { retryable: 'false' }, undefined],
+] as const) {
+  test(`${name}: the execution receipt preserves retryability before any payment`, async () => {
+    const result = await execute({
+      demo: false,
+      authorizer: async () => { throw Object.assign(new Error('fixture authorization unavailable'), hints); },
+    });
+    assert.equal(result.finish.status, 'failed');
+    assert.equal(result.finish.failureRetryable, expected);
+    assert.equal(result.commands.some((command) => command.action === 'authorize' || command.action === 'card'), false);
+    assert.equal(result.requests.some((request) => request.method === 'POST'), false);
+  });
+}
+
 test('Session email overrides the default in merchant taxes and Stripe form fields', async () => {
   const result = await execute({
     credentialUserEmail: 'session@example.invalid',

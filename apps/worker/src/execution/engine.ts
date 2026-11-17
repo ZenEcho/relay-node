@@ -835,6 +835,12 @@ export class ProtocolEngine {
     } catch (error) {
       if (this.control.signal?.aborted || (error as any)?.code === 'EXECUTION_ABORTED') return;
       const e = error as Error;
+      const retryHints = [(error as any)?.retryable, (error as any)?.runtimeDiagnostic?.retryable];
+      const failureRetryable = retryHints.includes(false)
+        ? false
+        : retryHints.includes(true)
+          ? true
+          : undefined;
       if (
         this.context.environment.proxyUrl &&
         error instanceof NativeTransportError &&
@@ -903,6 +909,7 @@ export class ProtocolEngine {
           paymentOutcome: declined ? 'failed' : undefined,
           context: this.context,
           error: e.message,
+          failureRetryable,
         });
       }
     } finally {
