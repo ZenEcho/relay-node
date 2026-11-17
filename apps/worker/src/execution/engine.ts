@@ -398,7 +398,10 @@ export class ProtocolEngine {
         await this.reconcile();
         return;
       }
-      await this.preflight();
+      if (this.context.checkoutResume) {
+        this.setStage('card_replacement');
+        if (!(await this.verifyResumedCheckout())) return;
+      } else await this.preflight();
       if (!this.assignment.paymentEnabled && !this.assignment.demo)
         throw new Error('真实付款未启用：请检查服务端 COMMIT_PAYMENTS 配置');
       const billing = this.assignment.billing;
@@ -728,6 +731,10 @@ export class ProtocolEngine {
         await submitHostedCheckout(this.services);
         return;
       }
+      if (this.context.checkoutResume?.intentId) {
+        await this.confirmOriginalIntent();
+        return;
+      }
       await this.requireSentinel('checkout_session_approval');
       this.setStage('merchant_confirm');
       await this.command('authorize', { action: 'merchant_confirm' });
@@ -824,35 +831,7 @@ export class ProtocolEngine {
         client_secret: clientSecret,
       };
       await this.checkpoint('intent_ready');
-      const returnUrl =
-        confirm.confirm_return_url || this.context.snapshot.confirm_return_url ||
-        this.context.confirmReturnUrl || this.context.snapshot.return_url || CHAT + '/';
-      const parsed = new URL(returnUrl);
-      if (parsed.origin !== CHAT) throw new Error('付款返回地址不属于原商户');
-      await this.command('authorize', { action: 'stripe_confirm' });
-      const originalIntent = this.context.intent!;
-      const confirmedIntent = await this.stripe(
-        'Stripe 原 Intent 确认',
-        '/v1/payment_intents/' + this.context.intent!.id + '/confirm',
-        {
-          key: this.context.key,
-          client_secret: clientSecret,
-          confirmation_token: this.context.confirmationToken,
-          return_url: returnUrl,
-          _stripe_version: STRIPE_VERSION,
-          'client_attribution_metadata[client_session_id]': this.context.clientSessionId,
-          'client_attribution_metadata[merchant_integration_source]': 'l1',
-        },
-      );
-      if (
-        confirmedIntent.id !== originalIntent.id ||
-        (confirmedIntent.client_secret && confirmedIntent.client_secret !== clientSecret)
-      )
-        throw new Error('付款确认响应不属于原 Intent');
-      this.context.intent = { ...confirmedIntent, client_secret: clientSecret };
-      // handleIntent persists the result with finish or verification_ready.
-      this.setStage('stripe_result');
-      await this.handleIntent();
+      await this.confirmOriginalIntent();
     } catch (error) {
       if (this.control.signal?.aborted || (error as any)?.code === 'EXECUTION_ABORTED') return;
       const e = error as Error;
@@ -1005,6 +984,91 @@ export class ProtocolEngine {
   }
   private async handleIntent() {
     return executionOperation(this.control.signal, () => handlePaymentIntent(this.services));
+  }
+  private async verifyResumedCheckout() {
+    const resume = this.context.checkoutResume!;
+    if (
+      !this.context.checkout || resume.checkoutId !== this.context.checkout.id ||
+      !this.context.proxyVerified || !this.context.accountId || !this.context.session?.accessToken ||
+      !this.context.billingEmailBinding || !this.context.originalSubscription ||
+      this.context.originalSubscription.has_active_subscription || !this.context.snapshot
+    ) throw new Error('原结账继续执行所需的账号、环境或报价不完整');
+    if (resume.intentId) {
+      const original = this.context.intent;
+      if (original?.id !== resume.intentId || !original.client_secret || !this.context.key)
+        throw new Error('换卡不能更换原 Intent');
+      const result = await this.stripe(
+        '换卡前只读核对原付款',
+        '/v1/payment_intents/' + original.id + '?' +
+          form({ key: this.context.key, client_secret: original.client_secret }),
+      );
+      const current = paymentIntentFromResponse(result, original);
+      if (!current || result.id !== original.id) throw new Error('换卡查询返回了其他 Intent');
+      if (
+        current.status !== 'requires_payment_method' ||
+        current.amount !== this.context.snapshot.amount_total ||
+        current.currency !== this.context.snapshot.currency
+      ) {
+        // No card has been allocated for this execution. Preserve the observed
+        // payment and stop rather than assigning its result to a different card.
+        this.context.intent = current;
+        await this.park('paused', '原付款状态或金额已变化，停止换卡，请核对原付款');
+        return false;
+      }
+      this.context.intent = current;
+    } else {
+      const checkout = this.context.checkout;
+      const data = await this.chat(
+        '继续选卡前只读核对原结账',
+        '/backend-api/payments/checkout/' + encodeURIComponent(checkout.processor_entity) +
+          '/' + encodeURIComponent(checkout.id),
+      );
+      const current = data.checkout_session || data;
+      const intent = paymentIntentFromResponse(current);
+      if (
+        (current.checkout_session_id || current.id) !== checkout.id ||
+        current.status !== 'open' || current.payment_status !== 'unpaid' || intent ||
+        (current.account_id && current.account_id !== this.context.accountId)
+      ) {
+        if (intent) this.context.intent = intent;
+        await this.park('paused', '原结账状态已变化，停止继续付款，请核对原结账');
+        return false;
+      }
+    }
+    return true;
+  }
+  private async confirmOriginalIntent() {
+    const originalIntent = this.context.intent!;
+    const clientSecret = originalIntent.client_secret;
+    if (!/^pi_[a-zA-Z0-9]+_secret_[a-zA-Z0-9]+$/.test(clientSecret || ''))
+      throw new Error('原 Intent 缺少有效的确认参数');
+    const returnUrl =
+      this.context.merchantConfirmation?.confirm_return_url || this.context.snapshot.confirm_return_url ||
+      this.context.confirmReturnUrl || this.context.snapshot.return_url || CHAT + '/';
+    if (new URL(returnUrl).origin !== CHAT) throw new Error('付款返回地址不属于原商户');
+    this.setStage('intent_ready');
+    await this.command('authorize', { action: 'stripe_confirm' });
+    this.assignment.run.paymentSubmitted = true;
+    const confirmedIntent = await this.stripe(
+      'Stripe 原 Intent 确认',
+      '/v1/payment_intents/' + originalIntent.id + '/confirm',
+      {
+        key: this.context.key,
+        client_secret: clientSecret,
+        confirmation_token: this.context.confirmationToken,
+        return_url: returnUrl,
+        _stripe_version: STRIPE_VERSION,
+        'client_attribution_metadata[client_session_id]': this.context.clientSessionId,
+        'client_attribution_metadata[merchant_integration_source]': 'l1',
+      },
+    );
+    if (
+      confirmedIntent.id !== originalIntent.id ||
+      (confirmedIntent.client_secret && confirmedIntent.client_secret !== clientSecret)
+    ) throw new Error('付款确认响应不属于原 Intent');
+    this.context.intent = { ...confirmedIntent, client_secret: clientSecret };
+    this.setStage('stripe_result');
+    await this.handleIntent();
   }
   private async park(status: string, error?: string) {
     throwIfExecutionAborted(this.control.signal);

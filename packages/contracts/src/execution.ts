@@ -64,6 +64,12 @@ export type RuntimeContext = {
   originalSubscription?: Record<string, any>;
   billing?: Billing | null;
   billingEmailBinding?: BillingEmailBinding;
+  checkoutResume?: {
+    sourceRunId: string;
+    checkoutId: string;
+    kind: 'card_replacement' | 'prepayment_retry';
+    intentId?: string;
+  };
   [key: string]: any;
 };
 export type ExecutionSnapshot = {

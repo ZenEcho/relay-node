@@ -126,6 +126,8 @@ async function execute(
     checkoutResponse?: HttpOutput;
     transportAttemptAudit?: boolean;
     transportRetryAudit?: boolean;
+    initialContext?: RuntimeContext;
+    checkoutReadResponse?: HttpOutput;
   } = {},
 ) {
   const environment = createEnvironment('PH', options.proxyUrl || '');
@@ -179,6 +181,10 @@ async function execute(
       phone: options.billingPhone,
     },
   } as Assignment;
+  if (options.initialContext) {
+    assignment.context = structuredClone(options.initialContext);
+    assignment.billing = assignment.context.billing || undefined;
+  }
   const requests: HttpInput[] = [],
     commands: { action: string; body: any }[] = [];
   const card = options.card || {
@@ -208,6 +214,8 @@ async function execute(
           startedAt: new Date().toISOString(), elapsedMs: 0, totalElapsedMs: 0,
         });
       requests.push(input);
+      if (url.pathname.includes('/checkout/openai_llc/') && options.checkoutReadResponse)
+        return options.checkoutReadResponse;
       if (url.pathname === '/backend-api/payments/checkout' && options.checkoutResponse)
         return options.checkoutResponse;
       if (url.pathname.endsWith('/payments/checkout') && options.checkoutConfigurationOnly) {
@@ -1421,4 +1429,94 @@ test('Stripe rejecting the reference hosted key stops before card assignment or 
   assert.equal(result.finish.status, 'failed');
   assert.equal(result.assignment.run.paymentSubmitted, false);
   assert.ok(!result.commands.some((c) => c.action === 'card' || c.action === 'authorize'));
+});
+
+async function replacementContext() {
+  const initial = await execute();
+  assert.equal(initial.finish.status, 'completed');
+  const context = structuredClone(initial.assignment.context);
+  context.intent = {
+    ...context.intent,
+    status: 'requires_payment_method',
+    amount: context.snapshot.amount_total,
+    currency: context.snapshot.currency,
+    last_payment_error: { code: 'card_declined', decline_code: 'generic_decline' },
+  };
+  context.checkoutResume = {
+    sourceRunId: 'previous-execution',
+    checkoutId: context.checkout!.id,
+    kind: 'card_replacement',
+    intentId: context.intent.id,
+  };
+  delete context.confirmationToken;
+  delete context.cleanup;
+  return context;
+}
+
+test('a declined card continues with the original checkout, Elements and Intent without replaying merchant setup', async () => {
+  const context = await replacementContext();
+  const result = await execute({
+    initialContext: context,
+    card: { number: '4000000000000077', expiry: '12/30', cvc: '123' },
+    authorizer: async () => { throw new Error('Stripe replacement must not request merchant Sentinel authorization'); },
+    intentResponse: (input) => ({
+      status: 200, headers: {}, body: '',
+      data: { ...context.intent, status: input.method === 'GET' ? 'requires_payment_method' : 'succeeded' },
+    }),
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  assert.equal(result.requests[0].method, 'GET');
+  assert.ok(result.requests[0].url.includes('/payment_intents/' + context.intent!.id + '?'));
+  assert.equal(result.commands.filter((c) => c.action === 'card').length, 1);
+  assert.deepEqual(result.commands.filter((c) => c.action === 'authorize' && c.body.action !== 'registration').map((c) => c.body.action), ['stripe_confirm']);
+  const preparation = result.requests.slice(0, result.requests.findIndex((r) => r.method === 'POST' && r.url.includes('/payment_intents/')));
+  assert.equal(preparation.some((r) => /checkout_pricing|accounts\/check|elements\/sessions|payments\/checkout/.test(r.url)), false);
+  const confirmation = result.requests.filter((r) => r.url.endsWith('/' + context.intent!.id + '/confirm'));
+  assert.equal(confirmation.length, 1);
+  assert.equal(new URLSearchParams(confirmation[0].body).get('confirmation_token'), result.assignment.context.confirmationToken);
+  const token = result.requests.find((r) => r.url.endsWith('/confirmation_tokens'))!;
+  assert.equal(new URLSearchParams(token.body).get('payment_method_data[card][number]'), '4000000000000077');
+  assert.deepEqual(result.assignment.context.checkout, context.checkout);
+  assert.deepEqual(result.assignment.context.elements, context.elements);
+  assert.deepEqual(result.assignment.context.environment, context.environment);
+  assert.equal(result.commands.some((c) => c.action === 'checkpoint' && /subscription|checkout_created|taxes_ready|elements_ready/.test(c.body.stage)), false);
+});
+
+for (const changed of ['succeeded', 'processing', 'requires_action', 'canceled', 'different_amount', 'different_intent'])
+  test(`replacement does not allocate a card or dispatch when the original payment changed: ${changed}`, async () => {
+    const context = await replacementContext();
+    const result = await execute({
+      initialContext: context,
+      intentResponse: () => ({
+        status: 200, headers: {}, body: '',
+        data: {
+          ...context.intent,
+          ...(changed === 'different_intent' ? { id: 'pi_foreign', client_secret: 'pi_foreign_secret_private' } : {}),
+          status: changed.startsWith('different_') ? 'requires_payment_method' : changed,
+          ...(changed === 'different_amount' ? { amount: context.snapshot.amount_total + 1 } : {}),
+        },
+      }),
+    });
+    assert.equal(result.commands.some((c) => c.action === 'card' || c.action === 'authorize'), false);
+    assert.equal(result.requests.some((r) => r.method === 'POST'), false);
+    assert.equal(result.finish.status, changed === 'different_intent' ? 'failed' : 'paused');
+  });
+
+test('a pre-dispatch failure resumes the accepted checkout without another quote, tax or Elements request', async () => {
+  const context = await replacementContext();
+  delete context.intent;
+  context.checkoutResume!.kind = 'prepayment_retry';
+  delete context.checkoutResume!.intentId;
+  delete context.merchantConfirmation;
+  const result = await execute({
+    initialContext: context,
+    checkoutReadResponse: { status: 200, headers: {}, body: '', data: { checkout_session: {
+      id: context.checkout!.id, status: 'open', payment_status: 'unpaid', account_id: context.accountId,
+    } } },
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  assert.equal(result.requests.filter((r) => r.url.endsWith('/checkout/confirm')).length, 1);
+  const preparation = result.requests.slice(0, result.requests.findIndex((r) => r.method === 'POST' && r.url.includes('/payment_intents/')));
+  assert.equal(preparation.some((r) => /checkout_pricing|accounts\/check|elements\/sessions|checkout\/taxes/.test(r.url)), false);
+  assert.equal(result.requests.some((r) => r.method === 'POST' && r.url.endsWith('/payments/checkout')), false);
 });
