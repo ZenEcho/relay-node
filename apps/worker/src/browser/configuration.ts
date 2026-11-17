@@ -28,13 +28,35 @@ export async function checkPaymentRuntime(
 export function sdkLoginCookies(cookies: Cookie[]) {
   // Import identity, not another browser's caches, tracking or temporary site
   // protection state. The official page establishes its own fresh site state.
-  return cookies.filter(
+  let login = cookies.filter(
     (c) =>
       c.domain.replace(/^\./, '') === 'chatgpt.com' &&
       /^(?:oai-did|__Secure-(?:next-auth|authjs)\.session-token(?:\.\d+)?|(?:__Host-)?(?:next-auth|authjs)\.csrf-token)$/.test(
         c.name,
       ),
   );
+  // Validated imports never contain both forms. A resumed native jar can keep
+  // imported session-only chunks after the origin rotates to a persistent whole
+  // cookie (or vice versa). Import only the provably newer complete generation.
+  for (const prefix of ['__Secure-next-auth.session-token', '__Secure-authjs.session-token']) {
+    const whole = login.filter((c) => c.name === prefix);
+    const parts = login.filter((c) => c.name.startsWith(prefix + '.'));
+    if (!whole.length || !parts.length) continue;
+    const ordered = [...parts].sort(
+      (a, b) => Number(a.name.slice(prefix.length + 1)) - Number(b.name.slice(prefix.length + 1)),
+    );
+    const complete = ordered.every((c, i) => c.name === prefix + '.' + i);
+    if (whole.length !== 1 || !complete) throw new Error('登录 Cookie 轮换版本冲突，无法恢复本单浏览器');
+    const same = ordered.map((c) => c.value).join('') === whole[0].value;
+    const wholeExpires = whole[0].expires || 0;
+    const partExpires = parts.map((c) => c.expires || 0);
+    if (same || wholeExpires > Math.max(Date.now() / 1000, ...partExpires))
+      login = login.filter((c) => !c.name.startsWith(prefix + '.'));
+    else if (Math.min(...partExpires) > Math.max(Date.now() / 1000, wholeExpires))
+      login = login.filter((c) => c.name !== prefix);
+    else throw new Error('登录 Cookie 轮换版本冲突，无法恢复本单浏览器');
+  }
+  return login;
 }
 export async function findSdkBrowser(configured?: string) {
   const candidates = configured

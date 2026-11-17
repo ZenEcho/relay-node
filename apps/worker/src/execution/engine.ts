@@ -48,6 +48,7 @@ export class ProtocolEngine {
     private transport: Transport,
     private sentinelAuthorizer?: SentinelAuthorizer,
     private stripeTokenProvider?: StripeTokenProvider,
+    private browserCleanupChat?: ExecutionServices['chat'],
   ) {
     this.context = assignment.context;
   }
@@ -61,6 +62,17 @@ export class ProtocolEngine {
       checkpoint: this.checkpoint.bind(this),
       request: this.request.bind(this),
       chat: this.chat.bind(this),
+      cleanupChat: this.browserCleanupChat
+        ? (name, path, body, headers) =>
+            trace(this.log, name, { method: body ? 'POST' : 'GET', path, transport: 'browser' }, async (capture) => {
+              await this.assertActive();
+              const data = await executionOperation(this.control.signal, () =>
+                this.browserCleanupChat!(name, path, body, headers),
+              );
+              capture(data);
+              return data;
+            }, 'http')
+        : undefined,
       stripe: this.stripe.bind(this),
       requireSentinel: this.requireSentinel.bind(this),
       acknowledgeVerification: this.acknowledgeVerification.bind(this),
@@ -623,11 +635,39 @@ export class ProtocolEngine {
       await this.requireSentinel('checkout_session_approval');
       await this.command('authorize', { action: 'merchant_confirm' });
       this.assignment.run.paymentSubmitted = true;
-      const confirm = await this.chat('商户付款确认', '/backend-api/payments/checkout/confirm', {
-        checkout_session_id: this.context.checkout!.id,
-        confirm_token: this.context.confirmationToken,
-        selected_payment_method_type: 'card',
-      });
+      let confirm;
+      try {
+        confirm = await this.chat('商户付款确认', '/backend-api/payments/checkout/confirm', {
+          checkout_session_id: this.context.checkout!.id,
+          confirm_token: this.context.confirmationToken,
+          selected_payment_method_type: 'card',
+        });
+      } catch (error) {
+        // Only this explicit merchant refusal is terminal. Generic 403s, lost
+        // responses and any evidence of an Intent still require reconciliation.
+        if (
+          error instanceof UpstreamError &&
+          error.status === 403 &&
+          error.data?.detail === 'Checkout is not available in your region.' &&
+          !this.context.intent &&
+          !error.data.payment_intent &&
+          !error.data.client_secret &&
+          !error.data.error?.payment_intent &&
+          Object.keys(this.assignment.run.dispatches).every((action) => action === 'merchant_confirm')
+        ) {
+          this.context.merchantConfirmation = {
+            status: 'checkout_region_unavailable',
+          };
+          await this.command('finish', {
+            status: 'failed',
+            paymentOutcome: 'failed',
+            context: this.context,
+            error: error.message,
+          });
+          return;
+        }
+        throw error;
+      }
       this.context.merchantConfirmation = confirm;
       // An explicit refusal without an Intent is terminal, not a lost response.
       if (confirm.status === 'subscription_limit' && !confirm.client_secret && !confirm.payment_intent) {
@@ -802,19 +842,32 @@ export class ProtocolEngine {
       (this.assignment.demo
         ? (input) => this.chat('模拟 Sentinel 授权', '/backend-api/sentinel/req', input)
         : undefined);
-    await trace(this.log, '取得本单 Sentinel 授权', { flow, pageUrl }, async (capture) => {
-      await this.assertActive();
-      const diagnostic = await executionOperation(this.control.signal, () =>
-        authorizeSentinel(this.context, flow, pageUrl, authorize, this.control.signal),
-      );
-      capture({
+    const environment = this.context.environment;
+    await trace(
+      this.log,
+      '取得本单 Sentinel 授权',
+      {
         flow,
-        ...diagnostic,
-        expiresAt: this.context.sentinelExpiresAt,
-        token: this.context.sentinel,
-        soToken: this.context.sentinelSo,
-      });
-    });
+        pageUrl,
+        environmentId: environment.id,
+        profile: environment.profile,
+        networkMode: environment.proxyUrl ? 'proxy' : 'direct',
+        proxyUrl: environment.proxyUrl,
+      },
+      async (capture) => {
+        await this.assertActive();
+        const diagnostic = await executionOperation(this.control.signal, () =>
+          authorizeSentinel(this.context, flow, pageUrl, authorize, this.control.signal),
+        );
+        capture({
+          flow,
+          ...diagnostic,
+          expiresAt: this.context.sentinelExpiresAt,
+          token: this.context.sentinel,
+          soToken: this.context.sentinelSo,
+        });
+      },
+    );
     await this.checkpoint(prefix + 'sentinel_ready');
   }
   private async reconcile() {

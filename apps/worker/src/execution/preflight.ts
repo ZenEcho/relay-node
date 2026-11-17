@@ -18,20 +18,18 @@ export async function preflightExecution(services: ExecutionServices) {
         return { status: error.status, data: error.data, body: '' };
       }
     });
-    if (proxied && result.country !== services.context.environment.country)
-      throw new Error('代理出口国家与订单地区不匹配');
     services.context.exitIp = result.ip;
     services.context.exitCountry = result.country;
-    services.context.proxyVerified = true;
+    services.context.proxyVerified = !proxied || result.country === services.context.environment.country;
   }
   const exitIp = services.context.exitIp;
   if (
     typeof exitIp === 'string' &&
     isIP(exitIp) &&
-    !/^[a-f0-9]{12}$/.test(services.context.exitFingerprint || '')
+    services.context.exitFingerprint !== digest(exitIp).slice(0, 12)
   ) {
     // A shared proxy gateway can assign different real exits. Correlate the
-    // verified exit without adding its address or location to diagnostic logs.
+    // measured exit without adding its address or location to diagnostic logs.
     services.context.exitFingerprint = digest(exitIp).slice(0, 12);
     await services.log({
       name: '记录本单网络出口',
@@ -42,10 +40,19 @@ export async function preflightExecution(services: ExecutionServices) {
         country: /^[A-Z]{2}$/.test(services.context.exitCountry || '')
           ? services.context.exitCountry
           : undefined,
+        requestedCountry: services.context.environment.country,
+        verified: services.context.proxyVerified === true,
         networkMode: services.context.environment.proxyUrl ? 'proxy' : 'direct',
       },
     });
   }
+  if (!services.context.proxyVerified)
+    throw Object.assign(
+      new Error(
+        `代理出口国家与订单地区不匹配：期望 ${services.context.environment.country}，实际 ${services.context.exitCountry}`,
+      ),
+      { code: 'PROXY_COUNTRY_MISMATCH' },
+    );
   if (
     !services.context.session?.accessToken ||
     (!services.context.billingEmailBinding &&

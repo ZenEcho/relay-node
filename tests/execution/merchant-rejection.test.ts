@@ -42,8 +42,13 @@ async function run(change: any = {}) {
         ? {
             accounts: {
               original: {
-                account: { account_id: change.accountId || 'account-original', plan_type: 'free' },
-                entitlement: { has_active_subscription: change.active ?? false },
+                account: {
+                  account_id: change.accountId || 'account-original',
+                  plan_type: 'free',
+                },
+                entitlement: {
+                  has_active_subscription: change.active ?? false,
+                },
               },
             },
           }
@@ -61,7 +66,10 @@ async function run(change: any = {}) {
     },
     transport,
   ).execute();
-  return { requests, finish: commands.filter((c) => c.action === 'finish').at(-1)?.body };
+  return {
+    requests,
+    finish: commands.filter((c) => c.action === 'finish').at(-1)?.body,
+  };
 }
 test('explicit subscription limit resolves failed only after original unpaid checkout and current free account', async () => {
   const result = await run();
@@ -69,13 +77,37 @@ test('explicit subscription limit resolves failed only after original unpaid che
   assert.equal(result.finish.paymentOutcome, 'failed');
   assert.equal(result.requests.length, 2);
 });
+
+test('a recorded region refusal resolves failed only after checking the original unpaid checkout and free account', async () => {
+  const confirmation = { status: 'checkout_region_unavailable' };
+  const result = await run({ confirmation });
+  assert.equal(result.finish.status, 'failed');
+  assert.equal(result.finish.paymentOutcome, 'failed');
+  assert.match(result.finish.error, /Checkout is not available in your region\./);
+  assert.equal(result.requests.length, 2);
+  for (const change of [
+    { active: true },
+    { checkout: { payment_intent: 'pi_original' } },
+    { dispatch: 'stripe_confirm' },
+    { accountId: 'other' },
+  ]) {
+    const pending = await run({ confirmation, ...change });
+    assert.equal(pending.finish.status, 'pending_confirmation');
+    assert.notEqual(pending.finish.paymentOutcome, 'failed');
+  }
+});
 test('unpaid alone, active or mismatched account, possible intent and later dispatch keep original payment pending', async () => {
   for (const change of [
     { confirmation: {} },
     { active: true },
     { accountId: 'other' },
     { checkout: { payment_intent: 'pi_original' } },
-    { confirmation: { status: 'subscription_limit', client_secret: 'pi_original_secret_fixture' } },
+    {
+      confirmation: {
+        status: 'subscription_limit',
+        client_secret: 'pi_original_secret_fixture',
+      },
+    },
     { dispatch: 'stripe_confirm' },
     { checkout: { status: 'expired' } },
     { checkout: { account_id: 'other' } },

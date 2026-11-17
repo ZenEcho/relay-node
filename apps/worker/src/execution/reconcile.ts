@@ -117,7 +117,7 @@ export async function reconcilePayment(services: ExecutionServices) {
     // alone, and never override a successful checkout above.
     const confirmation = services.context.merchantConfirmation;
     if (
-      confirmation?.status === 'subscription_limit' &&
+      ['subscription_limit', 'checkout_region_unavailable'].includes(confirmation?.status) &&
       !confirmation.client_secret &&
       !confirmation.payment_intent &&
       !services.context.intent &&
@@ -145,7 +145,12 @@ export async function reconcilePayment(services: ExecutionServices) {
           status: 'failed',
           paymentOutcome: 'failed',
           context: services.context,
-          error: '商户明确拒绝：subscription_limit；原结账未付款，原账号无有效订阅',
+          error:
+            '商户明确拒绝：' +
+            (confirmation.status === 'subscription_limit'
+              ? 'subscription_limit'
+              : 'Checkout is not available in your region.') +
+            '；原结账未付款，原账号无有效订阅',
         });
         return;
       }

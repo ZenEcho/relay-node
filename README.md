@@ -58,7 +58,7 @@ import { createBrowserSentinelAuthorizer } from '@relay/node/browser';
 
 工作流的 `checkoutMode` 可选 `custom`（默认，oaics_ / ChatGPT）或 `hosted`（cs_live_ / Stripe）。Hosted 通过 payment_pages 初始化、HTTP 令牌、原结账确认及商户审批处理；两条路径不自动互换。日志和执行检查点携带实际链接类型，恢复只查询原结账或原 Intent，不重放付款。商户明确返回 `subscription_limit` 且没有 Intent 时直接失败。
 
-SDK 的 `createBrowserSentinelAuthorizer(execute)` 可配合现有可信扩展，在匹配本单账号、设备和页面的真实登录文档中调用官方 Sentinel SDK。主令牌和 SO 的 flow 分开处理，保持 SDK 原始值；运行期间身份改变、SDK 未就绪或超时会停止。该模块不创建浏览器、不导入登录凭证、不模拟设备或求解挑战；`execute` 需由已有授权运行时提供。默认节点不注入浏览器 StripeTokenProvider；显式配置 `sentinel.mode: "official"` 时，仅 Sentinel 使用本单临时浏览器。在实例 config.json 的 officialSdk 中可指定 executablePath 和 headless。
+SDK 的 `createBrowserSentinelAuthorizer(execute)` 可配合现有可信扩展，在匹配本单账号、设备和页面的真实登录文档中调用官方 Sentinel SDK。主令牌和 SO 的 flow 分开处理，保持 SDK 原始值；运行期间身份改变、SDK 未就绪或超时会停止。该模块不创建浏览器、不导入登录凭证、不模拟设备或求解挑战；`execute` 需由已有授权运行时提供。默认节点不注入浏览器 StripeTokenProvider；付款后收尾按需启动本单临时浏览器，显式配置 `sentinel.mode: "official"` 时 Sentinel 也使用该浏览器。在实例 config.json 的 officialSdk 中可指定 executablePath 和 headless。
 
 Custom 流程在建单、更新税费和商户付款确认前分别获取授权；选卡与 Stripe 卡片令牌创建不额外刷新 Sentinel。后续授权检查点属于建单或付款阶段，进度不会跳回账号检查。参考桥错误只记录固定的脱敏分类；仅已识别的临时网络错误在当前阶段重试一次，身份、flow、令牌格式和证明校验失败不进行阶段重试。
 
@@ -85,7 +85,7 @@ node scripts/install-reference-sentinel.mjs --directory /absolute/path/reference
 
 暂停并排空原任务后重启节点服务，使配置生效。外部桥是本机明确选择的可信程序，适配器通过 stdin 传入本单 UA、设备、Cookie、代理、页面和 flow；核对输出绑定，限制时间/输出，回收子进程，不记录授权内容。SO 可空，参考桥的 SO 使用当前主 flow；浏览器适配器仍使用官方 SDK 自己返回的 flow。参考 SDK 是固定版本，站点协议改变时需要更新并重新验收。
 
-新环境固定使用原生组件支持的 Chrome 146 TLS/UA，已有订单的环境不改写。reference 模式检查参考桥及其依赖，无需 Chrome/Chromium；控制台云安装不安装浏览器。仅 official Sentinel 模式需要 Chrome/Chromium，可通过 officialSdk.executablePath 指定可执行文件。原付款核对与收尾不依赖浏览器就绪。
+新环境固定使用原生组件支持的 Chrome 146 TLS/UA，已有订单的环境不改写。reference 模式签发 Sentinel 无需 Chrome/Chromium；浏览器收尾和 official Sentinel 模式需要 Chrome/Chromium，可通过 officialSdk.executablePath 指定可执行文件。原付款核对不依赖浏览器就绪；收尾失败保留付款成功。收尾先强制刷新 Session 并验证原账号，再完成原登记、取消续费和获取账单；浏览器轮换后的 Cookie 整体保存，防止混入旧登录分片。刷新失败不继续使用旧 Token，明确的 401 仅在重新刷新后重试一次。
 
 独立预检默认只核对原账号并签发两个 flow；可用 `--sdk-root` 指定安装节点。额外传 `--verify-checkout` 才创建一个未付款 Plus 结账并核验商户接受情况，始终不取卡、不确认付款：
 

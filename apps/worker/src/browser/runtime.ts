@@ -14,6 +14,9 @@ import { SdkCdp } from './cdp.js';
 import { startSdkProxy } from '../transport/browser-proxy.js';
 import { authorizeSentinelInPage } from './actions.js';
 import { prepareStripeTokenInPage } from './actions.js';
+import { requestCleanupInPage } from './cleanup.js';
+import { UpstreamError } from '../execution/http-utils.js';
+import type { ExecutionServices } from '../execution/services.js';
 import type { SentinelAuthorizer } from '../../../../packages/contracts/src/sentinel.js';
 import { createReferenceSentinelAuthorizer, type ReferenceSentinelOptions } from './reference-sentinel.js';
 import type { StripeTokenProvider } from '../../../../packages/contracts/src/stripe.js';
@@ -298,6 +301,46 @@ export class OnDemandSdkRuntime {
     }
     return result;
   };
+  readonly cleanupChat: ExecutionServices['chat'] = async (_name, path, body, headers) => {
+    await this.open();
+    const context = this.assignment.context;
+    const result = await this.cdp!.evaluate(
+      '(' +
+        requestCleanupInPage.toString() +
+        ')(' +
+        JSON.stringify({
+          path,
+          body,
+          headers,
+          accountId: context.accountId,
+          accessToken: context.session?.accessToken,
+        }) +
+        ')',
+      this.session,
+      25000,
+    );
+    // A refresh may rotate HttpOnly cookies, including changing chunk counts.
+    // Replace the whole origin cookie set instead of appending another generation.
+    const exported = await this.cdp!.send(
+      'Network.getCookies',
+      { urls: ['https://chatgpt.com/'] },
+      this.session,
+    );
+    context.environment.cookies = [
+      ...context.environment.cookies.filter((c) => c.domain.replace(/^\./, '') !== 'chatgpt.com'),
+      ...(exported.cookies || []).filter((c: any) => c.domain.replace(/^\./, '') === 'chatgpt.com'),
+    ];
+    if (!result || result.status < 200 || result.status >= 300)
+      throw new UpstreamError(
+        'HTTP ' +
+          (result?.status || 0) +
+          '：' +
+          (result?.data?.error?.message || result?.data?.detail || '浏览器收尾请求失败'),
+        result?.status || 0,
+        result?.data,
+      );
+    return result.data;
+  };
   private async verifySessionNavigation(accountId?: string) {
     if (!accountId) return false;
     const url = 'https://chatgpt.com/api/auth/session';
@@ -482,6 +525,14 @@ export async function executeWithOnDemandSdk(
       control,
       transport,
       assignment.demo ? undefined : (request) => withSdkLease(assignment, control, () => authorize(request)),
+      undefined,
+      assignment.demo
+        ? undefined
+        : (...args) =>
+            withSdkLease(assignment, control, () => {
+              sdk ||= new OnDemandSdkRuntime(assignment, options, control.signal);
+              return sdk.cleanupChat(...args);
+            }),
     ).execute();
   } finally {
     control.signal?.removeEventListener('abort', abort);

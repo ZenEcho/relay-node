@@ -103,6 +103,7 @@ async function execute(
     intentResponse?: (input: HttpInput) => HttpOutput;
     merchantDisconnect?: boolean;
     merchantData?: any;
+    merchantStatus?: number;
     checkoutCustomer?: string;
     card?: { number: string; expiry: string; cvc: string; lastFour?: string };
     nestedTaxQuote?: boolean;
@@ -114,9 +115,10 @@ async function execute(
     defaultBillingEmail?: string;
     billingPhone?: string;
     boundBillingEmail?: string;
+    proxyUrl?: string;
   } = {},
 ) {
-  const environment = createEnvironment('PH', '');
+  const environment = createEnvironment('PH', options.proxyUrl || '');
   const cancellation = new AbortController();
   const assignment = {
     run: {
@@ -272,7 +274,7 @@ async function execute(
         };
       if (url.pathname.endsWith('/checkout/confirm') && options.merchantData)
         return {
-          status: 200,
+          status: options.merchantStatus || 200,
           headers: {},
           body: JSON.stringify(options.merchantData),
           data: options.merchantData,
@@ -349,6 +351,27 @@ test('custom oaics flow requires Sentinel and forwards both token headers withou
     result.commands.filter((c) => c.action === 'authorize' && c.body.action === 'merchant_confirm').length,
     1,
   );
+});
+
+test('Sentinel and merchant audits identify the same frozen proxy without exposing its credentials', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    proxyUrl: 'http://private-proxy-user:private-proxy-password@proxy.invalid:8080/',
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const logs = result.commands.filter((c) => c.action === 'step').map((c) => c.body.step);
+  const merchant = logs.find((entry) => entry.name === '商户付款确认');
+  const sentinel = logs.filter((entry) => entry.name === '取得本单 Sentinel 授权');
+  assert.ok(sentinel.length >= 2);
+  for (const entry of sentinel) {
+    assert.equal(entry.request.environmentId, merchant.request.environmentId);
+    assert.equal(entry.request.profile, merchant.request.profile);
+    assert.equal(entry.request.proxyUrl, merchant.request.proxyUrl);
+    assert.equal(entry.request.networkMode, 'proxy');
+  }
+  assert.equal(JSON.stringify(logs).includes('private-proxy-user'), false);
+  assert.equal(JSON.stringify(logs).includes('private-proxy-password'), false);
 });
 
 test('the current Stripe session_id response and original customer session are forwarded to card attribution', async () => {
@@ -975,6 +998,60 @@ test('a subscription limit carrying an Intent remains pending for original-payme
     });
     assert.equal(result.finish.status, 'pending_confirmation');
     assert.notEqual(result.finish.paymentOutcome, 'failed');
+  }
+});
+
+test('an explicit region refusal finishes failed after one merchant confirmation without another payment', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    merchantStatus: 403,
+    merchantData: { detail: 'Checkout is not available in your region.' },
+  });
+  assert.equal(result.finish.status, 'failed');
+  assert.equal(result.finish.paymentOutcome, 'failed');
+  assert.equal(result.finish.error, 'HTTP 403：Checkout is not available in your region.');
+  assert.equal(result.finish.context.merchantConfirmation.status, 'checkout_region_unavailable');
+  assert.equal(result.assignment.run.paymentSubmitted, true);
+  assert.equal(result.requests.filter((r) => r.url.endsWith('/checkout/confirm')).length, 1);
+  assert.ok(!result.requests.some((r) => /\/v1\/payment_intents\//.test(r.url)));
+});
+
+test('other HTTP refusals and region responses carrying an Intent preserve the submitted boundary', async () => {
+  for (const [status, data] of [
+    [403, { detail: 'Forbidden' }],
+    [500, { detail: 'Checkout is not available in your region.' }],
+    [
+      403,
+      {
+        detail: 'Checkout is not available in your region.',
+        payment_intent: { id: 'pi_original' },
+      },
+    ],
+    [
+      403,
+      {
+        detail: 'Checkout is not available in your region.',
+        client_secret: 'pi_original_secret_fixture',
+      },
+    ],
+    [
+      403,
+      {
+        detail: 'Checkout is not available in your region.',
+        error: { payment_intent: { id: 'pi_original' } },
+      },
+    ],
+  ] as const) {
+    const result = await execute({
+      demo: false,
+      authorizer: boundAuthorizer,
+      merchantStatus: status,
+      merchantData: data,
+    });
+    assert.equal(result.finish.status, 'pending_confirmation', JSON.stringify({ status, data }));
+    assert.notEqual(result.finish.paymentOutcome, 'failed');
+    assert.equal(result.requests.filter((r) => r.url.endsWith('/checkout/confirm')).length, 1);
   }
 });
 
