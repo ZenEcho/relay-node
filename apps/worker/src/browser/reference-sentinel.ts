@@ -353,6 +353,8 @@ export function createReferenceSentinelAuthorizer(
     return {
       ...request,
       token: output.main,
+      runtime: 'reference',
+      sdkVersion: version,
       ...(validHeader(output.so) ? { soToken: output.so } : {}),
       issuedAt: new Date(issuedAt).toISOString(),
       expiresAt: new Date(issuedAt + 60000).toISOString(),

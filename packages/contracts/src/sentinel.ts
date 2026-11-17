@@ -13,5 +13,7 @@ export type SentinelAuthorization = SentinelRequest & {
   soRequired?: boolean;
   issuedAt: string;
   expiresAt: string;
+  runtime?: 'reference' | 'official';
+  sdkVersion?: string;
 };
 export type SentinelAuthorizer = (request: SentinelRequest) => Promise<SentinelAuthorization>;

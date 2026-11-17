@@ -336,7 +336,7 @@ test('a card that does not match the assigned last four is rejected before start
   await runtime.close();
 });
 
-test('configured reference Sentinel completes preflight without starting the official browser', async (t) => {
+test('disabled payments finish account preflight before requesting Sentinel or starting a browser', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'relay-reference-integration-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const bridgePath = join(directory, 'bridge.cjs');
@@ -372,8 +372,9 @@ test('configured reference Sentinel completes preflight without starting the off
     { executablePath: '/does-not-exist/Chrome' },
     { mode: 'reference', bridgePath },
   );
-  assert.equal(JSON.parse(assignment.context.sentinel).p, 'reference-proof');
-  assert.ok(events.some((e) => e.action === 'checkpoint' && e.body.stage === 'sentinel_ready'));
+  assert.equal(assignment.context.sentinel, undefined);
+  assert.ok(events.some((e) => e.action === 'checkpoint' && e.body.stage === 'subscription_ready'));
+  assert.ok(!events.some((e) => e.action === 'step' && e.body.step.name === '取得本单 Sentinel 授权'));
   assert.match(events.findLast((e) => e.action === 'finish').body.error, /真实付款未启用/);
   assert.ok(!events.some((e) => e.action === 'card' || e.action === 'authorize'));
 });
@@ -462,7 +463,9 @@ test('reference execution prepares the original card through the API without Chr
   assert.equal(fields.get('payment_method_data[card][number]'), '4242424242424242');
   assert.equal(fields.get('payment_method_data[billing_details][email]'), 'test@example.invalid');
   assert.ok(requests.findIndex((request) => request.url.endsWith('/checkout/confirm')) > tokenIndex);
-  assert.equal(JSON.parse(assignment.context.sentinel).p, 'reference-proof');
+  const confirm = requests.find((request) => request.url.endsWith('/checkout/confirm'))!;
+  assert.equal(JSON.parse(confirm.headers!['openai-sentinel-token']).p, 'reference-proof');
+  assert.equal(assignment.context.sentinel, undefined);
 });
 
 test('a missing reference bridge stops execution before assigning a card or authorizing payment', async () => {
@@ -482,6 +485,7 @@ test('a missing reference bridge stops execution before assigning a card or auth
       demo: false,
       paymentEnabled: true,
       mode: 'execute',
+      billing: { name: 'Test', line1: '123 Test St', city: 'Manila', postalCode: '1000', country: 'PH' },
     } as any,
     {
       request: async (action, body) => {

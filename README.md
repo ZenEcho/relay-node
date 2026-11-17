@@ -60,7 +60,11 @@ import { createBrowserSentinelAuthorizer } from '@relay/node/browser';
 
 SDK 的 `createBrowserSentinelAuthorizer(execute)` 可配合现有可信扩展，在匹配本单账号、设备和页面的真实登录文档中调用官方 Sentinel SDK。主令牌和 SO 的 flow 分开处理，保持 SDK 原始值；运行期间身份改变、SDK 未就绪或超时会停止。该模块不创建浏览器、不导入登录凭证、不模拟设备或求解挑战；`execute` 需由已有授权运行时提供。默认节点不注入浏览器 StripeTokenProvider；付款后收尾按需启动本单临时浏览器，显式配置 `sentinel.mode: "official"` 时 Sentinel 也使用该浏览器。在实例 config.json 的 officialSdk 中可指定 executablePath 和 headless。
 
-Custom 流程在建单、更新税费和商户付款确认前分别获取授权；选卡与 Stripe 卡片令牌创建不额外刷新 Sentinel。后续授权检查点属于建单或付款阶段，进度不会跳回账号检查。参考桥错误只记录固定的脱敏分类；仅已识别的临时网络错误在当前阶段重试一次，身份、flow、令牌格式和证明校验失败不进行阶段重试。
+Custom 流程先读取地区报价，再在建单、更新税费和商户付款确认前分别获取授权；选卡与 Stripe 卡片令牌创建不额外刷新 Sentinel。每次授权仅供对应阶段的一次写请求使用，GET 和 Stripe 请求不携带 Sentinel，检查点不能恢复旧授权。发送前再次核对本地新鲜度期限、原账号、凭证及冻结环境；该期限不代表上游确认的有效期。授权日志和对应写请求通过 `grantId` 关联，日志保留运行模式、参考 SDK 版本和环境绑定校验结果。环境配置一致不保证动态代理实际出口相同。
+
+后续授权日志属于建单或付款阶段，进度不会跳回账号检查。合并相邻的重复阶段检查点，授权开始、就绪通过日志记录，不再分别等待检查点请求；原结账、税费、Elements、卡片令牌和 Intent 等恢复数据仍同步保存。首次 HTTP 传输共用派发前的执行检查，重试退避后重新检查。取卡请求使用独立的 180 秒期限，取消信号仍即时生效，不自动重放请求。
+
+参考桥错误只记录固定的脱敏分类；仅已识别的临时网络错误在当前阶段重试一次，身份、flow、令牌格式和证明校验失败不进行阶段重试。
 
 ## 后端 Sentinel 参考运行时
 

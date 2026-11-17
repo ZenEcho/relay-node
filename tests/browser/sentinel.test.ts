@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   authorizeSentinel,
+  consumeSentinel,
   type SentinelAuthorization,
   type SentinelAuthorizer,
 } from '../../apps/worker/src/execution/sentinel.js';
@@ -78,9 +79,71 @@ test('a classified bridge outage retries once in the same bound stage and report
       return credentials;
     },
   );
-  assert.deepEqual(result, { attempts: 2, retryReason: 'UPSTREAM_TIMEOUT' });
+  assert.equal(result.attempts, 2);
+  assert.equal(result.retryReason, 'UPSTREAM_TIMEOUT');
+  assert.equal(result.environmentBound, true);
+  assert.equal(result.runtime, 'adapter');
+  assert.match(result.grantId, /^[a-f0-9-]{36}$/);
   assert.deepEqual(requests[0], requests[1]);
   assert.equal(context.sentinel, credentials.token);
+});
+
+test('a grant preserves opaque headers and permits only one dispatch in the matching phase', async () => {
+  const { context, credentials } = fixture();
+  await authorizeSentinel(context, 'chatgpt_checkout', 'https://chatgpt.com/', async () => credentials);
+  const grant = consumeSentinel(context, 'chatgpt_checkout');
+  assert.equal(grant.headers['openai-sentinel-token'], credentials.token);
+  assert.equal(grant.headers['openai-sentinel-so-token'], credentials.soToken);
+  assert.equal(context.sentinel, undefined);
+  grant.assertValid();
+  assert.throws(() => consumeSentinel(context, 'chatgpt_checkout'), { code: 'SENTINEL_AUTH_INVALID' });
+  await authorizeSentinel(context, 'chatgpt_checkout', 'https://chatgpt.com/', async () => credentials);
+  assert.throws(() => consumeSentinel(context, 'checkout_session_approval'), { code: 'SENTINEL_AUTH_INVALID' });
+  assert.throws(() => consumeSentinel(context, 'chatgpt_checkout'), { code: 'SENTINEL_AUTH_INVALID' });
+});
+
+test('checkpoint credentials cannot restore a process-local grant', async () => {
+  const { context, credentials } = fixture();
+  await authorizeSentinel(context, 'chatgpt_checkout', 'https://chatgpt.com/', async () => credentials);
+  const restored = structuredClone(context);
+  assert.throws(() => consumeSentinel(restored, 'chatgpt_checkout'), { code: 'SENTINEL_AUTH_INVALID' });
+  assert.equal(restored.sentinel, undefined);
+});
+
+const changes: [string, (context: RuntimeContext) => void][] = [
+  ['account', (c) => { c.accountId = 'other'; }],
+  ['device', (c) => { c.environment.deviceId = 'other'; }],
+  ['proxy', (c) => { c.environment.proxyUrl = 'http://other.invalid:8080'; }],
+  ['profile', (c) => { c.environment.profile = 'other'; }],
+  ['headers', (c) => { c.environment.headers['accept-language'] = 'fr-FR'; }],
+  ['cookies', (c) => { c.environment.cookies.push({ name: 'session', value: 'other', domain: 'chatgpt.com' }); }],
+  ['bearer', (c) => { c.session = { accessToken: 'other' }; }],
+  ['environment instance', (c) => { c.environment = structuredClone(c.environment); }],
+];
+for (const [name, change] of changes) {
+  test(`a ${name} change during signing rejects the returned credentials`, async () => {
+    const { context, credentials } = fixture();
+    await assert.rejects(authorizeSentinel(context, 'chatgpt_checkout', 'https://chatgpt.com/', async () => {
+      change(context);
+      return credentials;
+    }), { code: 'SENTINEL_AUTH_INVALID' });
+    assert.equal(context.sentinel, undefined);
+  });
+  test(`a ${name} change after signing blocks the dispatch`, async () => {
+    const { context, credentials } = fixture();
+    await authorizeSentinel(context, 'chatgpt_checkout', 'https://chatgpt.com/', async () => credentials);
+    const grant = consumeSentinel(context, 'chatgpt_checkout');
+    change(context);
+    assert.throws(grant.assertValid, { code: 'SENTINEL_AUTH_INVALID' });
+  });
+}
+
+test('a consumed grant is checked for expiration again before transport dispatch', async (t) => {
+  const { context, credentials } = fixture();
+  await authorizeSentinel(context, 'chatgpt_checkout', 'https://chatgpt.com/', async () => credentials);
+  const grant = consumeSentinel(context, 'chatgpt_checkout');
+  t.mock.method(Date, 'now', () => Date.parse(credentials.expiresAt));
+  assert.throws(grant.assertValid, { code: 'SENTINEL_AUTH_INVALID' });
 });
 
 test('repeated bridge outages are bounded and unknown or identity failures never retry', async () => {
@@ -147,6 +210,7 @@ const cases: [string, (credentials: SentinelAuthorization) => void][] = [
       c.token = 'invalid\r\nheader';
     },
   ],
+  ['NUL main header', (c) => { c.token = 'invalid\0header'; }],
   [
     'wrong device',
     (c) => {

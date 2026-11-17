@@ -325,7 +325,7 @@ async function execute(
     control,
     transport,
     async () => {
-      throw new Error('fixture reached the end of preflight');
+      throw new Error('disabled payments must not request Sentinel');
     },
     undefined,
     options.browser ? f.chat : undefined,
@@ -342,7 +342,7 @@ async function execute(
 for (const browser of [true, false]) {
   test(`ProtocolEngine refreshes through ${browser ? 'the browser' : 'native Session cookies'}, verifies identity and retries with the fresh bearer`, async () => {
     const f = await execute({ browser });
-    assert.equal(f.finish.error, 'fixture reached the end of preflight');
+    assert.match(f.finish.error, /真实付款未启用/);
     assert.equal(f.context.session?.accessToken, fresh);
     assert.equal(f.paths.filter((path) => path.includes('refresh=true')).length, 1);
     assert.equal(f.native.filter((input) => input.url.includes('/accounts/check/')).length, browser ? 2 : 3);

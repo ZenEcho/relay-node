@@ -102,6 +102,5 @@ export async function preflightExecution(services: ExecutionServices) {
   }
   if (services.context.originalSubscription?.has_active_subscription)
     throw new Error('账号已有有效订阅，请先核对套餐，执行器未发起新付款');
-  await services.requireSentinel('chatgpt_checkout');
   await services.checkpoint('subscription_ready');
 }

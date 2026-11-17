@@ -68,6 +68,9 @@ export class HttpController {
   }
   async request(path: string, body: any = {}, signal?: AbortSignal) {
     throwIfExecutionAborted(signal);
+    // Card preparation can include opening and verifying a card. It is a single
+    // non-replayed request and must not inherit the short control RPC deadline.
+    const timeout = AbortSignal.timeout(/^runs\/[^/]+\/card$/.test(path) ? 180000 : 45000);
     const r = await fetch(this.origin.replace(/\/$/, '') + '/api/worker/' + path, {
       method: 'POST',
       headers: {
@@ -76,7 +79,7 @@ export class HttpController {
       },
       body: JSON.stringify(body),
       redirect: 'error',
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(45000)]) : AbortSignal.timeout(45000),
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
     });
     let text: string;
     try {

@@ -2,11 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ProtocolEngine } from '../../apps/worker/src/execution/engine.js';
 import { DemoTransport } from '../../apps/worker/src/testing/demo-transport.js';
-import type { HttpInput, HttpOutput } from '../../apps/worker/src/transport/native.js';
+import type { HttpInput, HttpOutput, TransportRequestOptions } from '../../apps/worker/src/transport/native.js';
 import type { Assignment, Control } from '../../apps/worker/src/runtime/controller.js';
 import { createEnvironment } from '../../packages/runtime/src/environment.js';
 import type { SentinelAuthorizer } from '../../packages/contracts/src/sentinel.js';
 import type { ExecutionServices } from '../../apps/worker/src/execution/services.js';
+import type { RuntimeContext } from '../../packages/contracts/src/execution.js';
 
 const boundAuthorizer: SentinelAuthorizer = async (request) => ({
   ...request,
@@ -121,6 +122,10 @@ async function execute(
     billingPhone?: string;
     boundBillingEmail?: string;
     proxyUrl?: string;
+    beforeCommand?: (action: string, body: any, context: RuntimeContext) => void;
+    checkoutResponse?: HttpOutput;
+    transportAttemptAudit?: boolean;
+    transportRetryAudit?: boolean;
   } = {},
 ) {
   const environment = createEnvironment('PH', options.proxyUrl || '');
@@ -181,14 +186,30 @@ async function execute(
     expiry: '12/30',
     cvc: '123',
   };
-  let sdkRequest: any;
+  let sdkRequest: any, activeChecks = 0;
   class Transport extends DemoTransport {
     constructor() {
       super(0);
     }
-    override async request(input: HttpInput) {
-      requests.push(input);
+    override async request(input: HttpInput, requestOptions?: TransportRequestOptions) {
       const url = new URL(input.url);
+      if (url.pathname === '/backend-api/payments/checkout' && options.transportAttemptAudit)
+        await requestOptions?.onAttempt?.({
+          requestId: '11111111-1111-4111-8111-111111111111',
+          attemptId: '22222222-2222-4222-8222-222222222222',
+          attempt: 1, method: input.method, targetHost: url.hostname, outcome: 'running',
+          startedAt: new Date().toISOString(), elapsedMs: 0, totalElapsedMs: 0,
+        });
+      if (url.pathname === '/backend-api/payments/checkout' && options.transportRetryAudit)
+        await requestOptions?.onAttempt?.({
+          requestId: '11111111-1111-4111-8111-111111111111',
+          attemptId: '33333333-3333-4333-8333-333333333333',
+          attempt: 2, method: input.method, targetHost: url.hostname, outcome: 'running',
+          startedAt: new Date().toISOString(), elapsedMs: 0, totalElapsedMs: 0,
+        });
+      requests.push(input);
+      if (url.pathname === '/backend-api/payments/checkout' && options.checkoutResponse)
+        return options.checkoutResponse;
       if (url.pathname.endsWith('/payments/checkout') && options.checkoutConfigurationOnly) {
         const response = await super.request(input);
         Object.assign(response.data, { publishable_key: 'pk_test_original', customer_session_client_secret: 'cuss_original', confirm_return_url: 'https://chatgpt.com/checkout/verify?stripe_session_id=' + response.data.internal_checkout_session_id });
@@ -318,7 +339,9 @@ async function execute(
   }
   const control: Control = {
     signal: cancellation.signal,
+    async assertActive() { activeChecks++; },
     async request(action, body = {}) {
+      options.beforeCommand?.(action, body, assignment.context);
       commands.push({ action, body: structuredClone(body) });
       if (action === 'authorize') assignment.run.dispatches[(body as any).action] = new Date().toISOString();
       if (action === 'card') return card;
@@ -349,12 +372,37 @@ async function execute(
     requests,
     commands,
     sdkRequest,
+    activeChecks,
     card,
     control,
     transport,
     finish: commands.filter((c) => c.action === 'finish').at(-1)?.body,
   };
 }
+
+test('custom execution persists recovery boundaries without redundant phase or authorization checkpoints', async () => {
+  const result = await execute({ demo: false, authorizer: boundAuthorizer,
+    credentialUserEmail: 'session@example.invalid' });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const stages = result.commands.filter((c) => c.action === 'checkpoint').map((c) => c.body.stage);
+  assert.equal(stages.length, 11);
+  for (const required of ['billing_email_ready', 'checkout_created', 'taxes_ready',
+    'elements_ready', 'confirmation_token_ready', 'intent_ready'])
+    assert.ok(stages.includes(required), required);
+  assert.equal(result.commands.filter((c) => c.action === 'card').length, 1);
+  assert.deepEqual(result.commands.filter((c) => c.action === 'authorize').map((c) => c.body.action),
+    ['merchant_confirm', 'stripe_confirm', 'registration']);
+});
+
+test('native first-attempt audits share the dispatch guard while retries get a fresh guard', async () => {
+  const options = { demo: false, authorizer: boundAuthorizer };
+  const plain = await execute(options);
+  const first = await execute({ ...options, transportAttemptAudit: true });
+  const retry = await execute({ ...options, transportAttemptAudit: true, transportRetryAudit: true });
+  for (const result of [plain, first, retry]) assert.equal(result.finish.status, 'completed', result.finish.error);
+  assert.equal(first.activeChecks, plain.activeChecks);
+  assert.equal(retry.activeChecks, first.activeChecks + 1);
+});
 
 test('custom oaics flow requires Sentinel and forwards both token headers without depending on the homepage', async () => {
   const result = await execute();
@@ -367,6 +415,8 @@ test('custom oaics flow requires Sentinel and forwards both token headers withou
     '/backend-api/checkout_pricing_config/configs/{country_code}',
   );
   assert.equal(pricing.headers?.['sec-fetch-mode'], 'cors');
+  assert.equal(pricing.headers?.['openai-sentinel-token'], undefined);
+  assert.equal(pricing.headers?.['openai-sentinel-so-token'], undefined);
   const checkout = result.requests.find((r) => r.url.endsWith('/payments/checkout'))!;
   assert.equal(JSON.parse(checkout.body!).checkout_ui_mode, 'custom');
   assert.ok(!checkout.headers?.['oai-web-deployment-attestation']);
@@ -381,10 +431,86 @@ test('custom oaics flow requires Sentinel and forwards both token headers withou
   assert.equal(JSON.parse(confirm.headers!['openai-sentinel-so-token']).flow, 'chatgpt_checkout');
   const authIndex = result.requests.findIndex((r) => r.url.includes('/sentinel/req'));
   assert.ok(authIndex >= 0 && authIndex < result.requests.indexOf(checkout));
+  assert.ok(result.requests.indexOf(pricing) < authIndex);
   assert.equal(
     result.commands.filter((c) => c.action === 'authorize' && c.body.action === 'merchant_confirm').length,
     1,
   );
+});
+
+test('each Sentinel grant is sent only to its matching write and never to reads or Stripe', async () => {
+  const result = await execute({
+    beforeCommand(action, body, context) {
+      if (action === 'checkpoint' && body.stage === 'subscription_ready') {
+        context.sentinel = 'stale-checkpoint-main';
+        context.sentinelSo = 'stale-checkpoint-observer';
+      }
+    },
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const protectedWrites = result.requests.filter((r) => r.headers?.['openai-sentinel-token']);
+  assert.deepEqual(protectedWrites.map((r) => [r.method, new URL(r.url).pathname]), [
+    ['POST', '/backend-api/payments/checkout'],
+    ['POST', '/backend-api/payments/checkout/taxes'],
+    ['POST', '/backend-api/payments/checkout/confirm'],
+  ]);
+  const steps = result.commands.filter((c) => c.action === 'step' && c.body.step.status === 'succeeded').map((c) => c.body.step);
+  const grants = steps.filter((s) => s.name === '取得本单 Sentinel 授权').map((s) => s.response.grantId);
+  const writes = steps.filter((s) => s.request?.grantId).map((s) => s.request.grantId);
+  assert.equal(new Set(grants).size, 3);
+  assert.deepEqual(writes, grants);
+  assert.ok(!JSON.stringify(result.requests).includes('stale-checkpoint'));
+});
+
+test('an environment change during the checkout audit round trip blocks the actual POST', async () => {
+  const result = await execute({
+    beforeCommand(action, body, context) {
+      if (action === 'step' && body.step.name === '创建支付链接' && body.step.status === 'running')
+        context.environment.proxyUrl = 'http://other.invalid:8080';
+    },
+  });
+  assert.equal(result.finish.status, 'failed');
+  assert.match(result.finish.error, /签发后本单凭证或环境发生变化/);
+  assert.ok(!result.requests.some((r) => r.url.endsWith('/payments/checkout')));
+  assert.ok(!result.commands.some((c) => ['card', 'authorize'].includes(c.action)));
+});
+
+test('an expired checkout grant stops before the POST without acquiring cards or replaying it', async (t) => {
+  const afterExpiry = Date.now() + 120000;
+  const result = await execute({
+    beforeCommand(action, body) {
+      if (action === 'step' && body.step.name === '创建支付链接' && body.step.status === 'running')
+        t.mock.method(Date, 'now', () => afterExpiry);
+    },
+  });
+  assert.equal(result.finish.status, 'failed');
+  assert.match(result.finish.error, /本地新鲜度期限/);
+  assert.ok(!result.requests.some((r) => r.url.endsWith('/payments/checkout')));
+  assert.ok(!result.commands.some((c) => ['card', 'authorize'].includes(c.action)));
+});
+
+test('an environment change inside the native attempt audit blocks the wire request', async () => {
+  const result = await execute({
+    transportAttemptAudit: true,
+    beforeCommand(action, body, context) {
+      if (action === 'step' && body.step.name === '原生 HTTP 传输尝试' && body.step.status === 'running')
+        context.environment.deviceId = 'other-device';
+    },
+  });
+  assert.equal(result.finish.status, 'failed');
+  assert.match(result.finish.error, /签发后本单凭证或环境发生变化/);
+  assert.ok(!result.requests.some((r) => r.url.endsWith('/payments/checkout')));
+  assert.ok(!result.commands.some((c) => ['card', 'authorize'].includes(c.action)));
+});
+
+test('an unusual-activity checkout refusal retains the upstream diagnostic without replay or card access', async () => {
+  const detail = 'Our systems have detected unusual activity. Please try again later.';
+  const result = await execute({ checkoutResponse: { status: 400, headers: {}, body: JSON.stringify({ detail }), data: { detail } } });
+  assert.equal(result.finish.status, 'failed');
+  assert.equal(result.finish.error, 'HTTP 400：' + detail);
+  assert.equal(result.requests.filter((r) => r.url.endsWith('/payments/checkout')).length, 1);
+  assert.ok(!result.commands.some((c) => ['card', 'authorize'].includes(c.action)));
+  assert.ok(!result.requests.some((r) => new URL(r.url).hostname === 'api.stripe.com'));
 });
 
 test('Sentinel and merchant audits identify the same frozen proxy without exposing its credentials', async () => {
@@ -507,10 +633,12 @@ test('an authenticated-runtime adapter supplies fresh bound credentials before t
   assert.equal(JSON.parse(checkout.headers!['openai-sentinel-token']).c, 'test-auth-1');
   assert.equal(JSON.parse(confirm.headers!['openai-sentinel-token']).c, 'test-auth-3');
   const stages = result.commands.filter((c) => c.action === 'checkpoint').map((c) => c.body.stage);
-  assert.ok(stages.includes('checkout_sentinel_authorization'));
-  assert.ok(stages.includes('payment_sentinel_authorization'));
-  const cardStart = stages.indexOf('card_preparation');
-  assert.equal(stages.slice(cardStart).includes('sentinel_authorization'), false);
+  assert.ok(!stages.some((stage) => /sentinel_(authorization|ready)$/.test(stage)));
+  const authorizationStages = result.commands.filter((c) => c.action === 'step'
+    && c.body.step.name === '取得本单 Sentinel 授权').map((c) => c.body.step.request.stage);
+  assert.ok(authorizationStages.includes('checkout_sentinel_authorization'));
+  assert.ok(authorizationStages.includes('payment_sentinel_authorization'));
+  assert.ok(stages.indexOf('confirmation_token_ready') < stages.indexOf('intent_ready'));
   const logs = JSON.stringify(result.commands.filter((c) => c.action === 'step'));
   assert.ok(!logs.includes('test-authentication') && !logs.includes('test-session-observer'));
 });

@@ -526,7 +526,7 @@ export async function executeWithOnDemandSdk(
         ))(request);
       if (sentinel?.mode !== 'official') throw new Error('不支持的 Sentinel 运行模式');
       sdk ||= new OnDemandSdkRuntime(assignment, options, control.signal);
-      return sdk.authorize(request);
+      return { ...(await sdk.authorize(request)), runtime: 'official' };
     };
     await new ProtocolEngine(
       assignment,

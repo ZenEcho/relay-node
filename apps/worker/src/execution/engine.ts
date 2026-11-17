@@ -22,7 +22,7 @@ import { loadCredential } from './credentials.js';
 import { isExpiredAccessToken, refreshExpiredAccessToken } from './session-refresh.js';
 import { paymentPlan } from '../../../../packages/rules/src/plans.js';
 import { billingPostalCodeOptional } from '../../../../packages/rules/src/billing.js';
-import { authorizeSentinel } from './sentinel.js';
+import { authorizeSentinel, consumeSentinel, type SentinelGrant } from './sentinel.js';
 import type { RuntimeContext } from '../../../../packages/contracts/src/execution.js';
 import type { StripeTokenProvider } from '../../../../packages/contracts/src/stripe.js';
 import {
@@ -40,6 +40,12 @@ const STRIPE_VERSION =
   '2025-03-31.basil; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1';
 // Compatibility metadata from oa-pay-protocol-go; tokenization remains HTTP.
 const STRIPE_JS_VERSIONS = ['628eb3cacd', 'a44b454c', 'd21f1cd6', '9c1e8d52', 'f7a3b211', '692f102a8f'];
+const sentinelWrites: Record<string, SentinelFlow> = {
+  '/backend-api/payments/checkout': 'chatgpt_checkout',
+  '/backend-api/payments/checkout/taxes': 'chatgpt_checkout',
+  '/backend-api/payments/checkout/confirm': 'checkout_session_approval',
+  '/backend-api/payments/checkout/approve': 'checkout_session_approval',
+};
 export class ProtocolEngine {
   private context: RuntimeContext;
   private stage = 'preflight';
@@ -104,9 +110,12 @@ export class ProtocolEngine {
   }
   private async checkpoint(stage: string) {
     throwIfExecutionAborted(this.control.signal);
+    this.setStage(stage);
+    await this.command('checkpoint', { context: this.context, stage });
+  }
+  private setStage(stage: string) {
     this.stage = stage;
     this.context.phase = stage;
-    await this.command('checkpoint', { context: this.context, stage });
   }
   private log = async (step: AuditEntry) => {
     if (this.control.signal?.aborted) return;
@@ -148,7 +157,7 @@ export class ProtocolEngine {
       },
     );
   }
-  private async request(name: string, input: HttpInput) {
+  private async request(name: string, input: HttpInput, grant?: SentinelGrant) {
     throwIfExecutionAborted(this.control.signal);
     const environment = this.context.environment;
     return trace(
@@ -156,6 +165,7 @@ export class ProtocolEngine {
       name,
       auditRequest({
         ...input,
+        ...(grant ? { grantId: grant.id, flow: grant.flow } : {}),
         headers: { ...environment.headers, ...input.headers },
         environmentId: environment.id,
         checkoutMode: this.context.checkoutMode || this.assignment.run.workflow?.checkoutMode || 'custom',
@@ -175,6 +185,8 @@ export class ProtocolEngine {
         const backoff = this.context.retryAfterByOrigin?.[origin];
         if (backoff && backoff > Date.now())
           throw new UpstreamError('上游仍在退避期限内，只保留原付款', 429, null);
+        // The controller/audit round trip may outlive or invalidate a grant.
+        grant?.assertValid();
         const output = await executionOperation(this.control.signal, () =>
           this.transport.request(input, {
             onAttempt: async (attempt) => {
@@ -216,7 +228,12 @@ export class ProtocolEngine {
                     }
                   : {}),
               });
-              if (event.outcome === 'running') await this.assertActive();
+              if (event.outcome === 'running') {
+                // The first attempt was checked immediately before transport dispatch.
+                // A retry needs a fresh check after its backoff.
+                if (event.attempt > 1) await this.assertActive();
+                grant?.assertValid();
+              }
             },
           }),
         );
@@ -278,8 +295,6 @@ export class ProtocolEngine {
         ? { authorization: 'Bearer ' + c.session.accessToken }
         : {}),
       ...(c.accountId ? { 'chatgpt-account-id': c.accountId } : {}),
-      ...(c.sentinel ? { 'openai-sentinel-token': c.sentinel } : {}),
-      ...(c.sentinelSo ? { 'openai-sentinel-so-token': c.sentinelSo } : {}),
       ...(c.metadata?.attestation ? { 'oai-web-deployment-attestation': c.metadata.attestation } : {}),
       ...(c.metadata?.build ? { 'oai-client-build-number': c.metadata.build } : {}),
       ...(c.metadata?.version ? { 'oai-client-version': c.metadata.version } : {}),
@@ -315,13 +330,15 @@ export class ProtocolEngine {
     }
   }
   private async rawChat(name: string, path: string, body?: any, extra?: Record<string, string>) {
+    const flow = body === undefined ? undefined : sentinelWrites[path.split('?')[0]];
+    const grant = flow ? consumeSentinel(this.context, flow) : undefined;
     return (
       await this.request(name, {
         method: body === undefined ? 'GET' : 'POST',
         url: CHAT + path,
-        headers: { ...this.headers(path), ...extra },
+        headers: { ...this.headers(path), ...extra, ...grant?.headers },
         body: body === undefined ? undefined : JSON.stringify(body),
-      })
+      }, grant)
     ).data;
   }
   private async stripe(name: string, path: string, body?: Record<string, any>) {
@@ -409,7 +426,13 @@ export class ProtocolEngine {
             ? explicitCurrency.toUpperCase()
             : currencyConfig?.currency_config?.symbol_code;
         if (!currency) throw new Error('报价接口未返回地区币种');
+        if (typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency))
+          throw new Error('结账币种必须为三位大写货币代码');
         this.context.currency = currency;
+        // Pricing is an unprotected read. Obtain a separate grant only after
+        // all reads, then scope it to this single checkout write.
+        await this.requireSentinel('chatgpt_checkout');
+        this.setStage('checkout');
         const result = await this.chat('创建支付链接', '/backend-api/payments/checkout', {
           plan_name: paymentPlan(this.assignment.run.workflow.plan).planName,
           billing_details: {
@@ -452,7 +475,6 @@ export class ProtocolEngine {
         this.context.customerSessionClientSecret ||= result.customer_session_client_secret;
         this.context.key ||= result.publishable_key || result.stripe_publishable_key;
         this.context.stripeAccount = result.stripe_account;
-        await this.checkpoint('checkout_created');
       }
       this.context.checkoutMode ||= this.context.checkout!.id.startsWith('cs_') ? 'hosted' : 'custom';
       if (!this.context.checkoutTypeLogged) {
@@ -466,7 +488,7 @@ export class ProtocolEngine {
           },
         });
         this.context.checkoutTypeLogged = true;
-        await this.checkpoint('checkout_type_ready');
+        await this.checkpoint('checkout_created');
       }
       if (!this.context.snapshot) {
         await this.requireSentinel('chatgpt_checkout');
@@ -580,7 +602,7 @@ export class ProtocolEngine {
         await this.checkpoint('elements_ready');
       }
       if (!this.context.confirmationToken) {
-        await this.checkpoint('card_preparation');
+        this.setStage('card_preparation');
         const card = await this.command('card');
         try {
           if (this.stripeTokenProvider) {
@@ -707,7 +729,7 @@ export class ProtocolEngine {
         return;
       }
       await this.requireSentinel('checkout_session_approval');
-      await this.checkpoint('merchant_confirm');
+      this.setStage('merchant_confirm');
       await this.command('authorize', { action: 'merchant_confirm' });
       this.assignment.run.paymentSubmitted = true;
       let confirm;
@@ -747,8 +769,8 @@ export class ProtocolEngine {
       const observedIntent = paymentIntentFromResponse(confirm, this.context.intent);
       if (observedIntent) {
         this.context.intent = observedIntent;
-        await this.checkpoint('merchant_intent_ready');
         if (observedIntent.status && observedIntent.status !== 'requires_confirmation' && observedIntent.client_secret) {
+          await this.checkpoint('merchant_intent_ready');
           await this.reconcile();
           return;
         }
@@ -828,7 +850,8 @@ export class ProtocolEngine {
       )
         throw new Error('付款确认响应不属于原 Intent');
       this.context.intent = { ...confirmedIntent, client_secret: clientSecret };
-      await this.checkpoint('stripe_result');
+      // handleIntent persists the result with finish or verification_ready.
+      this.setStage('stripe_result');
       await this.handleIntent();
     } catch (error) {
       if (this.control.signal?.aborted || (error as any)?.code === 'EXECUTION_ABORTED') return;
@@ -927,7 +950,7 @@ export class ProtocolEngine {
     // Authorization is a step within its business phase, not a return to preflight.
     const prefix =
       flow === 'checkout_session_approval' ? 'payment_' : this.context.checkout ? 'checkout_' : '';
-    await this.checkpoint(prefix + 'sentinel_authorization');
+    this.setStage(prefix + 'sentinel_authorization');
     // The configured adapter uses this order's identity and environment.
     // Merchant requests keep their own checkout referer in headers().
     const pageUrl = CHAT + '/';
@@ -967,7 +990,6 @@ export class ProtocolEngine {
         });
       },
     );
-    await this.checkpoint(prefix + 'sentinel_ready');
   }
   private async reconcile() {
     return executionOperation(this.control.signal, () => reconcilePayment(this.services));
