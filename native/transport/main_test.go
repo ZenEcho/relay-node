@@ -1,15 +1,91 @@
 package main
 
 import (
+	"crypto/x509"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	tls "github.com/bogdanfinn/tls-client"
 )
+
+func TestSDKRequestBudgetStopsAnInitialTLSHandshake(t *testing.T) {
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		_, _ = io.WriteString(connection, "HTTP/1.1 200 Connection Established\r\n\r\n")
+		_, _ = io.Copy(io.Discard, connection)
+	}))
+	defer gateway.Close()
+	client, observer, err := newObservedClient("chrome_146", gateway.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	result := performUpstreamRequest(
+		Request{ID: "deadline", Method: "GET", URL: "https://api.stripe.com/relay-test", TimeoutMs: 200},
+		"api.stripe.com", client, observer, map[string]bool{},
+	)
+	diagnostic := result["diagnostic"].(TransportDiagnostic)
+	if result["code"] != "TRANSPORT_BUDGET_EXHAUSTED" || diagnostic.Phase != "tls_handshake" || diagnostic.Reason != "timeout" || diagnostic.ProxyConnectStatus != 200 || diagnostic.RequestWritten || diagnostic.ResponseStarted {
+		t.Fatalf("expected a native budget error before writing to the target: %+v", result)
+	}
+}
+
+func TestSDKRequestBudgetReturnsAnIncompleteResponse(t *testing.T) {
+	for _, http2 := range []bool{false, true} {
+		protocol := "http1"
+		if http2 {
+			protocol = "http2"
+		}
+		t.Run(protocol, func(t *testing.T) {
+			var dispatched atomic.Int32
+			target := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "GET" {
+					_, _ = io.WriteString(w, "ready")
+					return
+				}
+				dispatched.Add(1)
+				w.Header().Set("Request-Id", "req_localFixture")
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = io.WriteString(w, "partial")
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			}))
+			target.EnableHTTP2 = http2
+			target.StartTLS()
+			defer target.Close()
+			roots := x509.NewCertPool()
+			roots.AddCert(target.Certificate())
+			client, observer, err := newObservedClient("chrome_146", "", tls.WithTransportOptions(&tls.TransportOptions{RootCAs: roots}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.CloseIdleConnections()
+			domains := map[string]bool{}
+			result := performUpstreamRequest(
+				Request{ID: "deadline", Method: "POST", URL: target.URL, TimeoutMs: 250,
+					Body: "{}", Headers: map[string]string{"idempotency-key": "loopback-test"}},
+				"127.0.0.1", client, observer, domains,
+			)
+			diagnostic := result["diagnostic"].(TransportDiagnostic)
+			if result["code"] != "TRANSPORT_BUDGET_EXHAUSTED" || result["status"] != http.StatusAccepted || result["partial"] != true || result["body"] != "partial" || diagnostic.Phase != "response_body" || diagnostic.Reason != "timeout" || !diagnostic.RequestWritten || !diagnostic.ResponseStarted {
+				t.Fatalf("expected original incomplete response and timeout diagnostics: %+v", result)
+			}
+			next := performUpstreamRequest(Request{ID: "next", Method: "GET", URL: target.URL, TimeoutMs: 2000}, "127.0.0.1", client, observer, domains)
+			if next["status"] != http.StatusOK || next["body"] != "ready" || dispatched.Load() != 1 {
+				t.Fatalf("the same client should serve the next request without replaying the POST: %+v", next)
+			}
+		})
+	}
+}
 
 func TestTransportErrorCode(t *testing.T) {
 	cases := []struct {

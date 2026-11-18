@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,15 +28,18 @@ type Cookie struct {
 	Expires int64  `json:"expires"`
 }
 type Request struct {
-	ID      string            `json:"id"`
-	Method  string            `json:"method"`
-	URL     string            `json:"url"`
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body"`
-	Profile string            `json:"profile"`
-	Proxy   string            `json:"proxyUrl"`
-	Cookies []Cookie          `json:"cookies"`
+	ID        string            `json:"id"`
+	Method    string            `json:"method"`
+	URL       string            `json:"url"`
+	Headers   map[string]string `json:"headers"`
+	Body      string            `json:"body"`
+	TimeoutMs int               `json:"timeoutMs"`
+	Profile   string            `json:"profile"`
+	Proxy     string            `json:"proxyUrl"`
+	Cookies   []Cookie          `json:"cookies"`
 }
+
+const nativeRequestTimeoutSeconds = 35
 
 var profileMap = map[string]profiles.ClientProfile{"chrome_146": profiles.Chrome_146, "chrome_133": profiles.Chrome_133, "chrome_131": profiles.Chrome_131, "chrome_124": profiles.Chrome_124, "chrome_120": profiles.Chrome_120}
 var hosts = map[string]bool{"chatgpt.com": true, "auth.openai.com": true, "api.stripe.com": true, "m.stripe.com": true, "r.stripe.com": true, "sentinel.openai.com": true, "ipapi.co": true}
@@ -174,52 +178,69 @@ func main() {
 			send(map[string]any{"id": input.ID, "error": "method not permitted"})
 			continue
 		}
-		request, err := newUpstreamRequest(input)
-		if err != nil {
-			send(map[string]any{"id": input.ID, "error": "request invalid"})
-			continue
-		}
-		diagnostic := observer.start()
-		request = diagnostic.attach(request)
-		response, err := client.Do(request)
-		if response != nil {
-			diagnostic.update(func(v *TransportDiagnostic) {
-				v.ResponseStarted = true
-				v.RequestWritten = true
-				v.Phase = "response_body"
-			})
-		}
-		if err != nil {
-			if response != nil && response.Body != nil {
-				_ = response.Body.Close()
-			}
-			send(map[string]any{"id": input.ID, "error": "upstream transport failed", "code": transportErrorCode(err), "diagnostic": diagnostic.finish(err)})
-			continue
-		}
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, 8*1024*1024+1))
-		response.Body.Close()
-		if readErr != nil || len(body) > 8*1024*1024 {
-			code := "UPSTREAM_READ_FAILED"
-			if len(body) > 8*1024*1024 {
-				code = "UPSTREAM_RESPONSE_TOO_LARGE"
-				body = body[:8*1024*1024]
-				readErr = errors.New("response limit reached")
-			}
-			send(map[string]any{"id": input.ID, "error": "response read failed", "code": code, "status": response.StatusCode, "headers": response.Header, "body": string(body), "partial": true, "diagnostic": diagnostic.finish(readErr)})
-			continue
-		}
-		domains[u.Hostname()] = true
-		cookies := []Cookie{}
-		for domain := range domains {
-			target, _ := url.Parse("https://" + domain + "/")
-			for _, c := range client.GetCookies(target) {
-				expires := int64(0)
-				if !c.Expires.IsZero() {
-					expires = c.Expires.Unix()
-				}
-				cookies = append(cookies, Cookie{c.Name, c.Value, domain, c.Path, c.Secure, expires})
-			}
-		}
-		send(map[string]any{"id": input.ID, "status": response.StatusCode, "headers": response.Header, "body": string(body), "cookies": cookies, "diagnostic": diagnostic.finish(nil)})
+		send(performUpstreamRequest(input, u.Hostname(), client, observer, domains))
 	}
+}
+
+func performUpstreamRequest(input Request, hostname string, client tls.HttpClient, observer *transportObserver, domains map[string]bool) map[string]any {
+	request, err := newUpstreamRequest(input)
+	if err != nil {
+		return map[string]any{"id": input.ID, "error": "request invalid"}
+	}
+	// Apply the SDK budget only when it gives the request an earlier deadline
+	// than the client's existing timeout.
+	if input.TimeoutMs > 0 && input.TimeoutMs < nativeRequestTimeoutSeconds*1000 {
+		ctx, cancel := context.WithTimeout(request.Context(), time.Duration(input.TimeoutMs)*time.Millisecond)
+		defer cancel()
+		request = request.WithContext(ctx)
+	}
+	diagnostic := observer.start()
+	request = diagnostic.attach(request)
+	response, err := client.Do(request)
+	if response != nil {
+		diagnostic.update(func(v *TransportDiagnostic) {
+			v.ResponseStarted = true
+			v.RequestWritten = true
+			v.Phase = "response_body"
+		})
+	}
+	if err != nil {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		code := transportErrorCode(err)
+		detail := diagnostic.finish(err)
+		if detail.Reason == "timeout" && errors.Is(request.Context().Err(), context.DeadlineExceeded) {
+			code = "TRANSPORT_BUDGET_EXHAUSTED"
+		}
+		return map[string]any{"id": input.ID, "error": "upstream transport failed", "code": code, "diagnostic": detail}
+	}
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, 8*1024*1024+1))
+	response.Body.Close()
+	if readErr != nil || len(body) > 8*1024*1024 {
+		code := "UPSTREAM_READ_FAILED"
+		if len(body) > 8*1024*1024 {
+			code = "UPSTREAM_RESPONSE_TOO_LARGE"
+			body = body[:8*1024*1024]
+			readErr = errors.New("response limit reached")
+		}
+		detail := diagnostic.finish(readErr)
+		if detail.Reason == "timeout" && errors.Is(request.Context().Err(), context.DeadlineExceeded) {
+			code = "TRANSPORT_BUDGET_EXHAUSTED"
+		}
+		return map[string]any{"id": input.ID, "error": "response read failed", "code": code, "status": response.StatusCode, "headers": response.Header, "body": string(body), "partial": true, "diagnostic": detail}
+	}
+	domains[hostname] = true
+	cookies := []Cookie{}
+	for domain := range domains {
+		target, _ := url.Parse("https://" + domain + "/")
+		for _, c := range client.GetCookies(target) {
+			expires := int64(0)
+			if !c.Expires.IsZero() {
+				expires = c.Expires.Unix()
+			}
+			cookies = append(cookies, Cookie{c.Name, c.Value, domain, c.Path, c.Secure, expires})
+		}
+	}
+	return map[string]any{"id": input.ID, "status": response.StatusCode, "headers": response.Header, "body": string(body), "cookies": cookies, "diagnostic": diagnostic.finish(nil)}
 }

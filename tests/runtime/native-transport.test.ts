@@ -38,6 +38,10 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
  if(message.method==='initialize'||message.method==='reset_connections'){send({ready:true});return;}
  requests++;
  if(scenario==='budget'){setTimeout(()=>send({status:200,headers:{},body:'{}'}),1000);return;}
+ if(scenario==='native-budget'){
+   if(requests===1){send({error:'response read failed',code:'TRANSPORT_BUDGET_EXHAUSTED',status:202,headers:{'request-id':['req_fixture']},body:'partial',partial:true,diagnostic:{phase:'response_body',reason:'timeout',requestWritten:true,responseStarted:true}});return;}
+   send({status:200,headers:{},body:'{}'});return;
+ }
  if(scenario==='http403'||scenario==='http429'){send({status:scenario==='http403'?403:429,headers:{'cf-mitigated':['challenge']},body:'{}',diagnostic:{phase:'complete',elapsedMs:1}});return;}
  if(scenario==='recover'&&requests>1){send({status:200,headers:{},body:'{"ok":true}',cookies:[{name:'device',value:'updated',domain:'chatgpt.com'}],diagnostic:{phase:'complete',elapsedMs:2,rawError:'private-success-error'}});return;}
  let code='UPSTREAM_CONNECTION_CLOSED',d={...diagnostic};
@@ -294,6 +298,30 @@ test('the overall retry budget terminates a hanging helper and records budget ex
   });
   assert.ok(Date.now() - started < 1500);
   assert.equal((await f.records()).filter((x) => x.method === 'GET').length, 1);
+});
+
+test('a budget-aware helper can return incomplete evidence without being killed or replaying the request', async (t) => {
+  const f = await fixture(t, 'native-budget', { retryBudgetMs: 1000 });
+  await assert.rejects(f.transport.request({ ...get, method: 'POST', body: '{}' }), (error: NativeTransportError) => {
+    assert.equal(error.code, 'TRANSPORT_BUDGET_EXHAUSTED');
+    assert.equal(error.diagnostic?.phase, 'response_body');
+    assert.equal(error.diagnostic?.reason, 'timeout');
+    assert.equal(error.transportAttempts?.[0].retryStopReason, 'budget_exhausted');
+    assert.deepEqual(error.httpResponse, {
+      status: 202,
+      headers: { 'request-id': ['req_fixture'] },
+      body: 'partial',
+      partial: true,
+    });
+    return true;
+  });
+  assert.equal((await f.transport.request(get)).status, 200);
+  const [initialize, post, read] = await f.records();
+  assert.deepEqual([initialize.method, post.method, read.method], ['initialize', 'POST', 'GET']);
+  assert.equal(initialize.timeoutMs, undefined);
+  for (const message of [post, read]) {
+    assert.ok(Number.isInteger(message.timeoutMs) && message.timeoutMs > 0 && message.timeoutMs <= 900);
+  }
 });
 
 test('a retry reset cannot race a concurrent request in the same transport', async (t) => {

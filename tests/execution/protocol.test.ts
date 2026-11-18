@@ -118,6 +118,8 @@ async function execute(
     customerSession?: string;
     snapshotCustomerSession?: string;
     checkoutConfigurationOnly?: boolean;
+    checkoutStripe?: Record<string, unknown>;
+    taxStripe?: Record<string, unknown>;
     snapshotConfirmReturnUrl?: string;
     omitMerchantReturnUrl?: boolean;
     stripeAccount?: string;
@@ -125,7 +127,6 @@ async function execute(
     sdkWrongCard?: boolean;
     tokenResponse?: (input: HttpInput, cancellation: AbortController) => Promise<HttpOutput>;
     tokenData?: any;
-    tokenStatus?: number;
     intentResponse?: (input: HttpInput) => HttpOutput;
     merchantDisconnect?: boolean;
     merchantData?: any;
@@ -238,6 +239,16 @@ async function execute(
         return options.checkoutReadResponse;
       if (url.pathname === '/backend-api/payments/checkout' && options.checkoutResponse)
         return options.checkoutResponse;
+      if (url.pathname.endsWith('/payments/checkout') && options.checkoutStripe) {
+        const response = await super.request(input);
+        Object.assign(response.data, options.checkoutStripe);
+        return response;
+      }
+      if (url.pathname.endsWith('/checkout/taxes') && options.taxStripe) {
+        const response = await super.request(input);
+        Object.assign(response.data.checkout_session, options.taxStripe);
+        return response;
+      }
       if (url.pathname.endsWith('/payments/checkout') && options.checkoutConfigurationOnly) {
         const response = await super.request(input);
         Object.assign(response.data, { publishable_key: 'pk_test_original', customer_session_client_secret: 'cuss_original', confirm_return_url: 'https://chatgpt.com/checkout/verify?stripe_session_id=' + response.data.internal_checkout_session_id });
@@ -329,12 +340,12 @@ async function execute(
       }
       if (url.pathname.endsWith('/confirmation_tokens')) {
         if (options.tokenResponse) return options.tokenResponse(input, cancellation);
-        if (options.tokenData || options.tokenStatus)
+        if (options.tokenData)
           return {
-            status: options.tokenStatus || 200,
+            status: 200,
             headers: {},
-            body: JSON.stringify(options.tokenData || {}),
-            data: options.tokenData || {},
+            body: JSON.stringify(options.tokenData),
+            data: options.tokenData,
           };
       }
       if (url.pathname.startsWith('/v1/payment_pages/') && input.method === 'GET' && options.hostedPageStatus)
@@ -420,6 +431,39 @@ test('custom execution persists recovery boundaries without redundant phase or a
   assert.equal(result.commands.filter((c) => c.action === 'card').length, 1);
   assert.deepEqual(result.commands.filter((c) => c.action === 'authorize').map((c) => c.body.action),
     ['merchant_confirm', 'stripe_confirm', 'registration']);
+});
+
+test('Stripe requests retain the connected account when the tax response omits it', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    checkoutStripe: { publishable_key: 'pk_test_demo', stripe_account: 'acct_original' },
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const stripe = result.requests.filter((request) => new URL(request.url).hostname === 'api.stripe.com');
+  assert.ok(stripe.length > 0);
+  assert.ok(stripe.every((request) => request.headers?.['Stripe-Account'] === 'acct_original'));
+});
+
+test('conflicting or invalid Stripe configuration stops before Stripe calls and card selection', async () => {
+  for (const options of [
+    { checkoutStripe: { publishable_key: 'pk_test_original' }, error: /publishable key 前后不一致/ },
+    {
+      checkoutStripe: { stripe_account: 'acct_original' },
+      taxStripe: { stripe_account: 'acct_other' },
+      error: /Stripe-Account 前后不一致/,
+    },
+    { taxStripe: { livemode: true }, error: /Stripe 环境与 publishable key 不一致/ },
+    { checkoutStripe: { publishable_key: 'sk_test_misrouted' }, error: /publishable key 格式无效/ },
+  ]) {
+    const result = await execute({ demo: false, authorizer: boundAuthorizer, ...options });
+    assert.equal(result.finish.status, 'failed');
+    assert.equal(result.finish.failureRetryable, false);
+    assert.match(result.finish.error, options.error);
+    assert.doesNotMatch(result.finish.error, /sk_test_misrouted|acct_other/);
+    assert.equal(result.requests.some((request) => new URL(request.url).hostname === 'api.stripe.com'), false);
+    assert.equal(result.commands.some(({ action }) => action === 'card' || action === 'authorize'), false);
+  }
 });
 
 test('native first-attempt audits share the dispatch guard while retries get a fresh guard', async () => {
@@ -983,7 +1027,28 @@ for (const failure of [
         message: 'This publishable key tokenization request is required to use the Stripe SDK.',
       },
     },
-    message: /HTTP 400.*required to use the Stripe SDK/,
+    message: /HTTP 400.*官方 Stripe SDK/,
+    code: 'STRIPE_SDK_REQUIRED',
+  },
+  {
+    name: 'Stripe authentication failure',
+    status: 401,
+    data: { error: { type: 'invalid_request_error', message: 'upstream-sensitive-diagnostic' } },
+    message: /HTTP 401.*无法认证/,
+    code: 'STRIPE_AUTHENTICATION_FAILED',
+  },
+  {
+    name: 'Stripe permission failure',
+    status: 403,
+    data: { error: { type: 'invalid_request_error', message: 'upstream-sensitive-diagnostic' } },
+    message: /HTTP 403.*拒绝.*权限/,
+    code: 'STRIPE_PERMISSION_DENIED',
+  },
+  {
+    name: 'an unclassified gateway denial',
+    status: 403,
+    data: { error: { type: 'invalid_request_error', message: 'gateway refused the request' } },
+    message: /HTTP 403.*gateway refused/,
   },
   {
     name: 'an API rejection',
@@ -1011,11 +1076,29 @@ for (const failure of [
     const result = await execute({
       demo: false,
       authorizer: boundAuthorizer,
-      tokenStatus: failure.status,
-      tokenData: failure.data,
+      tokenResponse: async () => {
+        const headers: HttpOutput['headers'] = failure.code
+          ? { 'Request-Id': ['req_StripeFailure1'], 'X-Debug': ['upstream-sensitive-diagnostic'] }
+          : {};
+        return { status: failure.status, headers, data: failure.data, body: JSON.stringify(failure.data) };
+      },
     });
     assert.equal(result.finish.status, 'failed');
     assert.match(result.finish.error, failure.message);
+    assert.equal(result.finish.failureRetryable, failure.code ? false : undefined);
+    if (failure.code) {
+      const step = result.commands.find(({ action, body }) =>
+        action === 'step' && body.step.name === '创建原卡确认令牌' && body.step.status === 'failed',
+      )!.body.step;
+      assert.deepEqual(step.response.stripe, {
+        code: failure.code,
+        type: 'invalid_request_error',
+        requestId: 'req_StripeFailure1',
+      });
+      assert.equal(step.httpStatus, failure.status);
+      assert.equal(step.errorDetail.code, failure.code);
+      assert.ok(!JSON.stringify(result.commands).includes('upstream-sensitive-diagnostic'));
+    }
     assert.equal(result.assignment.run.paymentSubmitted, false);
     assert.equal(result.assignment.context.confirmationToken, undefined);
     assert.equal(result.requests.filter((r) => r.url.endsWith('/confirmation_tokens')).length, 1);
@@ -1024,6 +1107,47 @@ for (const failure of [
     assert.deepEqual(result.card, { number: '', cvc: '', expiry: '' });
   });
 }
+
+test('Stripe permission failure on confirmation leaves the original payment in read-only reconciliation', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    intentResponse(input) {
+      const url = new URL(input.url);
+      const data = {
+        error: {
+          type: 'invalid_request_error',
+          message: 'missing permission',
+          payment_intent: {
+            id: url.pathname.split('/')[3],
+            client_secret: new URLSearchParams(input.body ?? url.search).get('client_secret'),
+            status: 'requires_payment_method',
+            last_payment_error: { type: 'card_error', code: 'card_declined' },
+          },
+        },
+      };
+      return { status: 403, headers: { 'request-id': ['req_StripePermission1'] }, data, body: JSON.stringify(data) };
+    },
+  });
+  assert.equal(result.finish.status, 'pending_confirmation');
+  assert.equal(result.finish.paymentOutcome, undefined);
+  assert.equal(result.finish.failureRetryable, false);
+  assert.equal(result.assignment.run.paymentSubmitted, true);
+  const intent = result.assignment.context.intent!;
+  assert.notEqual(intent.status, 'requires_payment_method');
+
+  const requestCount = result.requests.length;
+  const commandCount = result.commands.length;
+  await new ProtocolEngine(result.assignment, result.control, result.transport, boundAuthorizer).execute();
+  assert.deepEqual(
+    result.requests.slice(requestCount).map(({ method, url }) => [method, new URL(url).pathname]),
+    [['GET', '/v1/payment_intents/' + intent.id]],
+  );
+  assert.ok(!result.commands.slice(commandCount).some((c) => ['card', 'authorize'].includes(c.action)));
+  const recovered = result.commands.filter((c) => c.action === 'finish').at(-1)!.body;
+  assert.equal(recovered.status, 'pending_confirmation');
+  assert.equal(recovered.paymentOutcome, undefined);
+});
 
 for (const status of [200, 402]) {
   test(`an insufficient-funds Intent response (${status}) fails and recovery never repeats payment writes`, async () => {

@@ -68,6 +68,11 @@ Custom 流程先读取地区报价，再在建单、更新税费和商户付款�
 
 参考桥错误只记录固定的脱敏分类；仅已识别的临时网络错误在当前阶段重试一次，身份、flow、令牌格式和证明校验失败不进行阶段重试。 执行失败时，节点通过结束回执传递明确的 `failureRetryable` 标记；控制台可据此停止付款派发前的新执行尝试。
 
+### 支付运行时诊断
+
+- Stripe 配置在原结账与计税快照间绑定。发布密钥或 `Stripe-Account` 冲突、以及上游明确返回的 `livemode` 与密钥不符时，在取卡前停止。Stripe 明确要求官方 SDK，或返回带 `Request-Id` 的结构化认证及权限错误时，节点记录脱敏分类，派发前停止自动重试，派发后继续核对原付款。参考 [Stripe Node SDK](https://github.com/stripe/stripe-node/releases/tag/v23.1.0)、[Connect 账户绑定](https://docs.stripe.com/connect/authentication) 和 [Request ID](https://docs.stripe.com/api/request_ids)。
+- 原生 HTTP 组件接收每次请求的剩余时间预算，预算较短时用 Go 请求上下文约束 TLS、响应头及响应体读取。若读取中途到期，保留已收到的 HTTP 状态和响应片段供审计。独立的进程超时保护仍处理原生组件失去响应的情况。付款 POST 保持单次派发。参考 [Go HTTP 请求上下文](https://pkg.go.dev/net/http#NewRequestWithContext)。
+
 ## 后端 Sentinel 参考运行时
 
 节点默认使用 [gpt-subscribe-studio-1](https://github.com/crhywun/gpt-subscribe-studio-1/tree/adccdfc993e368f2c09bad7081885c6daff2d320) 的 Node VM、浏览器环境 shim 和 PoW 方案。Sentinel 由后端 reference 桥签发，Stripe 令牌通过 HTTP API 创建。正式节点包与 SDK 已包含固定校验的参考桥及 undici；新安装节点自动配置 `reference`，未配置 Sentinel 的旧节点更新后使用新版随包参考桥。安装和更新无需系统 npm。参考桥失败或缺失会停止，不会自动切换模式、代理或账号。

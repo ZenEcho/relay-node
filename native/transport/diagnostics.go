@@ -171,7 +171,7 @@ func newObservedClient(profileName, proxyURL string, extraOptions ...tls.HttpCli
 		return nil, nil, errors.New("unsupported TLS profile")
 	}
 	options := []tls.HttpClientOption{
-		tls.WithTimeoutSeconds(35), tls.WithClientProfile(profile),
+		tls.WithTimeoutSeconds(nativeRequestTimeoutSeconds), tls.WithClientProfile(profile),
 		tls.WithCookieJar(tls.NewCookieJar()), tls.WithNotFollowRedirects(),
 	}
 	options = append(options, extraOptions...)

@@ -296,14 +296,19 @@ export class NativeTransport implements Transport {
         this.active(generation);
         const requestRemaining = deadline - Date.now();
         if (requestRemaining <= 0) fail(new NativeTransportError('TRANSPORT_BUDGET_EXHAUSTED'));
+        const watchdogMs = Math.min(45000, requestRemaining);
+        // Leave time for the helper to return the last phase and any partial
+        // response before the process watchdog has to stop it.
+        const timeoutMs = watchdogMs - Math.min(250, Math.floor(watchdogMs / 10));
         response = await this.rpc(
           {
             method: input.method,
             url: input.url,
             body: input.body,
+            timeoutMs,
             headers: { ...this.environment!.headers, ...input.headers },
           },
-          Math.min(45000, requestRemaining),
+          watchdogMs,
           requestRemaining <= 45000 ? 'TRANSPORT_BUDGET_EXHAUSTED' : 'NATIVE_TRANSPORT_TIMEOUT',
         );
       } catch (caught) {

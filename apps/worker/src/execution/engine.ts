@@ -13,8 +13,10 @@ import { handlePaymentIntent } from './payment-intent.js';
 import { paymentIntentFromResponse } from './intent-binding.js';
 import { cleanupExecution } from './cleanup.js';
 import { UpstreamError, form } from './http-utils.js';
+import { stripeIntegrationError } from './stripe-response.js';
 import { trace, auditError, auditRequest, type AuditEntry } from '../../../../packages/runtime/src/audit.js';
 import { retryAfterMs } from '../../../../packages/rules/src/http.js';
+import { bindStripeCheckoutConfiguration } from './stripe-configuration.js';
 import { randomInt, randomUUID } from 'node:crypto';
 import type { Assignment, Control } from '../runtime/controller.js';
 import { NativeTransportError, type Transport, type HttpInput } from '../transport/native.js';
@@ -181,7 +183,7 @@ export class ProtocolEngine {
       }),
       async (capture) => {
         await this.assertActive();
-        const origin = new URL(input.url).origin;
+        const { origin, pathname } = new URL(input.url);
         const backoff = this.context.retryAfterByOrigin?.[origin];
         if (backoff && backoff > Date.now())
           throw new UpstreamError('上游仍在退避期限内，只保留原付款', 429, null);
@@ -238,11 +240,13 @@ export class ProtocolEngine {
           }),
         );
         throwIfExecutionAborted(this.control.signal);
+        const integrationFailure = origin === STRIPE ? stripeIntegrationError(pathname, input.method, output) : undefined;
         capture(
           {
             status: output.status,
-            headers: output.headers,
-            body: output.data ?? output.body,
+            ...(integrationFailure
+              ? { stripe: integrationFailure.response }
+              : { headers: output.headers, body: output.data ?? output.body }),
             diagnostic: transportDiagnostic(output.diagnostic),
             transportAttempts: transportAttempts(output.transportAttempts),
           },
@@ -259,6 +263,7 @@ export class ProtocolEngine {
             ...(Object.values(this.context.retryAfterByOrigin) as number[]),
           );
         }
+        if (integrationFailure) throw integrationFailure;
         if (output.status < 200 || output.status >= 300)
           throw new UpstreamError(
             `HTTP ${output.status}：${output.data?.error?.message || output.data?.detail || output.data?.message || name}`,
@@ -394,6 +399,7 @@ export class ProtocolEngine {
         await this.cleanup();
         return;
       }
+      bindStripeCheckoutConfiguration(this.context);
       if (this.assignment.mode === 'reconcile' || this.assignment.run.paymentSubmitted) {
         await this.reconcile();
         return;
@@ -476,8 +482,7 @@ export class ProtocolEngine {
         // subsequent tax snapshots may omit these optional fields.
         this.context.confirmReturnUrl = result.confirm_return_url;
         this.context.customerSessionClientSecret ||= result.customer_session_client_secret;
-        this.context.key ||= result.publishable_key || result.stripe_publishable_key;
-        this.context.stripeAccount = result.stripe_account;
+        bindStripeCheckoutConfiguration(this.context, result);
       }
       this.context.checkoutMode ||= this.context.checkout!.id.startsWith('cs_') ? 'hosted' : 'custom';
       if (!this.context.checkoutTypeLogged) {
@@ -493,7 +498,8 @@ export class ProtocolEngine {
         this.context.checkoutTypeLogged = true;
         await this.checkpoint('checkout_created');
       }
-      if (!this.context.snapshot) {
+      const taxesNeeded = !this.context.snapshot;
+      if (taxesNeeded) {
         await this.requireSentinel('chatgpt_checkout');
         const taxes = await this.chat('更新原结账税费', '/backend-api/payments/checkout/taxes', {
           checkout_session_id: this.context.checkout!.id,
@@ -516,7 +522,6 @@ export class ProtocolEngine {
         this.context.confirmReturnUrl =
           this.context.snapshot.confirm_return_url || taxes.confirm_return_url || this.context.confirmReturnUrl;
         this.context.customerSessionClientSecret ||= this.context.snapshot.customer_session_client_secret;
-        this.context.snapshot.stripe_account ||= this.context.stripeAccount;
         this.context.snapshot.amount_total ??= taxes.snapshot?.amount_total;
         this.context.snapshot.currency ??= taxes.snapshot?.currency;
         if (this.context.snapshot.id && this.context.snapshot.id !== this.context.checkout!.id)
@@ -526,36 +531,28 @@ export class ProtocolEngine {
           this.context.snapshot.processor_entity !== this.context.checkout!.processor_entity
         )
           throw new Error('计税响应处理方不匹配');
-        this.context.key =
-          this.context.snapshot.publishable_key ||
-          this.context.snapshot.stripe_publishable_key ||
-          this.context.snapshot.stripe?.publishable_key ||
-          this.context.key ||
-          (this.context.checkoutMode === 'hosted'
-            ? hostedPublishableKey(
-                this.context.snapshot.url || this.context.checkout!.url,
-                this.context.checkout!.id,
-              )
-            : undefined) ||
-          (this.context.checkoutMode === 'hosted' ? referenceHostedKey : undefined);
-        if (!this.context.key)
-          this.context.key = (
-            await this.chat('读取付款组件配置', '/backend-api/payments/stripe_client_bootstrap', {})
-          ).publishable_key;
-        if (!this.context.key) throw new Error('原结账缺少 Stripe publishable key');
-        await this.checkpoint('taxes_ready');
       }
+      const hosted = this.context.checkoutMode === 'hosted';
+      bindStripeCheckoutConfiguration(
+        this.context,
+        this.context.snapshot,
+        hosted
+          ? hostedPublishableKey(
+              this.context.snapshot.url || this.context.checkout!.url,
+              this.context.checkout!.id,
+            ) || referenceHostedKey
+          : undefined,
+      );
+      if (!this.context.key && taxesNeeded) {
+        const configuration = await this.chat('读取付款组件配置', '/backend-api/payments/stripe_client_bootstrap', {});
+        bindStripeCheckoutConfiguration(this.context, this.context.snapshot, configuration.publishable_key);
+      }
+      if (!this.context.key) throw new Error('原结账缺少 Stripe publishable key');
+      if (taxesNeeded) await this.checkpoint('taxes_ready');
       // Older checkpoints may carry these only on the checkout snapshot.
       this.context.confirmReturnUrl ||= this.context.snapshot.confirm_return_url;
       this.context.customerSessionClientSecret ||= this.context.snapshot.customer_session_client_secret;
-      if (this.context.checkoutMode === 'hosted') {
-        this.context.key ||= hostedPublishableKey(
-          this.context.snapshot.url || this.context.checkout!.url,
-          this.context.checkout!.id,
-        );
-        this.context.key ||= referenceHostedKey;
-        await prepareHostedCheckout(this.services);
-      }
+      if (hosted) await prepareHostedCheckout(this.services);
       const amount =
         this.context.snapshot.amount_total ??
         this.context.snapshot.checkout_state?.total?.total?.minorUnitsAmount;
