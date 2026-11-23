@@ -2,9 +2,39 @@ import { inspectEgress } from '../../../../packages/runtime/src/egress.js';
 import { digest } from '../../../../packages/runtime/src/security.js';
 import { isIP } from 'node:net';
 import { bindBillingEmail, selectBillingEmail } from '../../../../packages/rules/src/billing-email.js';
-import { verifySessionIdentity } from './credentials.js';
+import { hasChatgptSessionCookie, verifySessionIdentity } from './credentials.js';
 import { UpstreamError } from './http-utils.js';
 import type { ExecutionServices } from './services.js';
+
+async function readCheckoutSession(services: ExecutionServices) {
+  const context = services.context;
+  const originalCookies = context.environment.cookies;
+  const originalAccount =
+    context.accountId || context.session?.account?.id || context.session?.account?.account_id;
+  const originalUser = context.userId || context.session?.user?.id;
+  try {
+    const session = await services.chat('建单前读取最新 Session', '/api/auth/session', undefined, {
+      'cache-control': 'no-cache',
+    });
+    const accountId = session?.account?.id || session?.account?.account_id;
+    const userId = session?.user?.id;
+    verifySessionIdentity(
+      { ...context, accountId: originalAccount || accountId, userId: originalUser },
+      session,
+    );
+    if ((originalAccount && !accountId) || (originalUser && !userId))
+      throw new Error('最新 Session 缺少原账号或用户标识，无法确认本单登录身份');
+    if (session.expires && !(Date.parse(session.expires) > Date.now()))
+      throw new Error('Session 已过期，请重新登录并获取新的 Session');
+    context.session = { ...session, accessToken: session.accessToken || session.access_token };
+    context.accountId ||= accountId;
+    context.userId ||= userId;
+  } catch (error) {
+    context.environment.cookies = originalCookies;
+    throw error;
+  }
+}
+
 export async function preflightExecution(services: ExecutionServices) {
   if (!services.context.proxyVerified) {
     await services.checkpoint('proxy_check');
@@ -53,7 +83,13 @@ export async function preflightExecution(services: ExecutionServices) {
       ),
       { code: 'PROXY_COUNTRY_MISMATCH' },
     );
-  if (
+  const readLatestSession =
+    services.assignment.paymentEnabled &&
+    !services.assignment.demo &&
+    !services.context.checkout &&
+    hasChatgptSessionCookie(services.context.environment.cookies);
+  if (readLatestSession) await readCheckoutSession(services);
+  else if (
     !services.context.session?.accessToken ||
     (!services.context.billingEmailBinding &&
       selectBillingEmail('chatgpt', services.context.session).source !== 'session')
@@ -82,7 +118,7 @@ export async function preflightExecution(services: ExecutionServices) {
       });
   } else bindBillingEmail(services.context, 'chatgpt');
   services.assignment.billing = services.context.billing || undefined;
-  if (!services.context.originalSubscription) {
+  if (readLatestSession || !services.context.originalSubscription) {
     await services.checkpoint('subscription_check');
     const info = await services.chat(
       '查询原账号订阅',
@@ -96,6 +132,12 @@ export async function preflightExecution(services: ExecutionServices) {
     if (!accountId) throw new Error('订阅查询未返回原账号');
     if (services.context.accountId && services.context.accountId !== accountId)
       throw new Error('订阅账号与原凭证不一致');
+    if (readLatestSession)
+      verifySessionIdentity(services.context, {
+        accessToken: services.context.session?.accessToken,
+        account: selected.account,
+        user: info.user,
+      });
     services.context.accountId = accountId;
     services.context.userId ||= info.user?.id;
     services.context.originalSubscription = selected.entitlement || {};

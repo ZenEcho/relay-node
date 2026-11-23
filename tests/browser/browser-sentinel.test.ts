@@ -178,7 +178,7 @@ test('a missing SDK is loaded from the official same-origin endpoint before norm
   };
   f.page.document.head = {
     appendChild(value: any) {
-      assert.equal(value.src, 'https://chatgpt.com/backend-api/sentinel/sdk.js');
+      assert.equal(value.src, 'https://chatgpt.com/backend-api/sentinel/sdk.js?no_universal_links=1');
       value.onload();
       setTimeout(() => {
         f.page.SentinelSDK = sdk;

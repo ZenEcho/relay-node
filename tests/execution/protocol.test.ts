@@ -16,6 +16,12 @@ const boundAuthorizer: SentinelAuthorizer = async (request) => ({
   expiresAt: new Date(Date.now() + 60000).toISOString(),
 });
 
+const latestLoginSession = {
+  access_token: 'latest-session-access',
+  account: { id: 'demo-account' },
+  user: { id: 'demo-user', email: 'latest@example.invalid' },
+};
+
 for (const [name, hints, expected] of [
   ['explicit non-retryable failure', { retryable: false }, false],
   ['non-retryable runtime diagnostic', { runtimeDiagnostic: { retryable: false } }, false],
@@ -81,9 +87,13 @@ test('token-only credentials read the authenticated Session email before binding
 
 test('a resumed accepted binding survives a different newly imported Session email', async () => {
   const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    hasLoginSession: true,
     credentialUserEmail: 'new-session@example.invalid',
     defaultBillingEmail: 'new-default@example.invalid',
     boundBillingEmail: 'accepted@example.invalid',
+    sessionResponse: { status: 200, data: latestLoginSession },
   });
   assert.equal(result.finish.status, 'completed', result.finish.error);
   const tax = result.requests.find((request) => request.url.endsWith('/checkout/taxes'))!;
@@ -102,6 +112,56 @@ test('an invalid authenticated Session email falls back after the Session read a
   const tax = result.requests.find((request) => request.url.endsWith('/checkout/taxes'))!;
   assert.equal(JSON.parse(tax.body!).checkout_email, 'default@example.invalid');
 });
+
+for (const checkoutMode of ['custom', 'hosted'] as const) {
+  test(`${checkoutMode} reads the latest Session before the first checkout even with saved subscription preflight`, async () => {
+    const result = await execute({
+      checkoutMode,
+      demo: false,
+      authorizer: boundAuthorizer,
+      credentialUserEmail: 'saved@example.invalid',
+      hasLoginSession: true,
+      resumed: true,
+      sessionResponse: { status: 200, data: latestLoginSession },
+    });
+    assert.equal(result.finish.status, 'completed', result.finish.error);
+    const reads = result.requests.filter((request) => new URL(request.url).pathname === '/api/auth/session');
+    assert.equal(reads.length, 1);
+    assert.equal(reads[0].method, 'GET');
+    assert.equal(new URL(reads[0].url).search, '');
+    assert.equal(reads[0].headers?.['cache-control'], 'no-cache');
+    assert.equal(reads[0].headers?.authorization, undefined);
+    for (const path of ['/accounts/check/', '/checkout_pricing_config/', '/payments/checkout']) {
+      const request = result.requests.find((entry) => entry.url.includes(path))!;
+      assert.ok(result.requests.indexOf(request) > result.requests.indexOf(reads[0]));
+      assert.equal(request.headers?.authorization, 'Bearer ' + latestLoginSession.access_token);
+    }
+    assert.equal(result.finish.context.billingEmailBinding.email, latestLoginSession.user.email);
+  });
+}
+
+for (const [name, sessionResponse, expected] of [
+  ['upstream refusal', { status: 403, data: { detail: 'Session request refused' } }, /Session request refused/],
+  ['foreign account', { status: 200, data: { ...latestLoginSession, account: { id: 'other' } } }, /账号与原订单不一致/],
+  ['foreign user', { status: 200, data: { ...latestLoginSession, user: { id: 'other' } } }, /用户与原订单不一致/],
+  ['unconfirmed user', { status: 200, data: { ...latestLoginSession, user: {} } }, /缺少原账号或用户标识/],
+] as const) {
+  test(`checkout stops before pricing and authorization on ${name} during the Session read`, async () => {
+    const result = await execute({
+      demo: false,
+      authorizer: async () => assert.fail('checkout authorization must not run'),
+      credentialUserEmail: 'saved@example.invalid',
+      hasLoginSession: true,
+      sessionResponse,
+    });
+    assert.equal(result.finish.status, 'failed');
+    assert.match(result.finish.error, expected);
+    assert.equal(result.finish.context.session.accessToken, 'test-access');
+    assert.equal(result.requests.filter((request) => request.url.endsWith('/api/auth/session')).length, 1);
+    assert.ok(!result.requests.some((request) => request.url.includes('/checkout_pricing_config/')));
+    assert.ok(!result.requests.some((request) => request.method === 'POST'));
+  });
+}
 
 async function execute(
   options: {
@@ -138,6 +198,8 @@ async function execute(
     hostedKeyMissing?: boolean;
     hostedPageStatus?: number;
     credentialUserEmail?: string;
+    hasLoginSession?: boolean;
+    sessionResponse?: Pick<HttpOutput, 'status' | 'data'>;
     refreshedUserEmail?: string;
     defaultBillingEmail?: string;
     billingPhone?: string;
@@ -170,7 +232,10 @@ async function execute(
       credential: JSON.stringify({
         accessToken: 'test-access',
         account: { id: 'demo-account' },
-        ...(options.credentialUserEmail ? { user: { email: options.credentialUserEmail } } : {}),
+        ...(options.hasLoginSession ? { sessionToken: 'fixture-login-session' } : {}),
+        ...(options.credentialUserEmail
+          ? { user: { id: 'demo-user', email: options.credentialUserEmail } }
+          : {}),
       }),
       customerSessionClientSecret: options.customerSession,
       ...(options.boundBillingEmail
@@ -261,6 +326,10 @@ async function execute(
       }
       if (url.pathname.includes('/checkout/openai_llc/') && options.merchantData?.status === 'subscription_limit' && !options.merchantData.client_secret && !options.merchantData.payment_intent) {
         return { status: 200, headers: {}, body: '', data: { checkout_session: { id: JSON.parse(requests.find(request => request.url.endsWith('/checkout/confirm'))!.body!).checkout_session_id, status: 'open', payment_status: 'unpaid' } } };
+      }
+      if (url.pathname === '/api/auth/session' && options.sessionResponse) {
+        const { status, data } = options.sessionResponse;
+        return { status, headers: {}, body: JSON.stringify(data), data };
       }
       if (url.pathname === '/api/auth/session' && options.refreshedUserEmail) {
         const response = await super.request(input);
@@ -577,10 +646,17 @@ test('an environment change inside the native attempt audit blocks the wire requ
 
 test('an unusual-activity checkout refusal retains the upstream diagnostic without replay or card access', async () => {
   const detail = 'Our systems have detected unusual activity. Please try again later.';
-  const result = await execute({ checkoutResponse: { status: 400, headers: {}, body: JSON.stringify({ detail }), data: { detail } } });
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    hasLoginSession: true,
+    sessionResponse: { status: 200, data: latestLoginSession },
+    checkoutResponse: { status: 400, headers: {}, body: JSON.stringify({ detail }), data: { detail } },
+  });
   assert.equal(result.finish.status, 'failed');
   assert.equal(result.finish.error, 'HTTP 400：' + detail);
   assert.equal(result.requests.filter((r) => r.url.endsWith('/payments/checkout')).length, 1);
+  assert.equal(result.requests.filter((r) => new URL(r.url).pathname === '/api/auth/session').length, 1);
   assert.ok(!result.commands.some((c) => ['card', 'authorize'].includes(c.action)));
   assert.ok(!result.requests.some((r) => new URL(r.url).hostname === 'api.stripe.com'));
 });

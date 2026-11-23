@@ -1,4 +1,14 @@
-import type { RuntimeContext } from '../../../../packages/contracts/src/execution.js';
+import type { Cookie, RuntimeContext } from '../../../../packages/contracts/src/execution.js';
+
+export function hasChatgptSessionCookie(cookies: Cookie[]) {
+  return cookies.some(
+    (cookie) =>
+      cookie.domain.replace(/^\./, '') === 'chatgpt.com' &&
+      /^__Secure-(?:next-auth|authjs)\.session-token(?:\.\d+)?$/.test(cookie.name) &&
+      !!cookie.value,
+  );
+}
+
 export function loadCredential(context: RuntimeContext) {
   if (context.session) return;
   const value = context.credential?.trim();

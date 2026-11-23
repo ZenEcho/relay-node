@@ -19,7 +19,8 @@ function fixture(
   } = {},
 ) {
   const old = token(1),
-    fresh = token(2, options.expired ? 1 : undefined);
+    initial = token(2),
+    fresh = token(3, options.expired ? 1 : undefined);
   const context: any = {
     environment: createEnvironment('CL', ''),
     accountId: 'original',
@@ -58,11 +59,20 @@ function fixture(
     paths.push(path);
     if (path === '/api/auth/session') {
       if (options.initialFails) throw new Error('plain Session disconnected');
-      return { accessToken: old };
+      return { accessToken: initial };
     }
     if (path.includes('refresh=true')) {
       refreshes++;
-      assert.equal(headers?.['x-openai-failed-access-token-iat'], '1');
+      const url = new URL(path, 'https://chatgpt.com');
+      assert.equal(url.pathname, '/api/auth/session');
+      assert.deepEqual(Object.fromEntries(url.searchParams), {
+        refresh: 'true',
+        reason: 'token_expired',
+        method: 'POST',
+        path: '/backend-api/subscriptions/cancel',
+      });
+      assert.equal(body, undefined);
+      assert.equal(headers?.['x-openai-failed-access-token-iat'], options.initialFails ? '1' : '2');
       if (options.refreshFails) throw new Error('forced refresh failed');
       context.environment.cookies = [
         {

@@ -68,7 +68,11 @@ test('verified exits get a correlation fingerprint without new raw network or cr
 for (const actual of ['BR', 'FR']) {
   test(`a Chile order records the ${actual} exit and stops before Sentinel or subscription requests`, async () => {
     const f = fixture();
+    f.services.assignment.paymentEnabled = true;
     f.context.environment.country = 'CL';
+    f.context.environment.cookies = [
+      { name: '__Secure-next-auth.session-token', value: 'fixture-login-session', domain: 'chatgpt.com' },
+    ];
     f.services.request = async () => ({
       status: 200,
       headers: {},

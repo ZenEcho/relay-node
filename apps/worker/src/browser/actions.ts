@@ -107,7 +107,7 @@ export async function authorizeSentinelInPage(
           () =>
             new Promise<void>((resolve, reject) => {
               script = page.document.createElement('script');
-              script.src = expected.origin + '/backend-api/sentinel/sdk.js';
+              script.src = expected.origin + '/backend-api/sentinel/sdk.js?no_universal_links=1';
               script.async = true;
               script.onload = () => resolve();
               script.onerror = () => reject(new Error('official SDK load failed'));

@@ -42,18 +42,27 @@ test('ambiguous mixed login generations cannot be imported together', () => {
   );
 });
 test('page Session refresh includes browser cookies but never sends the expired bearer', async () => {
+  const path = '/api/auth/session?refresh=true&reason=token_expired&method=POST&path=%2Fbackend-api%2Fsubscriptions%2Fcancel';
   await execute(
     {
-      path: '/api/auth/session?refresh=true',
+      path,
       accountId: 'original',
       accessToken: 'expired',
+      headers: { 'x-openai-failed-access-token-iat': '123' },
     },
     async (url: string, init: any) => {
-      assert.equal(new URL(url).origin, 'https://chatgpt.com');
+      assert.equal(url, 'https://chatgpt.com' + path);
+      assert.equal(init.method, 'GET');
+      assert.equal(init.body, undefined);
       assert.equal(init.credentials, 'include');
       assert.equal(init.cache, 'no-store');
       assert.equal(init.redirect, 'error');
-      assert.equal(init.headers.authorization, undefined);
+      assert.deepEqual({ ...init.headers }, {
+        accept: 'application/json',
+        'x-openai-target-path': '/api/auth/session',
+        'x-openai-target-route': '/api/auth/session',
+        'x-openai-failed-access-token-iat': '123',
+      });
       assert.ok(init.signal);
       return new Response(JSON.stringify({ accessToken: 'fresh' }), { status: 200 });
     },

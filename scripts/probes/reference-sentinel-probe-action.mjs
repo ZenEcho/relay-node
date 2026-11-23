@@ -64,7 +64,7 @@ export async function authorizeReferenceSentinelInPage(request) {
         () =>
           new Promise((resolve, reject) => {
             const script = document.createElement('script');
-            script.src = '/backend-api/sentinel/sdk.js';
+            script.src = '/backend-api/sentinel/sdk.js?no_universal_links=1';
             script.async = true;
             script.onload = () => {
               script.remove();

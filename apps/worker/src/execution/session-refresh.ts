@@ -1,6 +1,6 @@
 import type { RuntimeContext } from '../../../../packages/contracts/src/execution.js';
 import { throwIfExecutionAborted } from '../../../../packages/runtime/src/cancellation.js';
-import { verifySessionIdentity } from './credentials.js';
+import { hasChatgptSessionCookie, verifySessionIdentity } from './credentials.js';
 import type { ExecutionServices } from './services.js';
 
 export function isExpiredAccessToken(error: unknown): boolean {
@@ -41,14 +41,7 @@ export async function refreshExpiredAccessToken(
   const identity = { ...context, accountId, userId };
   const cookies = context.environment.cookies.map((cookie) => ({ ...cookie }));
   if (!accountId) throw new Error('accessToken 已过期，缺少原账号身份，不能自动刷新后重试');
-  if (
-    !cookies.some(
-      (cookie) =>
-        cookie.domain.replace(/^\./, '') === 'chatgpt.com' &&
-        /^__Secure-(?:next-auth|authjs)\.session-token(?:\.\d+)?$/.test(cookie.name) &&
-        !!cookie.value,
-    )
-  )
+  if (!hasChatgptSessionCookie(cookies))
     throw new Error('accessToken 已过期，缺少用于刷新的 Session Cookie，请重新获取完整 Session');
   try {
     context.accountId = accountId;
