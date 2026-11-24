@@ -4,7 +4,10 @@ import { throwIfExecutionAborted } from '../../../../packages/runtime/src/cancel
 import { bindBillingEmail, selectBillingEmail } from '../../../../packages/rules/src/billing-email.js';
 import { hasChatgptSessionCookie, verifySessionIdentity } from './credentials.js';
 import { UpstreamError } from './http-utils.js';
+import { tokenClaims } from './session-refresh.js';
 import type { ExecutionServices } from './services.js';
+
+const CHECKOUT_PATH = '/backend-api/payments/checkout';
 
 async function readCheckoutSession(services: ExecutionServices) {
   const context = services.context;
@@ -13,20 +16,55 @@ async function readCheckoutSession(services: ExecutionServices) {
     context.accountId || context.session?.account?.id || context.session?.account?.account_id;
   const originalUser = context.userId || context.session?.user?.id;
   try {
-    const session = await services.chat('建单前读取最新 Session', '/api/auth/session', undefined, {
-      'cache-control': 'no-cache',
+    // The plain read only supplies the failed access-token iat. A refused or
+    // cached read must not stop the forced refresh that actually feeds the
+    // checkout write.
+    const initial = await services
+      .chat('建单前读取最新 Session', '/api/auth/session', undefined, {
+        'cache-control': 'no-cache',
+      })
+      .catch((error) => {
+        throwIfExecutionAborted(services.signal);
+        if ((error as { name?: string })?.name === 'AbortError') throw error;
+        return undefined;
+      });
+    const iat = tokenClaims(initial?.accessToken || initial?.access_token).iat;
+    const query = new URLSearchParams({
+      refresh: 'true',
+      reason: 'token_expired',
+      method: 'POST',
+      path: CHECKOUT_PATH,
     });
-    const accountId = session?.account?.id || session?.account?.account_id;
-    const userId = session?.user?.id;
+    const refreshed = await services.chat(
+      '建单前强制刷新 Session',
+      '/api/auth/session?' + query,
+      undefined,
+      {
+        'cache-control': 'no-cache',
+        ...(typeof iat === 'number' && Number.isFinite(iat)
+          ? { 'x-openai-failed-access-token-iat': String(iat) }
+          : {}),
+      },
+    );
+    const accessToken = refreshed?.accessToken || refreshed?.access_token;
+    const accountId = refreshed?.account?.id || refreshed?.account?.account_id;
+    const userId = refreshed?.user?.id;
     verifySessionIdentity(
       { ...context, accountId: originalAccount || accountId, userId: originalUser },
-      session,
+      refreshed,
     );
     if ((originalAccount && !accountId) || (originalUser && !userId))
       throw new Error('最新 Session 缺少原账号或用户标识，无法确认本单登录身份');
-    if (session.expires && !(Date.parse(session.expires) > Date.now()))
-      throw new Error('Session 已过期，请重新登录并获取新的 Session');
-    context.session = { ...session, accessToken: session.accessToken || session.access_token };
+    // The checkout write must use this refreshed Session, never the credential
+    // or the plain read above.
+    const session = { ...refreshed, accessToken };
+    const expires = tokenClaims(accessToken).exp;
+    if (
+      (session.expires && !(Date.parse(session.expires) > Date.now())) ||
+      (typeof expires === 'number' && expires <= Date.now() / 1000)
+    )
+      throw new Error('刷新后的 Session 或 accessToken 已过期，未使用旧凭证建单');
+    context.session = session;
     context.accountId ||= accountId;
     context.userId ||= userId;
   } catch (error) {

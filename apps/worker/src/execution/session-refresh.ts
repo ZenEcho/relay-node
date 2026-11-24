@@ -19,7 +19,7 @@ export function isExpiredAccessToken(error: unknown): boolean {
   );
 }
 
-function tokenClaims(token: unknown): { iat?: number; exp?: number } {
+export function tokenClaims(token: unknown): { iat?: number; exp?: number } {
   try {
     return JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString()) || {};
   } catch {

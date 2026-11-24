@@ -1,6 +1,6 @@
 {
   "name": "@relay/node",
-  "version": "0.1.31",
+  "version": "0.1.32",
   "description": "Relay independent execution node and SDK",
   "type": "module",
   "main": "dist/sdk.js",
