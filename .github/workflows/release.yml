@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -63,9 +63,7 @@ jobs:
           set -eu
           version=$(cat VERSION)
           test "$GITHUB_REF_NAME" = "v$version"
-          for platform in linux darwin; do
-            for arch in x64 arm64; do test -f "release/relay-node-$version-$platform-$arch.tar.gz"; done
-          done
+          for arch in x64 arm64; do test -f "release/relay-node-$version-linux-$arch.tar.gz"; done
           test -f "release/relay-node-sdk-$version.tgz"
           cd release
           sha256sum relay-node-*.tar.gz relay-node-sdk-*.tgz > SHA256SUMS

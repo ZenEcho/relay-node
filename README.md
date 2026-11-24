@@ -4,7 +4,7 @@ Relay 独立执行节点与 SDK。控制台负责账号、订单调度及付款�
 
 ## 安装
 
-支持 Linux（systemd / glibc）、macOS（当前用户 launchd），amd64 / arm64。
+正式安装包适用于 Linux（systemd / glibc），支持 amd64 和 arm64。macOS 可在目标机器上从源码构建。
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ZenEcho/relay-node/main/install.sh -o install.sh
@@ -42,7 +42,14 @@ npm run check
 npm run native:build
 ```
 
-`VERSION` 和 package.json 使用同一语义版本。推送 `vX.Y.Z` 标签后 CI 验证四个平台并创建正式 Release。平台包、SDK 和 SHA256SUMS 齐备后才公开版本；节点更新只接受本仓库正式发布的匹配平台包。
+`VERSION` 和 package.json 使用同一语义版本。推送 `vX.Y.Z` 标签后，CI 验证并发布 Linux x64、Linux ARM64、SDK 和 SHA256SUMS。Linux 节点从本仓库的正式 Release 更新。
+
+macOS 如需安装，在目标机器上完成上述构建后打包并注册当前用户的 launchd 服务：
+
+```sh
+node scripts/package-release.mjs
+release/stage/runtime/bin/node release/stage/dist/apps/worker/src/cli.js install
+```
 
 控制台通过固定 Release URL 引用 `relay-node-sdk-X.Y.Z.tgz`，SDK 提供执行器、传输组件、公共类型及工具；不要求在旁边检出节点源码。发布包使用白名单，不包含凭证、环境配置或本地数据。
 
