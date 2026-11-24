@@ -16,10 +16,16 @@ const boundAuthorizer: SentinelAuthorizer = async (request) => ({
   expiresAt: new Date(Date.now() + 60000).toISOString(),
 });
 
-const latestLoginSession = {
-  access_token: 'latest-session-access',
+const refreshedLoginSession = {
+  access_token: 'refreshed-session-access',
+  sessionToken: 'refreshed-login-session',
   account: { id: 'demo-account' },
-  user: { id: 'demo-user', email: 'latest@example.invalid' },
+  user: { id: 'demo-user', email: 'refreshed@example.invalid' },
+};
+const ordinaryLoginSession = {
+  ...refreshedLoginSession,
+  access_token: 'ordinary-session-access',
+  sessionToken: 'ordinary-login-session',
 };
 
 for (const [name, hints, expected] of [
@@ -93,7 +99,7 @@ test('a resumed accepted binding survives a different newly imported Session ema
     credentialUserEmail: 'new-session@example.invalid',
     defaultBillingEmail: 'new-default@example.invalid',
     boundBillingEmail: 'accepted@example.invalid',
-    sessionResponse: { status: 200, data: latestLoginSession },
+    refreshResponse: { status: 200, data: refreshedLoginSession },
   });
   assert.equal(result.finish.status, 'completed', result.finish.error);
   const tax = result.requests.find((request) => request.url.endsWith('/checkout/taxes'))!;
@@ -114,7 +120,7 @@ test('an invalid authenticated Session email falls back after the Session read a
 });
 
 for (const checkoutMode of ['custom', 'hosted'] as const) {
-  test(`${checkoutMode} uses a valid Session read for the first checkout even when forced refresh would return an empty response`, async () => {
+  test(`${checkoutMode} uses the forced refresh response for the first checkout`, async () => {
     const result = await execute({
       checkoutMode,
       demo: false,
@@ -122,39 +128,43 @@ for (const checkoutMode of ['custom', 'hosted'] as const) {
       credentialUserEmail: 'saved@example.invalid',
       hasLoginSession: true,
       resumed: true,
-      sessionResponse: { status: 200, data: latestLoginSession },
-      refreshResponse: { status: 200, data: {} },
+      sessionResponse: { status: 200, data: ordinaryLoginSession },
+      refreshResponse: { status: 200, data: refreshedLoginSession },
     });
     assert.equal(result.finish.status, 'completed', result.finish.error);
     const reads = result.requests.filter((request) => new URL(request.url).pathname === '/api/auth/session');
     assert.equal(reads.length, 1);
-    const [plain] = reads;
-    assert.equal(plain.method, 'GET');
-    assert.equal(new URL(plain.url).search, '');
-    assert.equal(plain.headers?.['cache-control'], 'no-cache');
-    assert.equal(plain.headers?.authorization, undefined);
+    const [refresh] = reads;
+    assert.equal(refresh.method, 'GET');
+    assert.equal(new URL(refresh.url).searchParams.get('refresh'), 'true');
+    assert.equal(refresh.headers?.['cache-control'], 'no-cache');
+    assert.equal(refresh.headers?.authorization, undefined);
     for (const path of ['/accounts/check/', '/checkout_pricing_config/', '/payments/checkout']) {
       const request = result.requests.find((entry) => entry.url.includes(path))!;
-      assert.ok(result.requests.indexOf(request) > result.requests.indexOf(plain));
-      assert.equal(request.headers?.authorization, 'Bearer ' + latestLoginSession.access_token);
+      assert.ok(result.requests.indexOf(request) > result.requests.indexOf(refresh));
+      assert.equal(request.headers?.authorization, 'Bearer ' + refreshedLoginSession.access_token);
     }
-    assert.equal(result.finish.context.billingEmailBinding.email, latestLoginSession.user.email);
+    assert.deepEqual(result.finish.context.session, {
+      ...refreshedLoginSession,
+      accessToken: refreshedLoginSession.access_token,
+    });
+    assert.equal(result.finish.context.billingEmailBinding.email, refreshedLoginSession.user.email);
   });
 }
 
-test('the forced pre-checkout Session refresh forwards the failed token iat without sending the old token', async () => {
+test('the forced pre-checkout Session refresh forwards the credential token iat', async () => {
   const iat = 1_700_000_000;
-  const expiredAccessToken =
+  const credentialAccessToken =
     'fixture.' +
-    Buffer.from(JSON.stringify({ iat, exp: iat + 60 })).toString('base64url') +
+    Buffer.from(JSON.stringify({ iat, exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url') +
     '.signature';
   const result = await execute({
     demo: false,
     authorizer: boundAuthorizer,
+    credentialAccessToken,
     credentialUserEmail: 'saved@example.invalid',
     hasLoginSession: true,
-    sessionResponse: { status: 200, data: { ...latestLoginSession, access_token: expiredAccessToken } },
-    refreshResponse: { status: 200, data: latestLoginSession },
+    refreshResponse: { status: 200, data: refreshedLoginSession },
   });
   assert.equal(result.finish.status, 'completed', result.finish.error);
   const refresh = result.requests.find(
@@ -169,51 +179,16 @@ test('the forced pre-checkout Session refresh forwards the failed token iat with
   assert.equal(refresh.headers?.authorization, undefined);
   assert.equal(refresh.headers?.['x-openai-target-path'], '/api/auth/session');
   const checkout = result.requests.find((request) => request.url.endsWith('/payments/checkout'))!;
-  assert.equal(checkout.headers?.authorization, 'Bearer ' + latestLoginSession.access_token);
-});
-
-test('the checkout write uses the forced refresh when the ordinary Session read returns no token', async () => {
-  const result = await execute({
-    demo: false,
-    authorizer: boundAuthorizer,
-    credentialUserEmail: 'saved@example.invalid',
-    hasLoginSession: true,
-    sessionResponse: { status: 200, data: {} },
-    refreshResponse: {
-      status: 200,
-      data: { ...latestLoginSession, access_token: 'refreshed-session-access' },
-    },
-  });
-  assert.equal(result.finish.status, 'completed', result.finish.error);
-  assert.equal(result.finish.context.session.accessToken, 'refreshed-session-access');
-  for (const path of ['/accounts/check/', '/checkout_pricing_config/', '/payments/checkout']) {
-    assert.equal(
-      result.requests.find((request) => request.url.includes(path))!.headers?.authorization,
-      'Bearer refreshed-session-access',
-      path,
-    );
-  }
-});
-
-test('an ordinary Session for a different user stops before checkout', async () => {
-  const result = await execute({
-    demo: false,
-    authorizer: async () => assert.fail('checkout authorization must not run'),
-    credentialUserEmail: 'saved@example.invalid',
-    hasLoginSession: true,
-    sessionResponse: { status: 200, data: { ...latestLoginSession, user: { id: 'other' } } },
-  });
-  assert.equal(result.finish.status, 'failed');
-  assert.match(result.finish.error, /用户与原订单不一致/);
-  assert.ok(!result.requests.some((request) => request.method === 'POST'));
+  assert.equal(checkout.headers?.authorization, 'Bearer ' + refreshedLoginSession.access_token);
 });
 
 for (const [name, refreshResponse, expected] of [
   ['upstream refusal', { status: 403, data: { detail: 'Session request refused' } }, /Session request refused/],
   ['empty response', { status: 200, data: {} }, /缺少 accessToken/],
-  ['foreign account', { status: 200, data: { ...latestLoginSession, account: { id: 'other' } } }, /账号与原订单不一致/],
-  ['foreign user', { status: 200, data: { ...latestLoginSession, user: { id: 'other' } } }, /用户与原订单不一致/],
-  ['unconfirmed user', { status: 200, data: { ...latestLoginSession, user: {} } }, /缺少原账号或用户标识/],
+  ['foreign account', { status: 200, data: { ...refreshedLoginSession, account: { id: 'other' } } }, /账号与原订单不一致/],
+  ['foreign user', { status: 200, data: { ...refreshedLoginSession, user: { id: 'other' } } }, /用户与原订单不一致/],
+  ['unconfirmed user', { status: 200, data: { ...refreshedLoginSession, user: {} } }, /缺少原账号或用户标识/],
+  ['expired Session', { status: 200, data: { ...refreshedLoginSession, expires: new Date(0).toISOString() } }, /已过期/],
 ] as const) {
   test(`checkout stops before pricing and authorization on ${name} during the forced Session refresh`, async () => {
     const result = await execute({
@@ -221,16 +196,15 @@ for (const [name, refreshResponse, expected] of [
       authorizer: async () => assert.fail('checkout authorization must not run'),
       credentialUserEmail: 'saved@example.invalid',
       hasLoginSession: true,
-      sessionResponse: { status: 200, data: {} },
+      sessionResponse: { status: 200, data: ordinaryLoginSession },
       refreshResponse,
     });
     assert.equal(result.finish.status, 'failed');
     assert.match(result.finish.error, expected);
     assert.equal(result.finish.context.session.accessToken, 'test-access');
-    assert.equal(
-      result.requests.filter((request) => new URL(request.url).pathname === '/api/auth/session').length,
-      2,
-    );
+    const sessionRequests = result.requests.filter((request) => new URL(request.url).pathname === '/api/auth/session');
+    assert.equal(sessionRequests.length, 1);
+    assert.equal(new URL(sessionRequests[0].url).searchParams.get('refresh'), 'true');
     assert.ok(!result.requests.some((request) => request.url.includes('/checkout_pricing_config/')));
     assert.ok(!result.requests.some((request) => request.method === 'POST'));
   });
@@ -270,6 +244,7 @@ async function execute(
     hostedUrlConfig?: boolean;
     hostedKeyMissing?: boolean;
     hostedPageStatus?: number;
+    credentialAccessToken?: string;
     credentialUserEmail?: string;
     hasLoginSession?: boolean;
     sessionResponse?: Pick<HttpOutput, 'status' | 'data'>;
@@ -304,7 +279,7 @@ async function execute(
     context: {
       environment,
       credential: JSON.stringify({
-        accessToken: 'test-access',
+        accessToken: options.credentialAccessToken ?? 'test-access',
         account: { id: 'demo-account' },
         ...(options.hasLoginSession ? { sessionToken: 'fixture-login-session' } : {}),
         ...(options.credentialUserEmail
@@ -409,7 +384,7 @@ async function execute(
         const { status, data } = options.refreshResponse;
         return { status, headers: {}, body: JSON.stringify(data), data };
       }
-      if (url.pathname === '/api/auth/session' && options.sessionResponse) {
+      if (url.pathname === '/api/auth/session' && !url.search && options.sessionResponse) {
         const { status, data } = options.sessionResponse;
         return { status, headers: {}, body: JSON.stringify(data), data };
       }
@@ -740,7 +715,7 @@ test('an unusual-activity checkout refusal retains the upstream diagnostic witho
     demo: false,
     authorizer: boundAuthorizer,
     hasLoginSession: true,
-    sessionResponse: { status: 200, data: latestLoginSession },
+    refreshResponse: { status: 200, data: refreshedLoginSession },
     checkoutResponse: { status: 400, headers: {}, body: JSON.stringify({ detail }), data: { detail } },
   });
   assert.equal(result.finish.status, 'failed');

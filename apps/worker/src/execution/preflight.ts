@@ -9,60 +9,34 @@ import type { ExecutionServices } from './services.js';
 
 const CHECKOUT_PATH = '/backend-api/payments/checkout';
 
-function checkoutSessionExpired(sessionExpires?: string, tokenExpires?: number) {
-  const now = Date.now();
-  return (
-    (!!sessionExpires && !(Date.parse(sessionExpires) > now)) ||
-    (typeof tokenExpires === 'number' && tokenExpires <= now / 1000)
-  );
-}
-
-async function readCheckoutSession(services: ExecutionServices) {
+async function refreshCheckoutSession(services: ExecutionServices) {
   const context = services.context;
   const originalCookies = context.environment.cookies;
   const originalAccount =
     context.accountId || context.session?.account?.id || context.session?.account?.account_id;
   const originalUser = context.userId || context.session?.user?.id;
+  const { iat } = tokenClaims(context.session?.accessToken || context.session?.access_token);
+  const query = new URLSearchParams({
+    refresh: 'true',
+    reason: 'token_expired',
+    method: 'POST',
+    path: CHECKOUT_PATH,
+  });
   try {
-    let session = await services
-      .chat('建单前读取最新 Session', '/api/auth/session', undefined, {
-        'cache-control': 'no-cache',
-      })
-      .catch((error) => {
-        throwIfExecutionAborted(services.signal);
-        if ((error as { name?: string })?.name === 'AbortError') throw error;
-        return undefined;
-      });
     throwIfExecutionAborted(services.signal);
-    let accessToken = session?.accessToken || session?.access_token;
-    let claims = tokenClaims(accessToken);
-    // The forced endpoint can return an empty response even when the ordinary read returns a usable Session.
-    if (
-      typeof accessToken !== 'string' ||
-      !accessToken.trim() ||
-      checkoutSessionExpired(session?.expires, claims.exp)
-    ) {
-      const query = new URLSearchParams({
-        refresh: 'true',
-        reason: 'token_expired',
-        method: 'POST',
-        path: CHECKOUT_PATH,
-      });
-      session = await services.chat(
-        '建单前强制刷新 Session',
-        '/api/auth/session?' + query,
-        undefined,
-        {
-          'cache-control': 'no-cache',
-          ...(typeof claims.iat === 'number' && Number.isFinite(claims.iat)
-            ? { 'x-openai-failed-access-token-iat': String(claims.iat) }
-            : {}),
-        },
-      );
-      throwIfExecutionAborted(services.signal);
-      accessToken = session?.accessToken || session?.access_token;
-      claims = tokenClaims(accessToken);
-    }
+    const session = await services.chat(
+      '建单前强制刷新 Session',
+      '/api/auth/session?' + query,
+      undefined,
+      {
+        'cache-control': 'no-cache',
+        ...(typeof iat === 'number' && Number.isFinite(iat)
+          ? { 'x-openai-failed-access-token-iat': String(iat) }
+          : {}),
+      },
+    );
+    throwIfExecutionAborted(services.signal);
+    const accessToken = session?.accessToken || session?.access_token;
     const accountId = session?.account?.id || session?.account?.account_id;
     const userId = session?.user?.id;
     verifySessionIdentity(
@@ -70,9 +44,14 @@ async function readCheckoutSession(services: ExecutionServices) {
       session,
     );
     if ((originalAccount && !accountId) || (originalUser && !userId))
-      throw new Error('最新 Session 缺少原账号或用户标识，无法确认本单登录身份');
-    if (checkoutSessionExpired(session.expires, claims.exp))
-      throw new Error('建单前取得的 Session 或 accessToken 已过期');
+      throw new Error('刷新后的 Session 缺少原账号或用户标识，无法确认本单登录身份');
+    const { exp } = tokenClaims(accessToken);
+    const now = Date.now();
+    if (
+      (session.expires && !(Date.parse(session.expires) > now)) ||
+      (typeof exp === 'number' && exp <= now / 1000)
+    )
+      throw new Error('刷新后的 Session 或 accessToken 已过期');
     context.session = { ...session, accessToken };
     context.accountId ||= accountId;
     context.userId ||= userId;
@@ -159,12 +138,12 @@ export async function preflightExecution(services: ExecutionServices) {
   const required = !services.context.proxyVerified;
   if (required) services.setStage('proxy_check');
   await sampleExecutionEgress(services, required);
-  const readLatestSession =
+  const forceSessionRefresh =
     services.assignment.paymentEnabled &&
     !services.assignment.demo &&
     !services.context.checkout &&
     hasChatgptSessionCookie(services.context.environment.cookies);
-  if (readLatestSession) await readCheckoutSession(services);
+  if (forceSessionRefresh) await refreshCheckoutSession(services);
   else if (
     !services.context.session?.accessToken ||
     (!services.context.billingEmailBinding &&
@@ -194,7 +173,7 @@ export async function preflightExecution(services: ExecutionServices) {
       });
   } else bindBillingEmail(services.context, 'chatgpt');
   services.assignment.billing = services.context.billing || undefined;
-  if (readLatestSession || !services.context.originalSubscription) {
+  if (forceSessionRefresh || !services.context.originalSubscription) {
     services.setStage('subscription_check');
     const info = await services.chat(
       '查询原账号订阅',
@@ -208,7 +187,7 @@ export async function preflightExecution(services: ExecutionServices) {
     if (!accountId) throw new Error('订阅查询未返回原账号');
     if (services.context.accountId && services.context.accountId !== accountId)
       throw new Error('订阅账号与原凭证不一致');
-    if (readLatestSession)
+    if (forceSessionRefresh)
       verifySessionIdentity(services.context, {
         accessToken: services.context.session?.accessToken,
         account: selected.account,
