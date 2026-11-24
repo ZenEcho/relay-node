@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -165,14 +166,26 @@ func (d *observedDialer) DialContext(ctx context.Context, network, address strin
 	return connection, err
 }
 
+type transportCookieJar struct{ http.CookieJar }
+
+func (jar transportCookieJar) Cookies(target *url.URL) []*http.Cookie {
+	now := time.Now()
+	// The TLS client's jar handles Max-Age deletion but ignores Expires.
+	return slices.DeleteFunc(jar.CookieJar.Cookies(target), func(cookie *http.Cookie) bool {
+		return cookie.MaxAge == 0 && !cookie.Expires.IsZero() && !cookie.Expires.After(now)
+	})
+}
+
 func newObservedClient(profileName, proxyURL string, extraOptions ...tls.HttpClientOption) (tls.HttpClient, *transportObserver, error) {
 	profile, ok := profileMap[profileName]
 	if !ok {
 		return nil, nil, errors.New("unsupported TLS profile")
 	}
+	// Deletion headers can carry empty values and must replace stored cookies.
+	jar := transportCookieJar{tls.NewCookieJar(tls.WithAllowEmptyCookies())}
 	options := []tls.HttpClientOption{
 		tls.WithTimeoutSeconds(nativeRequestTimeoutSeconds), tls.WithClientProfile(profile),
-		tls.WithCookieJar(tls.NewCookieJar()), tls.WithNotFollowRedirects(),
+		tls.WithCookieJar(jar), tls.WithNotFollowRedirects(),
 	}
 	options = append(options, extraOptions...)
 	if proxyURL != "" {

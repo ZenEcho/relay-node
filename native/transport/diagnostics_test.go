@@ -231,6 +231,63 @@ func TestObservedClientConstructionPreservesProtocols(t *testing.T) {
 	}
 }
 
+func TestObservedClientDropsLoginFragmentsBeforeSessionRefresh(t *testing.T) {
+	const sessionCookie = "__Secure-next-auth.session-token"
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("refresh") == "true" {
+			for _, suffix := range []string{".0", ".1"} {
+				if _, err := r.Cookie(sessionCookie + suffix); err != http.ErrNoCookie {
+					t.Errorf("refresh sent deleted Session fragment %s", suffix)
+				}
+			}
+			if cookie, err := r.Cookie(sessionCookie); err != nil || cookie.Value != "replacement" {
+				t.Error("refresh did not send the replacement Session cookie")
+			}
+			if cookie, err := r.Cookie("oai-did"); err != nil || cookie.Value != "device" {
+				t.Error("refresh did not preserve the device cookie")
+			}
+			return
+		}
+		http.SetCookie(w, &http.Cookie{Name: sessionCookie + ".0", Path: "/", MaxAge: -1, Secure: true})
+		http.SetCookie(w, &http.Cookie{Name: sessionCookie + ".1", Path: "/", Expires: time.Unix(1, 0), Secure: true})
+		http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "replacement", Path: "/", Secure: true})
+	}))
+	defer target.Close()
+	roots := x509.NewCertPool()
+	roots.AddCert(target.Certificate())
+	client, _, err := newObservedClient("chrome_146", "", tls.WithTransportOptions(&tls.TransportOptions{RootCAs: roots}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	initial, err := fhttp.NewRequest("GET", target.URL+"/api/auth/session", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetCookies(initial.URL, []*fhttp.Cookie{
+		{Name: sessionCookie + ".0", Value: "old-first", Path: "/", Secure: true},
+		{Name: sessionCookie + ".1", Value: "old-second", Path: "/", Secure: true},
+		{Name: "oai-did", Value: "device", Path: "/", Secure: true},
+	})
+	response, err := client.Do(initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	refresh, err := fhttp.NewRequest("GET", initial.URL.String()+"?refresh=true", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = client.Do(refresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if cookies := client.GetCookies(initial.URL); len(cookies) != 2 {
+		t.Fatalf("expected two active cookies in the snapshot, got %d", len(cookies))
+	}
+}
+
 func TestObservedProxyHTTPAndHTTP2AndConnectionReset(t *testing.T) {
 	for _, http2 := range []bool{false, true} {
 		name := "http1"

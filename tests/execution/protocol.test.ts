@@ -114,7 +114,7 @@ test('an invalid authenticated Session email falls back after the Session read a
 });
 
 for (const checkoutMode of ['custom', 'hosted'] as const) {
-  test(`${checkoutMode} forces a Session refresh before the first checkout even with saved subscription preflight`, async () => {
+  test(`${checkoutMode} uses a valid Session read for the first checkout even when forced refresh would return an empty response`, async () => {
     const result = await execute({
       checkoutMode,
       demo: false,
@@ -123,26 +123,19 @@ for (const checkoutMode of ['custom', 'hosted'] as const) {
       hasLoginSession: true,
       resumed: true,
       sessionResponse: { status: 200, data: latestLoginSession },
+      refreshResponse: { status: 200, data: {} },
     });
     assert.equal(result.finish.status, 'completed', result.finish.error);
     const reads = result.requests.filter((request) => new URL(request.url).pathname === '/api/auth/session');
-    assert.equal(reads.length, 2);
-    const [plain, refresh] = reads;
+    assert.equal(reads.length, 1);
+    const [plain] = reads;
     assert.equal(plain.method, 'GET');
     assert.equal(new URL(plain.url).search, '');
     assert.equal(plain.headers?.['cache-control'], 'no-cache');
     assert.equal(plain.headers?.authorization, undefined);
-    assert.equal(refresh.method, 'GET');
-    const query = new URL(refresh.url).searchParams;
-    assert.equal(query.get('refresh'), 'true');
-    assert.equal(query.get('reason'), 'token_expired');
-    assert.equal(query.get('method'), 'POST');
-    assert.equal(query.get('path'), '/backend-api/payments/checkout');
-    assert.equal(refresh.headers?.['x-openai-failed-access-token-iat'], undefined);
-    assert.equal(refresh.headers?.authorization, undefined);
     for (const path of ['/accounts/check/', '/checkout_pricing_config/', '/payments/checkout']) {
       const request = result.requests.find((entry) => entry.url.includes(path))!;
-      assert.ok(result.requests.indexOf(request) > result.requests.indexOf(refresh));
+      assert.ok(result.requests.indexOf(request) > result.requests.indexOf(plain));
       assert.equal(request.headers?.authorization, 'Bearer ' + latestLoginSession.access_token);
     }
     assert.equal(result.finish.context.billingEmailBinding.email, latestLoginSession.user.email);
@@ -150,36 +143,42 @@ for (const checkoutMode of ['custom', 'hosted'] as const) {
 }
 
 test('the forced pre-checkout Session refresh forwards the failed token iat without sending the old token', async () => {
-  const iat = 1795333522;
-  const accessToken =
+  const iat = 1_700_000_000;
+  const expiredAccessToken =
     'fixture.' +
-    Buffer.from(JSON.stringify({ iat, exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url') +
+    Buffer.from(JSON.stringify({ iat, exp: iat + 60 })).toString('base64url') +
     '.signature';
   const result = await execute({
     demo: false,
     authorizer: boundAuthorizer,
     credentialUserEmail: 'saved@example.invalid',
     hasLoginSession: true,
-    sessionResponse: { status: 200, data: { ...latestLoginSession, access_token: accessToken } },
+    sessionResponse: { status: 200, data: { ...latestLoginSession, access_token: expiredAccessToken } },
+    refreshResponse: { status: 200, data: latestLoginSession },
   });
   assert.equal(result.finish.status, 'completed', result.finish.error);
   const refresh = result.requests.find(
     (request) => new URL(request.url).searchParams.get('refresh') === 'true',
   )!;
+  assert.equal(refresh.method, 'GET');
+  const query = new URL(refresh.url).searchParams;
+  assert.equal(query.get('reason'), 'token_expired');
+  assert.equal(query.get('method'), 'POST');
+  assert.equal(query.get('path'), '/backend-api/payments/checkout');
   assert.equal(refresh.headers?.['x-openai-failed-access-token-iat'], String(iat));
   assert.equal(refresh.headers?.authorization, undefined);
   assert.equal(refresh.headers?.['x-openai-target-path'], '/api/auth/session');
   const checkout = result.requests.find((request) => request.url.endsWith('/payments/checkout'))!;
-  assert.equal(checkout.headers?.authorization, 'Bearer ' + accessToken);
+  assert.equal(checkout.headers?.authorization, 'Bearer ' + latestLoginSession.access_token);
 });
 
-test('the checkout write carries the refreshed Session instead of the plain read', async () => {
+test('the checkout write uses the forced refresh when the ordinary Session read returns no token', async () => {
   const result = await execute({
     demo: false,
     authorizer: boundAuthorizer,
     credentialUserEmail: 'saved@example.invalid',
     hasLoginSession: true,
-    sessionResponse: { status: 200, data: latestLoginSession },
+    sessionResponse: { status: 200, data: {} },
     refreshResponse: {
       status: 200,
       data: { ...latestLoginSession, access_token: 'refreshed-session-access' },
@@ -196,8 +195,22 @@ test('the checkout write carries the refreshed Session instead of the plain read
   }
 });
 
-for (const [name, sessionResponse, expected] of [
+test('an ordinary Session for a different user stops before checkout', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: async () => assert.fail('checkout authorization must not run'),
+    credentialUserEmail: 'saved@example.invalid',
+    hasLoginSession: true,
+    sessionResponse: { status: 200, data: { ...latestLoginSession, user: { id: 'other' } } },
+  });
+  assert.equal(result.finish.status, 'failed');
+  assert.match(result.finish.error, /用户与原订单不一致/);
+  assert.ok(!result.requests.some((request) => request.method === 'POST'));
+});
+
+for (const [name, refreshResponse, expected] of [
   ['upstream refusal', { status: 403, data: { detail: 'Session request refused' } }, /Session request refused/],
+  ['empty response', { status: 200, data: {} }, /缺少 accessToken/],
   ['foreign account', { status: 200, data: { ...latestLoginSession, account: { id: 'other' } } }, /账号与原订单不一致/],
   ['foreign user', { status: 200, data: { ...latestLoginSession, user: { id: 'other' } } }, /用户与原订单不一致/],
   ['unconfirmed user', { status: 200, data: { ...latestLoginSession, user: {} } }, /缺少原账号或用户标识/],
@@ -208,7 +221,8 @@ for (const [name, sessionResponse, expected] of [
       authorizer: async () => assert.fail('checkout authorization must not run'),
       credentialUserEmail: 'saved@example.invalid',
       hasLoginSession: true,
-      sessionResponse,
+      sessionResponse: { status: 200, data: {} },
+      refreshResponse,
     });
     assert.equal(result.finish.status, 'failed');
     assert.match(result.finish.error, expected);
@@ -732,7 +746,7 @@ test('an unusual-activity checkout refusal retains the upstream diagnostic witho
   assert.equal(result.finish.status, 'failed');
   assert.equal(result.finish.error, 'HTTP 400：' + detail);
   assert.equal(result.requests.filter((r) => r.url.endsWith('/payments/checkout')).length, 1);
-  assert.equal(result.requests.filter((r) => new URL(r.url).pathname === '/api/auth/session').length, 2);
+  assert.equal(result.requests.filter((r) => new URL(r.url).pathname === '/api/auth/session').length, 1);
   assert.ok(!result.commands.some((c) => ['card', 'authorize'].includes(c.action)));
   assert.ok(!result.requests.some((r) => new URL(r.url).hostname === 'api.stripe.com'));
 });
