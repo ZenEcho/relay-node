@@ -3,6 +3,22 @@ import assert from 'node:assert/strict';
 import { HttpController } from '../../apps/worker/src/runtime/controller.js';
 import type { Assignment } from '../../packages/contracts/src/execution.js';
 
+test('lease checks piggyback the phase without uploading a checkpoint', async (t) => {
+  const requests: { url: string; body: unknown }[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string, input: RequestInit) => {
+    requests.push({ url, body: JSON.parse(String(input.body)) });
+    return new Response('{"ok":true}');
+  });
+  const controller = new HttpController('http://console.invalid', 'test-node-token');
+  const control = controller.forRun({ run: { id: 'original', workerLease: 'lease' } } as Assignment);
+  await control.assertActive!('checkout');
+  await control.assertActive!();
+  assert.deepEqual(requests, [
+    { url: 'http://console.invalid/api/worker/runs/original/check', body: { lease: 'lease', stage: 'checkout' } },
+    { url: 'http://console.invalid/api/worker/runs/original/check', body: { lease: 'lease' } },
+  ]);
+});
+
 test('card preparation has its own deadline, remains single-dispatch and still responds to cancellation', async (t) => {
   const deadlines: number[] = [];
   const timeout = AbortSignal.timeout;

@@ -80,5 +80,7 @@ export async function findSdkBrowser(configured?: string) {
       return path;
     } catch {}
   }
-  throw new Error('官方 SDK 环境需要 Chrome/Chromium，请安装或配置 officialSdk.executablePath');
+  throw Object.assign(new Error('官方 SDK 环境需要 Chrome/Chromium，请安装或配置 officialSdk.executablePath'), {
+    code: 'OFFICIAL_SDK_UNAVAILABLE',
+  });
 }

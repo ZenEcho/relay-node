@@ -549,36 +549,39 @@ export async function executeWithOnDemandSdk(
 }
 
 export async function withSdkLease<T>(
-  assignment: Assignment,
+  _assignment: Assignment,
   control: Control,
   action: () => Promise<T>,
 ): Promise<T> {
   throwIfExecutionAborted(control.signal);
-  let pending = Promise.resolve(),
-    failure: Error | undefined;
+  const renew = () =>
+    executionOperation(control.signal, async () => {
+      if (control.assertActive) await control.assertActive();
+      else await control.request('check');
+    });
+  if (control.assertActive) await renew();
+  let pending: Promise<void> | undefined;
+  let failure: { error: unknown } | undefined;
   const timer = setInterval(() => {
-    pending = pending
-      .then(async () => {
-        await executionOperation(control.signal, () =>
-          control.request('checkpoint', {
-            context: assignment.context,
-            stage: assignment.context.phase || 'official_sdk',
-          }),
-        );
-      })
+    // A slow lease check must not queue up renewals or overwrite a checkpoint.
+    if (pending || failure) return;
+    pending = renew()
       .catch((error) => {
-        failure = error;
+        failure = { error };
+      })
+      .finally(() => {
+        pending = undefined;
       });
   }, 30000);
   timer.unref();
+  let result: T;
   try {
-    if (control.assertActive) await executionOperation(control.signal, () => control.assertActive!());
-    const result = await executionOperation(control.signal, action);
-    await executionOperation(control.signal, () => pending);
-    throwIfExecutionAborted(control.signal);
-    if (failure) throw failure;
-    return result;
+    result = await executionOperation(control.signal, action);
   } finally {
     clearInterval(timer);
   }
+  await pending;
+  throwIfExecutionAborted(control.signal);
+  if (failure) throw failure.error;
+  return result;
 }

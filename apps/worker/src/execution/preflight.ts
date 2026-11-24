@@ -110,7 +110,7 @@ export async function sampleExecutionEgress(services: ExecutionServices, require
 export async function preflightExecution(services: ExecutionServices) {
   // Once the original environment is verified, subsequent samples are diagnostic.
   const required = !services.context.proxyVerified;
-  if (required) await services.checkpoint('proxy_check');
+  if (required) services.setStage('proxy_check');
   await sampleExecutionEgress(services, required);
   const readLatestSession =
     services.assignment.paymentEnabled &&
@@ -148,7 +148,7 @@ export async function preflightExecution(services: ExecutionServices) {
   } else bindBillingEmail(services.context, 'chatgpt');
   services.assignment.billing = services.context.billing || undefined;
   if (readLatestSession || !services.context.originalSubscription) {
-    await services.checkpoint('subscription_check');
+    services.setStage('subscription_check');
     const info = await services.chat(
       '查询原账号订阅',
       '/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-480',

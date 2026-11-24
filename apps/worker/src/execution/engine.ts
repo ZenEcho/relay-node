@@ -76,6 +76,7 @@ export class ProtocolEngine {
       context: this.context,
       log: this.log,
       command: this.command.bind(this),
+      setStage: this.setStage.bind(this),
       checkpoint: this.checkpoint.bind(this),
       request: this.request.bind(this),
       chat: this.chat.bind(this),
@@ -114,7 +115,10 @@ export class ProtocolEngine {
   private async checkpoint(stage: string) {
     throwIfExecutionAborted(this.control.signal);
     this.setStage(stage);
-    await this.command('checkpoint', { context: this.context, stage });
+    // The console audits committed checkpoints. Keep the order path free of a second copy.
+    await executionOperation(this.control.signal, () =>
+      this.control.request('checkpoint', { context: this.context, stage }),
+    );
   }
   private setStage(stage: string) {
     this.stage = stage;
@@ -132,7 +136,6 @@ export class ProtocolEngine {
     throwIfExecutionAborted(this.control.signal);
     if (action === 'step') return this.control.request(action, body);
     const names: Record<string, string> = {
-      checkpoint: '保存执行进度',
       card: '请求付款卡片',
       authorize: '请求付款派发授权',
       verification: '客户验证协调',
@@ -436,7 +439,7 @@ export class ProtocolEngine {
       )
         throw new Error('请配置完整的默认账单地址，或等待预备地址就绪');
       if (!this.context.checkout) {
-        await this.checkpoint('checkout');
+        this.setStage('checkout');
         const currencyConfig = await this.chat(
           '读取地区币种',
           '/backend-api/checkout_pricing_config/configs/' + this.context.environment.country,
@@ -831,7 +834,7 @@ export class ProtocolEngine {
         clientSecret = current.payment_intent?.client_secret;
       }
       if (!/^pi_[a-zA-Z0-9]+_secret_[a-zA-Z0-9]+$/.test(clientSecret || '')) {
-        await this.checkpoint('merchant_result_pending');
+        this.setStage('merchant_result_pending');
         await this.park('pending_confirmation', '商户请求已派发，尚未取得可核对的原 Intent');
         return;
       }

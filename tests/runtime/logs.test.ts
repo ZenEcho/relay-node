@@ -142,3 +142,92 @@ test('a completion queued during the start acknowledgement is delivered in the s
   assert.deepEqual(sent, ['running', 'failed']);
   assert.equal(logs.pending, 0);
 });
+
+test('a completed lease uploads in the background while another lease for the same run stays local', async (t) => {
+  const started = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  const sent: string[] = [];
+  const f = await fixture(t, [], async (r) => {
+    assert.equal(r.deferred, true);
+    sent.push(r.lease);
+    if (r.lease === 'first-lease') {
+      started.resolve();
+      await resume.promise;
+    }
+  });
+  const logs = await f.open();
+  logs.hold('run-1', 'first-lease');
+  logs.hold('run-1', 'second-lease');
+  logs.enqueueDeferred('run-1', 'first-lease', record(valid).step);
+  logs.enqueueDeferred('run-1', 'second-lease', record(randomUUID()).step);
+  await logs.flush();
+  assert.equal(sent.length, 0);
+  assert.equal((await f.read()).length, 2);
+
+  logs.release('run-1', 'first-lease');
+  assert.equal(sent.length, 0);
+  await started.promise;
+  assert.deepEqual(sent, ['first-lease']);
+  logs.enqueueDeferred('run-1', 'second-lease', record(randomUUID()).step);
+  await logs.persistPending();
+  assert.equal((await f.read()).length, 3);
+  assert.deepEqual(sent, ['first-lease']);
+  resume.resolve();
+  await logs.flush();
+  assert.deepEqual(sent, ['first-lease']);
+  assert.equal(logs.pending, 2);
+
+  logs.release('run-1', 'second-lease');
+  await logs.flush();
+  assert.deepEqual(sent, ['first-lease', 'second-lease', 'second-lease']);
+  assert.equal(logs.pending, 0);
+});
+
+test('held receipts survive a restart, retain the stable completion, and retry failed uploads', async (t) => {
+  let offline = true;
+  let attempts = 0;
+  const sent: string[] = [];
+  const f = await fixture(t, [], async (r) => {
+    attempts++;
+    assert.equal(r.deferred, true);
+    assert.equal(r.step.traceId, valid);
+    if (offline) throw Object.assign(new Error('unavailable'), { status: 503 });
+    sent.push(r.step.status);
+  });
+  let logs = await f.open();
+  logs.hold('run-1', 'private-lease');
+  logs.enqueueDeferred('run-1', 'private-lease', record(valid, false).step);
+  logs.enqueueDeferred('run-1', 'private-lease', record(valid).step);
+  logs.enqueueDeferred('run-1', 'private-lease', record(valid, false).step);
+  await logs.persistPending();
+  assert.equal(attempts, 0);
+
+  logs = await f.open();
+  await logs.flush();
+  assert.equal(attempts, 1);
+  assert.equal(logs.pending, 1);
+  offline = false;
+  await logs.flush();
+  assert.deepEqual(sent, ['failed']);
+  assert.equal(logs.pending, 0);
+});
+
+test('active log bursts share one background snapshot without starting an upload', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = await fixture(t, [], async () => { assert.fail('active lease attempted an upload'); });
+  const logs = await f.open();
+  const persisted = Promise.withResolvers<void>();
+  const persist = (logs as any).persist.bind(logs);
+  const writes = t.mock.method(logs as any, 'persist', async () => {
+    await persist();
+    persisted.resolve();
+  });
+  logs.hold('run-1', 'private-lease');
+  for (let index = 0; index < 10; index++)
+    logs.enqueueDeferred('run-1', 'private-lease', record(randomUUID()).step);
+  assert.equal(writes.mock.callCount(), 0);
+  t.mock.timers.tick(1000);
+  await persisted.promise;
+  assert.equal(writes.mock.callCount(), 1);
+  assert.equal((await f.read()).length, 10);
+});

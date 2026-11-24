@@ -106,7 +106,7 @@ export type ExecutionAssignment = {
 export type Assignment = ExecutionAssignment;
 export interface Control {
   signal?: AbortSignal;
-  assertActive?(): Promise<void>;
+  assertActive?(stage?: string): Promise<void>;
   request(action: string, body?: any): Promise<any>;
 }
 export type Step = {

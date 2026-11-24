@@ -35,8 +35,16 @@ export class HttpController {
   async flushLogs() {
     await this.logs.flush();
   }
+  async persistLogs() {
+    await this.logs.persistPending();
+  }
   get pendingLogs() {
     return this.logs.pending;
+  }
+  deferRunLogs(assignment: Assignment) {
+    const { id, workerLease } = assignment.run;
+    this.logs.hold(id, workerLease!);
+    return () => this.logs.release(id, workerLease!);
   }
   async logEvent(
     name: string,
@@ -63,7 +71,7 @@ export class HttpController {
           }
         : {}),
     };
-    if (assignment) await this.logs.enqueue(assignment.run.id, assignment.run.workerLease!, step);
+    if (assignment) this.logs.enqueueDeferred(assignment.run.id, assignment.run.workerLease!, step);
     else await this.logs.enqueueNode(step);
   }
   async request(path: string, body: any = {}, signal?: AbortSignal) {
@@ -125,7 +133,7 @@ export class HttpController {
     const request: Control['request'] = (action, body = {}) =>
       executionOperation(signal, async () => {
         if (action === 'step')
-          return this.logs.enqueue(assignment.run.id, assignment.run.workerLease!, {
+          return this.logs.enqueueDeferred(assignment.run.id, assignment.run.workerLease!, {
             ...body.step,
             traceId: body.step.traceId || randomUUID(),
           });
@@ -153,8 +161,8 @@ export class HttpController {
     return {
       signal,
       request,
-      assertActive: async () => {
-        await request('check');
+      assertActive: async (stage) => {
+        await request('check', { stage });
       },
     };
   }

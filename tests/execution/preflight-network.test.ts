@@ -25,6 +25,7 @@ function fixture(verified = false) {
   const services = {
     context,
     assignment: { mode: 'execute' },
+    setStage: (stage: string) => { context.phase = stage; },
     checkpoint: async () => {},
     request: async () => {
       requests++;

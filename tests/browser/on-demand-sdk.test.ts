@@ -268,43 +268,56 @@ test('isolated SDK profiles receive only the original login family and device co
   );
 });
 
-test('SDK work renews its original lease and stops the pulse when the SDK action finishes', async (t) => {
+test('SDK work renews its lease without queueing checks while a renewal is pending', async (t) => {
   t.mock.timers.enable({ apis: ['setInterval'] });
-  let finish!: (value: string) => void,
-    pulses = 0;
-  const assignment: any = { context: { phase: 'sentinel_ready' } };
+  const sdkStarted = Promise.withResolvers<void>();
+  const sdkResult = Promise.withResolvers<string>();
+  const renewalStarted = Promise.withResolvers<void>();
+  const renewalResult = Promise.withResolvers<void>();
+  let checks = 0;
   const pending = withSdkLease(
-    assignment,
+    {} as any,
     {
-      request: async (action, body) => {
-        assert.equal(action, 'checkpoint');
-        assert.equal(body.stage, 'sentinel_ready');
-        pulses++;
-        return {};
+      assertActive: async () => {
+        if (++checks === 1) return;
+        renewalStarted.resolve();
+        await renewalResult.promise;
       },
+      request: async (action) => assert.fail('unexpected control request: ' + action),
     },
-    () =>
-      new Promise<string>((resolve) => {
-        finish = resolve;
-      }),
+    () => {
+      sdkStarted.resolve();
+      return sdkResult.promise;
+    },
   );
+  await sdkStarted.promise;
   t.mock.timers.tick(30000);
+  await renewalStarted.promise;
+  t.mock.timers.tick(90000);
   await Promise.resolve();
-  finish('prepared');
+  assert.equal(checks, 2);
+  sdkResult.resolve('prepared');
+  const beforeRenewal = await Promise.race([
+    pending,
+    new Promise<string>((resolve) => setImmediate(() => resolve('renewal pending'))),
+  ]);
+  assert.equal(beforeRenewal, 'renewal pending');
+  renewalResult.resolve();
   assert.equal(await pending, 'prepared');
-  assert.equal(pulses, 1);
   t.mock.timers.tick(60000);
   await Promise.resolve();
-  assert.equal(pulses, 1);
+  assert.equal(checks, 2);
 });
 
 test('lost execution ownership prevents a prepared SDK result from reaching the payment phase', async (t) => {
   t.mock.timers.enable({ apis: ['setInterval'] });
   let finish!: () => void;
   const pending = withSdkLease(
-    { context: {} } as any,
+    {} as any,
     {
-      request: async () => {
+      request: async (action, body) => {
+        assert.equal(action, 'check');
+        assert.equal(body, undefined);
         throw new Error('lease revoked');
       },
     },
@@ -317,6 +330,32 @@ test('lost execution ownership prevents a prepared SDK result from reaching the 
   t.mock.timers.tick(30000);
   await Promise.resolve();
   finish();
+  await rejected;
+});
+
+test('cancellation discards SDK and lease check results still in flight', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const cancellation = new AbortController();
+  const sdkResult = Promise.withResolvers<string>();
+  const renewalStarted = Promise.withResolvers<void>();
+  const renewalResult = Promise.withResolvers<void>();
+  const pending = withSdkLease(
+    {} as any,
+    {
+      signal: cancellation.signal,
+      request: async () => {
+        renewalStarted.resolve();
+        await renewalResult.promise;
+      },
+    },
+    () => sdkResult.promise,
+  );
+  const rejected = assert.rejects(pending, { code: 'EXECUTION_ABORTED' });
+  t.mock.timers.tick(30000);
+  await renewalStarted.promise;
+  cancellation.abort();
+  sdkResult.resolve('late');
+  renewalResult.resolve();
   await rejected;
 });
 

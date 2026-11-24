@@ -6,6 +6,59 @@ import { join } from 'node:path';
 import { HttpController } from '../../apps/worker/src/runtime/controller.js';
 import type { Assignment } from '../../packages/contracts/src/execution.js';
 
+test('a blocked background log upload leaves other runs and their receipts independent', async (t) => {
+  const directory = await mkdtemp('/tmp/relay-deferred-node-logs-');
+  const previousDirectory = process.env.WORKER_LOG_DIR;
+  process.env.WORKER_LOG_DIR = directory;
+  const uploadStarted = Promise.withResolvers<void>();
+  const uploadGate = Promise.withResolvers<void>();
+  t.after(async () => {
+    uploadGate.resolve();
+    if (previousDirectory === undefined) delete process.env.WORKER_LOG_DIR;
+    else process.env.WORKER_LOG_DIR = previousDirectory;
+    await rm(directory, { recursive: true, force: true });
+  });
+  const receipts: string[] = [];
+  const uploads: { runId: string; deferred?: boolean }[] = [];
+  t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit) => {
+    if (url.endsWith('/logs')) {
+      const body = JSON.parse(String(init.body));
+      uploads.push(body);
+      if (body.runId === 'first') {
+        uploadStarted.resolve();
+        await uploadGate.promise;
+      }
+    } else receipts.push(url.split('/').slice(-2).join('/'));
+    return new Response('{"ok":true}');
+  });
+  const controller = new HttpController('http://console.invalid', 'test-node-token');
+  await controller.initializeLogs();
+  const first = { run: { id: 'first', workerLease: 'lease-1' } } as Assignment;
+  const second = { run: { id: 'second', workerLease: 'lease-2' } } as Assignment;
+  const releaseFirst = controller.deferRunLogs(first);
+  const releaseSecond = controller.deferRunLogs(second);
+  const firstControl = controller.forRun(first);
+  const secondControl = controller.forRun(second);
+  await firstControl.request('step', { step: { name: 'first request', status: 'succeeded' } });
+  await controller.flushLogs();
+  assert.deepEqual(uploads, []);
+  await firstControl.request('finish');
+  releaseFirst();
+  await uploadStarted.promise;
+  await secondControl.request('checkpoint');
+  await secondControl.request('step', { step: { name: 'second request', status: 'succeeded' } });
+  await secondControl.request('finish');
+  releaseSecond();
+  assert.deepEqual(receipts, ['first/finish', 'second/checkpoint', 'second/finish']);
+  assert.deepEqual(uploads.map(({ runId }) => runId), ['first']);
+  uploadGate.resolve();
+  await controller.flushLogs();
+  assert.deepEqual(uploads.map(({ runId, deferred }) => ({ runId, deferred })), [
+    { runId: 'first', deferred: true },
+    { runId: 'second', deferred: true },
+  ]);
+});
+
 test('runtime and order events share an encrypted outbox, survive restart and replay through their own endpoints', async (t) => {
   const directory = await mkdtemp('/tmp/relay-node-logs-');
   const previousDirectory = process.env.WORKER_LOG_DIR;

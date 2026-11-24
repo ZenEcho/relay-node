@@ -8,6 +8,7 @@ export async function cleanupExecution(services: ExecutionServices) {
   const cleanup = (services.context.cleanup ||= {});
   const config = services.assignment.run.workflow.cleanup;
   const chat = services.cleanupChat || services.chat;
+  let unsavedEffect = false;
   const perform = async (name: string, enabled: boolean, action: () => Promise<void>) => {
     throwIfExecutionAborted(services.signal);
     if (cleanup[name]?.status === 'succeeded') return;
@@ -22,14 +23,22 @@ export async function cleanupExecution(services: ExecutionServices) {
       });
       return;
     }
+    const stage = 'cleanup_' + name;
+    services.setStage(stage);
     try {
-      await services.checkpoint('cleanup_' + name);
+      // Save completed mutations before more cleanup work. The final receipt
+      // also saves them when there are no steps left to run.
+      if (unsavedEffect) {
+        await services.checkpoint(stage);
+        unsavedEffect = false;
+      }
       await trace(services.log, '收尾 · ' + name, { enabled }, async (capture) => {
         await action();
         throwIfExecutionAborted(services.signal);
         capture({ status: 'succeeded' });
       });
       cleanup[name] = { status: 'succeeded' };
+      unsavedEffect = name === 'registration' || name === 'cancel';
     } catch (error) {
       throwIfExecutionAborted(services.signal);
       cleanup[name] = {
@@ -53,8 +62,9 @@ export async function cleanupExecution(services: ExecutionServices) {
       // supplies iat; it must not prevent the official forced refresh request.
       const initial = await chat('读取当前 Session', '/api/auth/session', undefined, {
         'cache-control': 'no-cache',
-      }).catch(() => {
+      }).catch((error) => {
         throwIfExecutionAborted(services.signal);
+        if (error?.code === 'OFFICIAL_SDK_UNAVAILABLE') throw error;
         return services.context.session;
       });
       let iat: string | undefined;
@@ -126,7 +136,7 @@ export async function cleanupExecution(services: ExecutionServices) {
         sessionReady = true;
         if (config.refresh) cleanup.refresh = { status: 'succeeded' };
         // Persist rotated credentials before a later cancellation/invoice can fail.
-        await services.checkpoint('cleanup_refresh');
+        await services.checkpoint(services.context.phase || 'cleanup_refresh');
       } catch (error) {
         services.context.session = oldSession;
         throw error;
@@ -175,9 +185,8 @@ export async function cleanupExecution(services: ExecutionServices) {
   await perform('registration', true, async () => {
     if (services.assignment.run.dispatches.registration)
       throw new Error('原完成登记已派发但回执未确认，保留付款成功，不重复登记');
-    // Refresh first when login cookies are available. Never authorize a new
-    // registration with a credential already known to have failed refresh.
-    if (config.refresh || config.cancel || config.invoices) await refreshSession();
+    // Open the browser and validate its Session before consuming the one-time registration grant.
+    if (services.cleanupChat || config.refresh || config.cancel || config.invoices) await refreshSession();
     await services.command('authorize', { action: 'registration' });
     services.assignment.run.dispatches.registration = new Date().toISOString();
     const result = await chat('原订阅完成登记', '/backend-api/payments/checkout_session', {

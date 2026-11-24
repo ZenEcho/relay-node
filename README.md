@@ -15,6 +15,8 @@ Linux 请以 root 执行；也可 `sudo -E sh install.sh`。按提示输入实�
 
 安装包自带固定的 Node.js 运行时、原生 HTTP 组件及菜单，无需安装 pnpm、Node.js 或 Go。macOS 菜单位于 `~/.local/bin/relay-node`，请确保该目录在 PATH 中。
 
+真实订单收尾需要节点服务用户可执行的 Chrome 或 Chromium。手动部署时请准备浏览器，自定义安装路径通过实例 `config.json` 的 `officialSdk.executablePath` 指定绝对路径。
+
 ```sh
 relay-node
 relay-node --instance main status

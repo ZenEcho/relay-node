@@ -177,7 +177,7 @@ export async function runManager(root: string) {
         [join(directory, 'dist/apps/worker/src/entry.js'), '--self-test', directory],
         { timeout: 60000 },
       );
-      await controller.flushLogs();
+      await controller.persistLogs();
       await report('installing');
       await saveJson(join(root, 'upgrade.json'), {
         requestId: id,
@@ -410,11 +410,13 @@ export async function runManager(root: string) {
             (assignment: import('../../../../packages/contracts/src/execution.js').Assignment) => {
               const handle = cancellations.register(assignment.run.id, assignment.run.workerLease);
               if (handle && !handle.controller.signal.aborted) {
+                const taskController = controller;
+                const releaseLogs = taskController.deferRunLogs(assignment);
                 const task = log('执行节点接收订单', { request: { mode: assignment.mode } }, assignment)
                   .then(() =>
                     executeWithOnDemandSdk(
                       assignment,
-                      controller.forRun(assignment, handle.controller),
+                      taskController.forRun(assignment, handle.controller),
                       assignment.demo
                         ? new DemoTransport()
                         : new NativeTransport(join(releaseRoot, 'bin/relay-transport')),
@@ -443,6 +445,7 @@ export async function runManager(root: string) {
                   .finally(() => {
                     handle.dispose();
                     pending.delete(task);
+                    releaseLogs();
                   });
                 pending.add(task);
               } else handle?.dispose();
@@ -468,7 +471,7 @@ export async function runManager(root: string) {
     await Promise.allSettled(pending);
     await upgrading;
     await log('节点 · 停止');
-    await controller.flushLogs();
+    await controller.persistLogs();
   } finally {
     stopMetrics();
     server.close();

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { cleanupExecution } from '../../apps/worker/src/execution/cleanup.js';
+import { executeWithOnDemandSdk } from '../../apps/worker/src/browser/runtime.js';
 import { ProtocolEngine } from '../../apps/worker/src/execution/engine.js';
 import { UpstreamError } from '../../apps/worker/src/execution/http-utils.js';
 import { createEnvironment } from '../../packages/runtime/src/environment.js';
@@ -93,6 +94,7 @@ function fixture(
         accounts: { original: { account: { account_id: 'original' } } },
         user: { id: 'user' },
       };
+    if (path === '/backend-api/payments/checkout_session') return { success: true };
     if (options.rejectToken && path.includes('/subscriptions') && (!rejected || options.repeatRejection)) {
       rejected = true;
       throw new UpstreamError('HTTP 401: token expired', 401, {});
@@ -121,6 +123,7 @@ function fixture(
       commands.push({ action, body: structuredClone(body) });
       return {};
     },
+    setStage: (stage: string) => { context.phase = stage; },
     checkpoint: async () => {},
     log: async () => {},
   } as any;
@@ -187,6 +190,20 @@ test('disabling Session export still refreshes credentials required for cancella
   assert.equal(f.services.context.latestSession, undefined);
 });
 
+test('cleanup saves confirmed mutations before the next enabled step', async () => {
+  const f = fixture();
+  f.assignment.run.dispatches = {};
+  const saved: { stage: string; cleanup: Record<string, { status: string }> }[] = [];
+  f.services.checkpoint = async (stage) => {
+    saved.push({ stage, cleanup: structuredClone(f.services.context.cleanup!) });
+  };
+  await cleanupExecution(f.services);
+  assert.deepEqual(saved.map(({ stage }) => stage), ['cleanup_refresh', 'cleanup_cancel', 'cleanup_invoices']);
+  assert.equal(saved[1].cleanup.registration.status, 'succeeded');
+  assert.equal(saved[2].cleanup.cancel.status, 'succeeded');
+  assert.equal(f.commands.at(-1).body.cleanup.invoices.status, 'succeeded');
+});
+
 test('ProtocolEngine routes paid cleanup through the injected browser without native payment requests', async () => {
   const f = fixture();
   await new ProtocolEngine(
@@ -208,3 +225,33 @@ test('ProtocolEngine routes paid cleanup through the injected browser without na
     'succeeded',
   );
 });
+
+for (const cleanup of [{ refresh: true, cancel: true, invoices: true }, {}]) {
+  test(`a missing browser leaves paid cleanup recoverable with ${cleanup.refresh ? 'all' : 'no'} optional steps enabled`, async () => {
+    const f = fixture();
+    f.assignment.run.workflow.cleanup = cleanup;
+    f.assignment.run.dispatches = {};
+    await executeWithOnDemandSdk(
+      f.assignment,
+      { request: f.services.command },
+      {
+        initialize: async () => {},
+        close() {},
+        request: async () => assert.fail('no native payment or cleanup request'),
+      },
+      { executablePath: '/does-not-exist/Chrome' },
+    );
+    const result = f.commands.findLast((c) => c.action === 'finish').body;
+    assert.equal(result.status, 'completed');
+    for (const step of ['refresh', 'registration', 'cancel', 'invoices']) {
+      if (cleanup.refresh || step === 'registration') {
+        assert.equal(result.cleanup[step].status, 'failed');
+        assert.match(result.cleanup[step].error, /Chrome\/Chromium.*officialSdk\.executablePath/);
+      } else assert.equal(result.cleanup[step].status, 'skipped');
+    }
+    assert.equal(result.context.latestSession, undefined);
+    assert.ok(!f.commands.some((c) => c.action === 'authorize'));
+    assert.ok(!f.commands.some((c) => c.action === 'checkpoint'));
+    assert.ok(!f.commands.some((c) => c.body?.step?.name === '强制刷新最新 Session'));
+  });
+}

@@ -445,9 +445,13 @@ async function execute(
       return super.request(input);
     }
   }
+  const activeStages = new Set<string>();
   const control: Control = {
     signal: cancellation.signal,
-    async assertActive() { activeChecks++; },
+    async assertActive(stage) {
+      activeChecks++;
+      if (stage) activeStages.add(stage);
+    },
     async request(action, body = {}) {
       options.beforeCommand?.(action, body, assignment.context);
       commands.push({ action, body: structuredClone(body) });
@@ -481,6 +485,7 @@ async function execute(
     commands,
     sdkRequest,
     activeChecks,
+    activeStages,
     card,
     control,
     transport,
@@ -493,10 +498,13 @@ test('custom execution persists recovery boundaries without redundant phase or a
     credentialUserEmail: 'session@example.invalid' });
   assert.equal(result.finish.status, 'completed', result.finish.error);
   const stages = result.commands.filter((c) => c.action === 'checkpoint').map((c) => c.body.stage);
-  assert.equal(stages.length, 11);
-  for (const required of ['billing_email_ready', 'checkout_created', 'taxes_ready',
-    'elements_ready', 'confirmation_token_ready', 'intent_ready'])
-    assert.ok(stages.includes(required), required);
+  assert.deepEqual(stages, ['billing_email_ready', 'subscription_ready', 'checkout_created',
+    'taxes_ready', 'elements_ready', 'confirmation_token_ready', 'intent_ready']);
+  assert.equal(result.activeStages.size, 0);
+  const loggedStages = result.commands.filter((c) => c.action === 'step').map((c) => c.body.step.request?.stage);
+  for (const stage of ['proxy_check', 'subscription_check', 'checkout'])
+    assert.ok(loggedStages.includes(stage), stage);
+  assert.ok(!result.commands.some((c) => c.action === 'step' && c.body.step.name === '保存执行进度'));
   assert.equal(result.commands.filter((c) => c.action === 'card').length, 1);
   assert.deepEqual(result.commands.filter((c) => c.action === 'authorize').map((c) => c.body.action),
     ['merchant_confirm', 'stripe_confirm', 'registration']);
@@ -1410,7 +1418,12 @@ test('initial checkout configuration remains available when a tax snapshot omits
 });
 
 test('browser cleanup audit retains actual headers, status and a non-JSON failure response', async () => {
-  const result = await execute({ cleanupChat: async (_name, path, body, _headers, observe) => {
+  const result = await execute({ hasLoginSession: true, cleanupChat: async (_name, path, body, _headers, observe) => {
+    if (path.startsWith('/api/auth/session'))
+      return { accessToken: 'fixture-fresh', account: { id: 'demo-account' } };
+    if (path.startsWith('/backend-api/accounts/check/'))
+      return { accounts: { default: { account: { account_id: 'demo-account' } } } };
+    assert.equal(path, '/backend-api/payments/checkout_session');
     observe?.({ request: { method: 'POST', url: 'https://chatgpt.com' + path, headers: { authorization: 'Bearer browser-private', 'content-type': 'application/json' }, body: JSON.stringify(body) }, status: 503, headers: { 'x-request-id': ['browser-response-fixture'] }, body: '<html>upstream unavailable</html>' });
     throw new Error('browser cleanup failed');
   } });

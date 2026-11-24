@@ -8,6 +8,7 @@ export type ExecutionServices = {
   context: RuntimeContext;
   command: Control['request'];
   log(entry: AuditEntry): Promise<void>;
+  setStage(stage: string): void;
   checkpoint(stage: string): Promise<void>;
   request(name: string, input: HttpInput): Promise<HttpOutput>;
   chat(

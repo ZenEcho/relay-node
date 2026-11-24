@@ -151,7 +151,7 @@ export async function submitHostedCheckout(services: ExecutionServices) {
   });
   if (!['approved', 'success', 'succeeded'].includes(approval.result || approval.status))
     throw new Error('Hosted 商户审批未通过：' + String(approval.result || approval.status || '响应缺少状态'));
-  await services.checkpoint('hosted_approved');
+  services.setStage('hosted_approved');
   await reconcileHostedCheckout(services);
 }
 export async function reconcileHostedCheckout(services: ExecutionServices) {
