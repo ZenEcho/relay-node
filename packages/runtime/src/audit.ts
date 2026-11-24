@@ -5,7 +5,7 @@ import { transportDiagnostic, transportAttempts } from './transport-diagnostics.
 
 // Audit payloads have explicit limits. Never silently drop an oversized response.
 const sensitive =
-  /authorization|cookie|secret|cvv|cvc|password|passwd|^pwd$|signature|nonce|token|(?:api|app|auth|access).?key|^neek$|^key$|credential|sessionjson|^session$|latestsession|sentinel|attestation|rqdata|responsekey|pageaccess|card.?number|\[number\]|^number$|(?:^|\[)pan\]?$|captcha.*url|cipher|keyhash|tokenhash|workerlease|verification.*access|^cdkcode$/i;
+  /authorization|cookie|secret|cvv|cvc|password|passwd|^pwd$|signature|nonce|token|(?:api|app|auth|access).?key|^neek$|^key$|credential|sessionjson|^session$|latestsession|sentinel|attestation|rqdata|responsekey|pageaccess|card.?number|\[number\]|^number$|(?:^|\[)pan\]?$|captcha.*url|cipher|keyhash|tokenhash|workerlease|verification.*access|^cdkcode$|^exitIp$/i;
 const secretParameter =
   /^(?:auth|authorization|access|access_token|session|session_token|token|api[_-]?key|key|secret|password|pass|signature|sig|client_secret|accessToken)$/i;
 
