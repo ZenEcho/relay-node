@@ -284,6 +284,8 @@ async function execute(
     },
     close() {},
     request: async (input) => {
+      if (new URL(input.url).hostname === 'ipapi.co')
+        return { status: 200, headers: {}, body: '', data: { ip: '192.0.2.4', country_code: 'PH' } };
       native.push(structuredClone(input));
       const path = new URL(input.url).pathname + new URL(input.url).search;
       let data: any;

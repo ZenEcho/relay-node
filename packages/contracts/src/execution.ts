@@ -61,6 +61,14 @@ export type RuntimeContext = {
   renewalStatus?: string;
   latestSession?: string;
   proxyVerified?: boolean;
+  exitIp?: string;
+  exitCountry?: string;
+  exitFingerprint?: string;
+  exitProbe?: {
+    observedAt: string;
+    source: 'ipapi.co' | 'chatgpt.com';
+    simulated: boolean;
+  };
   originalSubscription?: Record<string, any>;
   billing?: Billing | null;
   billingEmailBinding?: BillingEmailBinding;

@@ -1217,7 +1217,7 @@ test('Stripe permission failure on confirmation leaves the original payment in r
   await new ProtocolEngine(result.assignment, result.control, result.transport, boundAuthorizer).execute();
   assert.deepEqual(
     result.requests.slice(requestCount).map(({ method, url }) => [method, new URL(url).pathname]),
-    [['GET', '/v1/payment_intents/' + intent.id]],
+    [['GET', '/json/'], ['GET', '/v1/payment_intents/' + intent.id]],
   );
   assert.ok(!result.commands.slice(commandCount).some((c) => ['card', 'authorize'].includes(c.action)));
   const recovered = result.commands.filter((c) => c.action === 'finish').at(-1)!.body;
@@ -1276,9 +1276,10 @@ for (const status of [200, 402]) {
     const originalIntentId = result.assignment.context.intent!.id;
     await new ProtocolEngine(result.assignment, result.control, result.transport, boundAuthorizer).execute();
     const recoveryRequests = result.requests.slice(requestCount);
-    assert.equal(recoveryRequests.length, 1);
-    assert.equal(recoveryRequests[0].method, 'GET');
-    assert.equal(new URL(recoveryRequests[0].url).pathname, '/v1/payment_intents/' + originalIntentId);
+    assert.deepEqual(
+      recoveryRequests.map(({ method, url }) => [method, new URL(url).pathname]),
+      [['GET', '/json/'], ['GET', '/v1/payment_intents/' + originalIntentId]],
+    );
     assert.ok(!result.commands.slice(commandCount).some((c) => ['card', 'authorize'].includes(c.action)));
     const recovered = result.commands.filter((c) => c.action === 'finish').at(-1)!.body;
     assert.equal(recovered.status, 'failed');
@@ -1686,7 +1687,15 @@ test('a declined card continues with the original checkout, Elements and Intent 
   });
   assert.equal(result.finish.status, 'completed', result.finish.error);
   assert.equal(result.requests[0].method, 'GET');
-  assert.ok(result.requests[0].url.includes('/payment_intents/' + context.intent!.id + '?'));
+  assert.equal(new URL(result.requests[0].url).hostname, 'ipapi.co');
+  assert.ok(result.requests[1].url.includes('/payment_intents/' + context.intent!.id + '?'));
+  const logs = result.commands.filter((c) => c.action === 'step').map((c) => c.body.step);
+  const probe = logs.find((step) => step.name === '记录本单网络出口');
+  const confirm = logs.find((step) => step.name === 'Stripe 原 Intent 确认');
+  assert.equal(probe.response.source, 'ipapi.co');
+  assert.equal(confirm.request.exitFingerprint, probe.response.exitFingerprint);
+  assert.equal(confirm.request.exitProbe.observedAt, probe.response.observedAt);
+  assert.equal(JSON.stringify(logs).includes(result.assignment.context.exitIp!), false);
   assert.equal(result.commands.filter((c) => c.action === 'card').length, 1);
   assert.deepEqual(result.commands.filter((c) => c.action === 'authorize' && c.body.action !== 'registration').map((c) => c.body.action), ['stripe_confirm']);
   const preparation = result.requests.slice(0, result.requests.findIndex((r) => r.method === 'POST' && r.url.includes('/payment_intents/')));

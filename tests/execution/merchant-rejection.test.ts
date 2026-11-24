@@ -67,7 +67,8 @@ async function run(change: any = {}) {
     transport,
   ).execute();
   return {
-    requests,
+    requests: requests.filter(({ url }) => /\/accounts\/check\/|\/payments\/checkout\//.test(url)),
+    probe: commands.find((c) => c.action === 'step' && c.body.step.name === '记录本单网络出口')?.body.step,
     finish: commands.filter((c) => c.action === 'finish').at(-1)?.body,
   };
 }
@@ -76,6 +77,8 @@ test('explicit subscription limit resolves failed only after original unpaid che
   assert.equal(result.finish.status, 'failed');
   assert.equal(result.finish.paymentOutcome, 'failed');
   assert.equal(result.requests.length, 2);
+  assert.equal(result.probe.status, 'failed');
+  assert.equal(result.probe.response.observed, false);
 });
 
 test('a recorded region refusal resolves failed only after checking the original unpaid checkout and free account', async () => {

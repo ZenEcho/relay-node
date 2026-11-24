@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { preflightExecution } from '../../apps/worker/src/execution/preflight.js';
+import { preflightExecution, sampleExecutionEgress } from '../../apps/worker/src/execution/preflight.js';
 import { createEnvironment } from '../../packages/runtime/src/environment.js';
 import { digest } from '../../packages/runtime/src/security.js';
 import type { ExecutionServices } from '../../apps/worker/src/execution/services.js';
@@ -24,7 +24,7 @@ function fixture(verified = false) {
   };
   const services = {
     context,
-    assignment: {},
+    assignment: { mode: 'execute' },
     checkpoint: async () => {},
     request: async () => {
       requests++;
@@ -47,7 +47,19 @@ test('verified exits get a correlation fingerprint without new raw network or cr
   await preflightExecution(f.services);
   assert.equal(f.requests(), 1);
   assert.equal(f.context.exitFingerprint, digest('203.0.113.42').slice(0, 12));
+  assert.match(f.context.exitProbe.observedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual((f.logs[0] as any).request, {
+    environmentId: f.context.environment.id,
+    profile: f.context.environment.profile,
+    executionMode: 'execute',
+    requestedCountry: 'PH',
+    networkMode: 'proxy',
+  });
   assert.deepEqual((f.logs[0] as any).response, {
+    observedAt: f.context.exitProbe.observedAt,
+    source: 'ipapi.co',
+    simulated: false,
+    observed: true,
     exitFingerprint: f.context.exitFingerprint,
     country: 'PH',
     requestedCountry: 'PH',
@@ -88,7 +100,10 @@ for (const actual of ['BR', 'FR']) {
     });
     assert.equal(f.context.exitCountry, actual);
     assert.equal(f.context.proxyVerified, false);
+    assert.equal((f.logs[0] as any).status, 'failed');
     assert.deepEqual((f.logs[0] as any).response, {
+      ...f.context.exitProbe,
+      observed: true,
       exitFingerprint: digest('203.0.113.42').slice(0, 12),
       country: actual,
       requestedCountry: 'CL',
@@ -99,12 +114,34 @@ for (const actual of ['BR', 'FR']) {
   });
 }
 
-test('resumed verified exits gain the fingerprint once without extracting or changing their proxy', async () => {
+test('resumed verified exits are sampled even when the fingerprint and proxy stay the same', async () => {
   const f = fixture(true),
     originalProxy = f.context.environment.proxyUrl;
   await preflightExecution(f.services);
   await preflightExecution(f.services);
-  assert.equal(f.requests(), 0);
-  assert.equal(f.logs.length, 1);
+  assert.equal(f.requests(), 2);
+  assert.equal(f.logs.length, 2);
+  assert.equal((f.logs[1] as any).response.exitChanged, false);
   assert.equal(f.context.environment.proxyUrl, originalProxy);
+});
+
+test('a fresh fallback probe reports a changed exit and failed diagnostics discard stale observations', async () => {
+  const f = fixture(true);
+  await sampleExecutionEgress(f.services);
+  f.services.request = async (_name, input) => ({
+    status: input.url.includes('ipapi.co') ? 403 : 200,
+    headers: {},
+    data: null,
+    body: 'h=chatgpt.com\nip=203.0.113.84\nloc=PH\n',
+  });
+  await sampleExecutionEgress(f.services);
+  assert.equal(f.context.exitFingerprint, digest('203.0.113.84').slice(0, 12));
+  assert.equal((f.logs[1] as any).response.source, 'chatgpt.com');
+  assert.equal((f.logs[1] as any).response.exitChanged, true);
+  f.services.request = async () => { throw new Error('diagnostic unavailable'); };
+  await sampleExecutionEgress(f.services);
+  assert.equal(f.context.exitProbe, undefined);
+  assert.equal(f.context.proxyVerified, true);
+  assert.equal((f.logs[2] as any).response.observed, false);
+  assert.equal((f.logs[2] as any).response.exitFingerprint, undefined);
 });

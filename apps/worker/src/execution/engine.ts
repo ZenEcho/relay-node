@@ -6,7 +6,8 @@ import {
 } from './hosted-checkout.js';
 import type { SentinelFlow, SentinelAuthorizer } from '../../../../packages/contracts/src/sentinel.js';
 import type { ExecutionServices } from './services.js';
-import { preflightExecution } from './preflight.js';
+import { preflightExecution, sampleExecutionEgress } from './preflight.js';
+import { egressProbeUrls } from '../../../../packages/runtime/src/egress.js';
 import { reconcilePayment } from './reconcile.js';
 import { acknowledgeVerification } from './verification-receipt.js';
 import { handlePaymentIntent } from './payment-intent.js';
@@ -162,6 +163,7 @@ export class ProtocolEngine {
   private async request(name: string, input: HttpInput, grant?: SentinelGrant) {
     throwIfExecutionAborted(this.control.signal);
     const environment = this.context.environment;
+    const egressProbe = input.url === egressProbeUrls.primary || input.url === egressProbeUrls.fallback;
     return trace(
       this.log,
       name,
@@ -173,10 +175,13 @@ export class ProtocolEngine {
         checkoutMode: this.context.checkoutMode || this.assignment.run.workflow?.checkoutMode || 'custom',
         profile: environment.profile,
         country: environment.country,
-        exitFingerprint: /^[a-f0-9]{12}$/.test(this.context.exitFingerprint || '')
-          ? this.context.exitFingerprint
-          : undefined,
-        exitCountry: /^[A-Z]{2}$/.test(this.context.exitCountry || '') ? this.context.exitCountry : undefined,
+        ...(this.context.exitProbe
+          ? {
+              exitProbe: this.context.exitProbe,
+              exitFingerprint: this.context.exitFingerprint,
+              exitCountry: this.context.exitCountry,
+            }
+          : {}),
         networkMode: environment.networkMode || (environment.proxyUrl ? 'proxy' : 'direct'),
         proxyUrl: environment.proxyUrl,
         cookieNames: environment.cookies.map((cookie) => cookie.name),
@@ -244,9 +249,11 @@ export class ProtocolEngine {
         capture(
           {
             status: output.status,
-            ...(integrationFailure
-              ? { stripe: integrationFailure.response }
-              : { headers: output.headers, body: output.data ?? output.body }),
+            ...(egressProbe
+              ? {}
+              : integrationFailure
+                ? { stripe: integrationFailure.response }
+                : { headers: output.headers, body: output.data ?? output.body }),
             diagnostic: transportDiagnostic(output.diagnostic),
             transportAttempts: transportAttempts(output.transportAttempts),
           },
@@ -256,7 +263,7 @@ export class ProtocolEngine {
           ([key]) => key.toLowerCase() === 'retry-after',
         )?.[1]?.[0];
         const delay = retryAfterMs(retryHeader);
-        if (output.status >= 400 && delay) {
+        if (!egressProbe && output.status >= 400 && delay) {
           this.context.retryAfterByOrigin ||= {};
           this.context.retryAfterByOrigin[origin] = Date.now() + delay;
           this.context.retryAfterAt = Math.max(
@@ -264,12 +271,12 @@ export class ProtocolEngine {
           );
         }
         if (integrationFailure) throw integrationFailure;
-        if (output.status < 200 || output.status >= 300)
-          throw new UpstreamError(
-            `HTTP ${output.status}：${output.data?.error?.message || output.data?.detail || output.data?.message || name}`,
-            output.status,
-            output.data,
-          );
+        if (output.status < 200 || output.status >= 300) {
+          const message = egressProbe
+            ? name
+            : output.data?.error?.message || output.data?.detail || output.data?.message || name;
+          throw new UpstreamError(`HTTP ${output.status}：${message}`, output.status, output.data);
+        }
         return output;
       },
       'http',
@@ -375,6 +382,8 @@ export class ProtocolEngine {
     this.control.signal?.addEventListener('abort', abort, { once: true });
     try {
       throwIfExecutionAborted(this.control.signal);
+      // A checkpoint may have been produced by another execution or node.
+      delete this.context.exitProbe;
       await trace(
         this.log,
         '初始化订单环境与凭证',
@@ -396,16 +405,19 @@ export class ProtocolEngine {
       );
       if (this.assignment.mode === 'cleanup') {
         this.paid = true;
+        await sampleExecutionEgress(this.services);
         await this.cleanup();
         return;
       }
       bindStripeCheckoutConfiguration(this.context);
       if (this.assignment.mode === 'reconcile' || this.assignment.run.paymentSubmitted) {
+        await sampleExecutionEgress(this.services);
         await this.reconcile();
         return;
       }
       if (this.context.checkoutResume) {
         this.setStage('card_replacement');
+        await sampleExecutionEgress(this.services);
         if (!(await this.verifyResumedCheckout())) return;
       } else await this.preflight();
       if (!this.assignment.paymentEnabled && !this.assignment.demo)

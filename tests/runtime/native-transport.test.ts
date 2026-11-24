@@ -383,6 +383,11 @@ for (const scenario of ['recover', 'fail'])
           environment: f.environment,
           exitFingerprint: 'abcdef123456',
           exitCountry: 'PH',
+          exitProbe: {
+            observedAt: '2026-11-24T07:00:00.000Z',
+            source: 'ipapi.co',
+            simulated: false,
+          },
         },
         run: {},
       } as any,
@@ -399,6 +404,7 @@ for (const scenario of ['recover', 'fail'])
     const parent = steps.filter((x) => x.name === '测试账号只读查询');
     const attempts = steps.filter((x) => x.name === '原生 HTTP 传输尝试');
     assert.equal(parent[0].request.exitFingerprint, 'abcdef123456');
+    assert.equal(parent[0].request.exitProbe.source, 'ipapi.co');
     assert.equal(attempts.filter((x) => x.status === 'running').length, scenario === 'recover' ? 2 : 3);
     assert.equal(new Set(attempts.map((x) => x.traceId)).size, scenario === 'recover' ? 2 : 3);
     if (scenario === 'recover') assert.equal(parent.at(-1).response.transportAttempts.length, 2);

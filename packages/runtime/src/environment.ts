@@ -13,10 +13,14 @@ export function createEnvironment(country: string, proxyUrl: string): Environmen
     proxyUrl,
     networkMode: proxyUrl ? 'proxy' : 'direct',
     deviceId: randomUUID(),
+    // Stripe.js stores its device identifiers as canonical UUIDs in
+    // __stripe_mid/__stripe_sid and replays them verbatim. A bare 32-hex string
+    // is not the same id, so the payment method would describe a device Stripe
+    // has never seen even when the rest of the environment is unchanged.
     stripeIds: {
-      guid: randomUUID().replaceAll('-', ''),
-      muid: randomUUID().replaceAll('-', ''),
-      sid: randomUUID().replaceAll('-', ''),
+      guid: randomUUID(),
+      muid: randomUUID(),
+      sid: randomUUID(),
     },
     cookies: [],
     headers: {

@@ -7,15 +7,25 @@ type EgressRequest = (input: {
   headers: Record<string, string>;
 }) => Promise<{ status: number; data: any; body: string }>;
 
+export const egressProbeUrls = {
+  primary: 'https://ipapi.co/json/',
+  fallback: 'https://chatgpt.com/cdn-cgi/trace',
+};
+
 export async function inspectEgress(request: EgressRequest) {
+  const { ip, country } = await observeEgress(request);
+  return { ip, country };
+}
+
+export async function observeEgress(request: EgressRequest) {
   // Both checks use the same transport/session, so an explicit workflow proxy stays pinned.
   let primary: Awaited<ReturnType<EgressRequest>> | undefined;
   let primaryError: unknown;
   try {
     primary = await request({
       method: 'GET',
-      url: 'https://ipapi.co/json/',
-      headers: { accept: 'application/json' },
+      url: egressProbeUrls.primary,
+      headers: { accept: 'application/json', 'cache-control': 'no-cache' },
     });
   } catch (error) {
     const e = error as { code?: string; name?: string };
@@ -31,11 +41,12 @@ export async function inspectEgress(request: EgressRequest) {
     return {
       ip: primary.data.ip as string,
       country: primary.data.country_code as string,
+      source: 'ipapi.co' as const,
     };
   const fallback = await request({
     method: 'GET',
-    url: 'https://chatgpt.com/cdn-cgi/trace',
-    headers: { accept: 'text/plain' },
+    url: egressProbeUrls.fallback,
+    headers: { accept: 'text/plain', 'cache-control': 'no-cache' },
   });
   const values = new URLSearchParams(fallback.body.trim().split('\n').join('&'));
   const ip = values.get('ip') || '',
@@ -54,5 +65,5 @@ export async function inspectEgress(request: EgressRequest) {
       ),
       primaryError ? { cause: primaryError } : {},
     );
-  return { ip, country };
+  return { ip, country, source: 'chatgpt.com' as const };
 }

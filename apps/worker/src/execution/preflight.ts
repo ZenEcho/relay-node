@@ -1,6 +1,6 @@
-import { inspectEgress } from '../../../../packages/runtime/src/egress.js';
+import { observeEgress } from '../../../../packages/runtime/src/egress.js';
 import { digest } from '../../../../packages/runtime/src/security.js';
-import { isIP } from 'node:net';
+import { throwIfExecutionAborted } from '../../../../packages/runtime/src/cancellation.js';
 import { bindBillingEmail, selectBillingEmail } from '../../../../packages/rules/src/billing-email.js';
 import { hasChatgptSessionCookie, verifySessionIdentity } from './credentials.js';
 import { UpstreamError } from './http-utils.js';
@@ -35,12 +35,22 @@ async function readCheckoutSession(services: ExecutionServices) {
   }
 }
 
-export async function preflightExecution(services: ExecutionServices) {
-  if (!services.context.proxyVerified) {
-    await services.checkpoint('proxy_check');
-    const proxied =
-      services.context.environment.networkMode === 'proxy' || !!services.context.environment.proxyUrl;
-    const result = await inspectEgress(async (input) => {
+export async function sampleExecutionEgress(services: ExecutionServices, required = false) {
+  const { context, assignment } = services;
+  const { environment } = context;
+  const proxied = environment.networkMode === 'proxy' || !!environment.proxyUrl;
+  const simulated = assignment.demo === true;
+  const request = {
+    environmentId: environment.id,
+    profile: environment.profile,
+    executionMode: assignment.mode,
+    requestedCountry: environment.country,
+    networkMode: proxied ? 'proxy' : 'direct',
+  };
+  delete context.exitProbe;
+  let result: Awaited<ReturnType<typeof observeEgress>>;
+  try {
+    result = await observeEgress(async (input) => {
       try {
         return await services.request(proxied ? '检查本单代理出口' : '检查执行节点本机出口', input);
       } catch (error) {
@@ -48,41 +58,60 @@ export async function preflightExecution(services: ExecutionServices) {
         return { status: error.status, data: error.data, body: '' };
       }
     });
-    services.context.exitIp = result.ip;
-    services.context.exitCountry = result.country;
-    services.context.proxyVerified = !proxied || result.country === services.context.environment.country;
-  }
-  const exitIp = services.context.exitIp;
-  if (
-    typeof exitIp === 'string' &&
-    isIP(exitIp) &&
-    services.context.exitFingerprint !== digest(exitIp).slice(0, 12)
-  ) {
-    // A shared proxy gateway can assign different real exits. Correlate the
-    // measured exit without adding its address or location to diagnostic logs.
-    services.context.exitFingerprint = digest(exitIp).slice(0, 12);
+  } catch (error) {
+    throwIfExecutionAborted(services.signal);
+    const failure = error as { code?: string; name?: string };
+    if (failure?.code === 'EXECUTION_ABORTED' || failure?.name === 'AbortError') throw error;
     await services.log({
       name: '记录本单网络出口',
-      status: 'succeeded',
+      status: 'failed',
       category: 'event',
-      response: {
-        exitFingerprint: services.context.exitFingerprint,
-        country: /^[A-Z]{2}$/.test(services.context.exitCountry || '')
-          ? services.context.exitCountry
-          : undefined,
-        requestedCountry: services.context.environment.country,
-        verified: services.context.proxyVerified === true,
-        networkMode: services.context.environment.proxyUrl ? 'proxy' : 'direct',
-      },
+      request,
+      response: { observed: false, checkedAt: new Date().toISOString(), simulated },
+      error: '无法确认本次执行的网络出口',
     });
+    if (required) throw error;
+    return;
   }
-  if (!services.context.proxyVerified)
+  const previousFingerprint = context.exitFingerprint;
+  context.exitIp = result.ip;
+  context.exitCountry = result.country;
+  context.exitFingerprint = digest(result.ip).slice(0, 12);
+  context.exitProbe = { observedAt: new Date().toISOString(), source: result.source, simulated };
+  const verified = !proxied || result.country === environment.country;
+  if (required) context.proxyVerified = verified;
+  await services.log({
+    name: '记录本单网络出口',
+    status: verified ? 'succeeded' : 'failed',
+    category: 'event',
+    request,
+    response: {
+      ...context.exitProbe,
+      observed: true,
+      exitFingerprint: context.exitFingerprint,
+      country: result.country,
+      requestedCountry: environment.country,
+      verified,
+      networkMode: request.networkMode,
+      ...(previousFingerprint !== undefined
+        ? { exitChanged: previousFingerprint !== context.exitFingerprint }
+        : {}),
+    },
+  });
+  if (required && !verified)
     throw Object.assign(
       new Error(
-        `代理出口国家与订单地区不匹配：期望 ${services.context.environment.country}，实际 ${services.context.exitCountry}`,
+        `代理出口国家与订单地区不匹配：期望 ${environment.country}，实际 ${result.country}`,
       ),
       { code: 'PROXY_COUNTRY_MISMATCH' },
     );
+}
+
+export async function preflightExecution(services: ExecutionServices) {
+  // Once the original environment is verified, subsequent samples are diagnostic.
+  const required = !services.context.proxyVerified;
+  if (required) await services.checkpoint('proxy_check');
+  await sampleExecutionEgress(services, required);
   const readLatestSession =
     services.assignment.paymentEnabled &&
     !services.assignment.demo &&
