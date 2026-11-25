@@ -54,8 +54,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: node-*
-          merge-multiple: true
-          path: release
+          path: artifacts
       - name: Verify complete release and publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -63,9 +62,12 @@ jobs:
           set -eu
           version=$(cat VERSION)
           test "$GITHUB_REF_NAME" = "v$version"
-          for arch in x64 arm64; do test -f "release/relay-node-$version-linux-$arch.tar.gz"; done
-          test -f "release/relay-node-sdk-$version.tgz"
+          mkdir release
+          cp "artifacts/node-ubuntu-24.04/relay-node-$version-linux-x64.tar.gz" \
+            "artifacts/node-ubuntu-24.04-arm/relay-node-$version-linux-arm64.tar.gz" \
+            "artifacts/node-ubuntu-24.04/relay-node-sdk-$version.tgz" release/
           cd release
+          gzip -t relay-node-*.tar.gz relay-node-sdk-*.tgz
           sha256sum relay-node-*.tar.gz relay-node-sdk-*.tgz > SHA256SUMS
           gh release create "v$version" --repo "$GITHUB_REPOSITORY" --draft --title "Relay Node v$version" --generate-notes
           gh release upload "v$version" ./*.tar.gz ./*sdk*.tgz SHA256SUMS --repo "$GITHUB_REPOSITORY"
