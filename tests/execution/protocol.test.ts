@@ -180,6 +180,7 @@ for (const checkoutMode of ['custom', 'hosted'] as const) {
   test(`${checkoutMode} uses the forced refresh response for the first checkout`, async () => {
     const result = await execute({
       checkoutMode,
+      cdkPaymentCurrency: '-',
       demo: false,
       authorizer: boundAuthorizer,
       credentialUserEmail: 'saved@example.invalid',
@@ -318,6 +319,7 @@ async function execute(
     initialContext?: RuntimeContext;
     checkoutReadResponse?: HttpOutput;
     authorizeFailures?: number;
+    cdkPaymentCurrency?: string;
   } = {},
 ) {
   const environment = createEnvironment('PH', options.proxyUrl || '');
@@ -325,7 +327,7 @@ async function execute(
   const assignment = {
     run: {
       id: 'custom-order',
-      order: { cdkRedeemType: 'gpt_plus', cdkPaymentCurrency: 'PHP' },
+      order: { cdkRedeemType: 'gpt_plus', cdkPaymentCurrency: options.cdkPaymentCurrency ?? 'PHP' },
       workflow: {
         plan: 'gpt_plus',
         cleanup: {},
@@ -683,8 +685,16 @@ test('native first-attempt audits share the dispatch guard while retries get a f
   assert.equal(retry.activeChecks, first.activeChecks + 1);
 });
 
+test('a supplied order currency skips the pricing lookup and is used for checkout', async () => {
+  const result = await execute({ cdkPaymentCurrency: 'php' });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  assert.ok(!result.requests.some((request) => request.url.includes('/checkout_pricing_config/')));
+  const checkout = result.requests.find((request) => new URL(request.url).pathname === '/backend-api/payments/checkout')!;
+  assert.equal(JSON.parse(checkout.body!).billing_details.currency, 'PHP');
+});
+
 test('custom oaics flow requires Sentinel and forwards both token headers without depending on the homepage', async () => {
-  const result = await execute();
+  const result = await execute({ cdkPaymentCurrency: '-' });
   assert.equal(result.finish.status, 'completed', result.finish.error);
   const account = result.requests.find((r) => r.url.includes('/accounts/check/'))!;
   assert.equal(account.headers?.['x-openai-target-route'], '/backend-api/accounts/check/{version}');
@@ -1734,6 +1744,40 @@ test('a checkout of another selected type stops before card access and never swi
     assert.ok(!result.commands.some((c) => c.action === 'card' || c.action === 'authorize'));
     assert.equal(result.requests.filter((r) => r.url.endsWith('/payments/checkout')).length, 1);
   }
+});
+
+test('the official create response decides the mode even when the workflow prefers the other one', async () => {
+  // 工作流要 custom，官方却建了 hosted：以官方为准，不按我们偏好的前缀判类型不匹配。
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    checkoutMode: 'custom',
+    checkoutResponse: {
+      status: 200,
+      headers: {},
+      body: '',
+      data: {
+        internal_checkout_session_id: 'cs_live_official',
+        checkout_ui_mode: 'hosted',
+        processor_entity: 'openai_llc',
+        url: 'https://checkout.stripe.com/c/pay/cs_live_official',
+      },
+    },
+  });
+  assert.equal(result.assignment.context.checkout!.id, 'cs_live_official');
+  assert.equal(result.assignment.context.checkoutMode, 'hosted');
+  assert.equal(result.assignment.context.officialCheckoutMode, 'hosted');
+  assert.ok(
+    result.commands.some(
+      (c) => c.action === 'step' && c.body.step.name === '支付链接类型 · hosted（官方指定）',
+    ),
+  );
+  assert.ok(!/类型不匹配/.test(result.finish.error || ''));
+  assert.equal(
+    result.requests.filter((r) => r.url.endsWith('/payments/checkout')).length,
+    1,
+    '不应当因为模式不同就重建结账',
+  );
 });
 
 test('hosted recovery reads the original page and never replays confirmation or approval', async () => {

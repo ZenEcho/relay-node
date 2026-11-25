@@ -76,6 +76,11 @@ export type RuntimeContext = {
   stripeDevice?: { muid: string; guid: string; sid: string };
   billing?: Billing | null;
   billingEmailBinding?: BillingEmailBinding;
+  // The mode this checkout actually runs in. gpt 官方建单接口可以覆盖工作流的
+  // 偏好，所以这个值以官方返回为准，不总是等于 workflow.checkoutMode。
+  checkoutMode?: 'custom' | 'hosted';
+  // Set when the official response picked a mode other than the one requested.
+  officialCheckoutMode?: 'custom' | 'hosted';
   checkoutResume?: {
     sourceRunId: string;
     checkoutId: string;
@@ -95,6 +100,10 @@ export type ExecutionSnapshot = {
   workflow: {
     plan: string;
     checkoutMode?: 'custom' | 'hosted';
+    // Set on a card-decline mode-fallback attempt: the mode that already
+    // declined for this order. Official mode wins, so a fallback that comes
+    // back pinned to this mode must stop instead of opening another card.
+    checkoutModeFallbackFrom?: 'custom' | 'hosted';
     billingCountry?: string;
     cleanup: { refresh: boolean; cancel: boolean; invoices: boolean };
   };

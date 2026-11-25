@@ -12,6 +12,13 @@ import { reconcilePayment } from './reconcile.js';
 import { acknowledgeVerification } from './verification-receipt.js';
 import { handlePaymentIntent } from './payment-intent.js';
 import { paymentIntentFromResponse } from './intent-binding.js';
+import {
+  adoptCheckoutMode,
+  isCheckoutModeRejection,
+  modeFallbackBlocked,
+  zeroAmountRequiresCustom,
+  type CheckoutMode,
+} from './checkout-mode.js';
 import { cleanupExecution } from './cleanup.js';
 import { UpstreamError, form } from './http-utils.js';
 import { stripeIntegrationError } from './stripe-response.js';
@@ -65,6 +72,14 @@ function retryableAuthorize(error: unknown) {
   const status = e?.status || e?.statusCode || e?.httpResponse?.status || 0;
   return status === 0 || status === 429 || status >= 500;
 }
+// A guard that no retry can satisfy: report it once with retryable=false so the
+// console stops the order instead of replaying the same checkout.
+function terminal(message: string) {
+  const error = new Error(message);
+  (error as any).retryable = false;
+  return error;
+}
+
 export class ProtocolEngine {
   private context: RuntimeContext;
   private stage = 'preflight';
@@ -422,6 +437,50 @@ export class ProtocolEngine {
       }, grant)
     ).data;
   }
+  private async createCheckout(requested: CheckoutMode, currency: string) {
+    const body = (mode: CheckoutMode) => ({
+      plan_name: paymentPlan(this.assignment.run.workflow.plan).planName,
+      billing_details: { country: this.context.environment.country, currency },
+      ...(mode === 'hosted'
+        ? { checkout_ui_mode: 'hosted', cancel_url: CHAT + '/#pricing' }
+        : {
+            entry_point: 'all_plans_pricing_modal',
+            checkout_ui_mode: 'custom',
+            processor_entity: 'openai_llc',
+          }),
+    });
+    let result: any;
+    let attempted: CheckoutMode = requested;
+    try {
+      result = await this.chat('创建支付链接', '/backend-api/payments/checkout', body(requested));
+    } catch (error) {
+      // 官方只允许另一种模式时，换一次再试；其它失败保持原样抛出。
+      if (!isCheckoutModeRejection(error)) throw error;
+      attempted = requested === 'custom' ? 'hosted' : 'custom';
+      await this.log({
+        name: '支付链接模式互备 · ' + attempted,
+        category: 'event',
+        status: 'succeeded',
+        response: { attempted: requested, fallback: attempted },
+      });
+      result = await this.chat('创建支付链接', '/backend-api/payments/checkout', body(attempted));
+    }
+    const candidates = [
+      result.internal_checkout_session_id,
+      result.internalCheckoutSessionId,
+      result.checkout_session?.id,
+      result.checkout_session_id,
+      result.checkoutSessionId,
+    ];
+    const adopted = adoptCheckoutMode(attempted, result.checkout_ui_mode, candidates.find(
+      (value): value is string => typeof value === 'string',
+    ));
+    const prefix = adopted.mode === 'hosted' ? 'cs_' : 'oaics_';
+    const id = candidates.find((value) => typeof value === 'string' && value.startsWith(prefix));
+    if (!id || !/^(oaics_|cs_(?:live_|test_))[a-zA-Z0-9_]+$/.test(id))
+      throw new Error('返回的支付链接与官方结账模式 ' + adopted.mode + ' 不匹配');
+    return { id, result, mode: adopted.mode, official: adopted.official || attempted !== requested };
+  }
   private async stripe(name: string, path: string, body?: Record<string, any>) {
     return (
       await this.request(name, {
@@ -506,15 +565,14 @@ export class ProtocolEngine {
         throw new Error('请配置完整的默认账单地址，或等待预备地址就绪');
       if (!this.context.checkout) {
         this.setStage('checkout');
-        const currencyConfig = await this.chat(
-          '读取地区币种',
-          '/backend-api/checkout_pricing_config/configs/' + this.context.environment.country,
-        );
         const explicitCurrency = this.assignment.run.order.cdkPaymentCurrency;
         const currency =
           explicitCurrency && explicitCurrency !== '-'
             ? explicitCurrency.toUpperCase()
-            : currencyConfig?.currency_config?.symbol_code;
+            : (await this.chat(
+                '读取地区币种',
+                '/backend-api/checkout_pricing_config/configs/' + this.context.environment.country,
+              ))?.currency_config?.symbol_code;
         if (!currency) throw new Error('报价接口未返回地区币种');
         if (typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency))
           throw new Error('结账币种必须为三位大写货币代码');
@@ -523,57 +581,53 @@ export class ProtocolEngine {
         // all reads, then scope it to this single checkout write.
         await this.requireSentinel('chatgpt_checkout');
         this.setStage('checkout');
-        const result = await this.chat('创建支付链接', '/backend-api/payments/checkout', {
-          plan_name: paymentPlan(this.assignment.run.workflow.plan).planName,
-          billing_details: {
-            country: this.context.environment.country,
-            currency,
-          },
-          ...(this.assignment.run.workflow.checkoutMode === 'hosted'
-            ? { checkout_ui_mode: 'hosted', cancel_url: CHAT + '/#pricing' }
-            : {
-                entry_point: 'all_plans_pricing_modal',
-                checkout_ui_mode: 'custom',
-                processor_entity: 'openai_llc',
-              }),
-        });
-        const mode = this.assignment.run.workflow.checkoutMode || 'custom';
-        const candidates = [
-          result.internal_checkout_session_id,
-          result.internalCheckoutSessionId,
-          result.checkout_session?.id,
-          result.checkout_session_id,
-          result.checkoutSessionId,
-        ];
-        const prefix = mode === 'hosted' ? 'cs_' : 'oaics_';
-        const id = candidates.find((value) => typeof value === 'string' && value.startsWith(prefix));
-        if (!id || !/^(oaics_|cs_(?:live_|test_))[a-zA-Z0-9_]+$/.test(id))
-          throw new Error('返回的支付链接与所选 ' + mode + ' 类型不匹配');
-        this.context.checkoutMode = mode;
+        // 官方建单接口决定这个账号能用哪种结账模式：我们只提交偏好，响应里的
+        // checkout_ui_mode（或会话前缀）才是本单真实模式。
+        const requested: CheckoutMode =
+          this.assignment.run.workflow.checkoutMode === 'hosted' ? 'hosted' : 'custom';
+        const created = await this.createCheckout(requested, currency);
+        if (
+          modeFallbackBlocked(created.mode, this.assignment.run.workflow.checkoutModeFallbackFrom)
+        )
+          // 重开还是被钉回拒付过的模式，再试只会重复同一个失败：直接终结。
+          throw terminal(
+            '官方固定使用 ' +
+              created.mode +
+              ' 结账，本单已在该模式下拒付，模式互备没有可用分支',
+          );
+        this.context.checkoutMode = created.mode;
+        if (created.official) this.context.officialCheckoutMode = created.mode;
         this.context.checkout = {
-          id,
-          processor_entity: result.processor_entity || 'openai_llc',
-          ...(mode === 'hosted'
+          id: created.id,
+          processor_entity: created.result.processor_entity || 'openai_llc',
+          ...(created.mode === 'hosted'
             ? {
-                url: result.url || result.checkout_url || result.checkout_session?.url,
+                url:
+                  created.result.url ||
+                  created.result.checkout_url ||
+                  created.result.checkout_session?.url,
               }
             : {}),
         };
         // Preserve the original response's configuration across checkpoints;
         // subsequent tax snapshots may omit these optional fields.
-        this.context.confirmReturnUrl = result.confirm_return_url;
-        this.context.customerSessionClientSecret ||= result.customer_session_client_secret;
-        bindStripeCheckoutConfiguration(this.context, result);
+        this.context.confirmReturnUrl = created.result.confirm_return_url;
+        this.context.customerSessionClientSecret ||= created.result.customer_session_client_secret;
+        bindStripeCheckoutConfiguration(this.context, created.result);
       }
       this.context.checkoutMode ||= this.context.checkout!.id.startsWith('cs_') ? 'hosted' : 'custom';
       if (!this.context.checkoutTypeLogged) {
         await this.log({
-          name: '支付链接类型 · ' + this.context.checkoutMode,
+          name:
+            '支付链接类型 · ' +
+            this.context.checkoutMode +
+            (this.context.officialCheckoutMode ? '（官方指定）' : ''),
           category: 'event',
           status: 'succeeded',
           response: {
             checkoutMode: this.context.checkoutMode,
             checkoutId: this.context.checkout!.id,
+            official: Boolean(this.context.officialCheckoutMode),
           },
         });
         this.context.checkoutTypeLogged = true;
@@ -633,7 +687,6 @@ export class ProtocolEngine {
       // Older checkpoints may carry these only on the checkout snapshot.
       this.context.confirmReturnUrl ||= this.context.snapshot.confirm_return_url;
       this.context.customerSessionClientSecret ||= this.context.snapshot.customer_session_client_secret;
-      if (hosted) await prepareHostedCheckout(this.services);
       const amount =
         this.context.snapshot.amount_total ??
         this.context.snapshot.checkout_state?.total?.total?.minorUnitsAmount;
@@ -653,6 +706,18 @@ export class ProtocolEngine {
         throw new Error('原结账金额、币种或标识无法核验，停止准备卡片');
       this.context.snapshot.amount_total = amount;
       this.context.snapshot.currency = currency.toLowerCase();
+      // 零元结账必须落在 custom（oaics_）支付页上：官方 hosted 页面按正常价
+      // 收单，0 元优惠不会生效。这里以官方金额为准判断，0 元却在 hosted 就停。
+      const effectiveMode: CheckoutMode =
+        this.context.checkoutMode === 'hosted' ? 'hosted' : 'custom';
+      if (zeroAmountRequiresCustom(effectiveMode, amount))
+        // 0 元单在 hosted 上会按正常价收单，重试同一个模式不会变好：终结等人工核对。
+        throw terminal(
+          '零元结账必须使用 custom（oaics_）支付页，当前是 ' +
+            effectiveMode +
+            '，已停止准备卡片',
+        );
+      if (hosted) await prepareHostedCheckout(this.services);
       if (!this.context.elements && !this.stripeTokenProvider) {
         this.context.clientSessionId ||= randomUUID();
         this.context.elements = await this.stripe(
