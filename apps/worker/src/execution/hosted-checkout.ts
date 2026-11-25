@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { form } from './http-utils.js';
+import { UpstreamError, form } from './http-utils.js';
 import type { ExecutionServices } from './services.js';
 import { paymentIntentFromResponse } from './intent-binding.js';
 
@@ -8,6 +8,14 @@ const VERSION = '2025-03-31.basil; checkout_server_update_beta=v1; checkout_manu
 export const referenceHostedKey =
   'pk_live_51HOrSwC6h1nxGoI3lTAgRjYVrz4dU3fVOabyCcKR3pbEJguCVAlqCxdxCUvoRh1XWwRacViovU3kLKvpkjh7IqkW00iXQsjo3n';
 const CHAT = 'https://chatgpt.com';
+// Stripe 在 OAI approve 之后才真正提交付款，并异步创建 PaymentIntent。页面上的
+// expected_amount、submission_attempt 与 /poll 终态才是这段链路的真相。
+const PAGE_ROUNDS = 4;
+const PAGE_INTERVAL_MS = 1500;
+const COMPLETION_ROUNDS = 8;
+const COMPLETION_INTERVAL_MS = 2000;
+const PAID_STATES = ['paid', 'success', 'succeeded', 'complete', 'completed', 'processing', 'requires_capture'];
+const FAILED_STATES = ['failed', 'expired', 'canceled', 'cancelled'];
 
 // Hosted URLs carry Stripe's public client configuration (base64, XOR 5).
 export function hostedPublishableKey(value: unknown, checkoutId: string): string | undefined {
@@ -29,6 +37,70 @@ export function hostedPublishableKey(value: unknown, checkoutId: string): string
   } catch {
     return;
   }
+}
+
+/**
+ * expected_amount 只认官方返回：hosted 页面的 total_summary.due 就是 Stripe 按
+ * 本单账单地区算出来的应付金额，地区换了数字自己就变，这里不做任何地区或税率
+ * 判断。/taxes 快照上的 amount_total 是建单时的值，页面更新后会过期。
+ */
+export function hostedAmountTotal(page: any): number | undefined {
+  const summary = page?.total_summary || page?.checkout_session?.total_summary;
+  const candidates = [
+    summary?.due,
+    summary?.total,
+    page?.amount_due,
+    page?.amount_total,
+    page?.invoice?.amount_due,
+  ];
+  return candidates.find((value) => Number.isSafeInteger(value) && value >= 0);
+}
+
+// 更新页面的响应一定带 total_summary；只有它才反映重算后的税额，不能拿旧快照补。
+function summaryAmount(page: any): number | undefined {
+  const summary = page?.total_summary || page?.checkout_session?.total_summary;
+  const value = summary?.due ?? summary?.total;
+  return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+/** 审批后的提交失败只出现在 submission_attempt 上，页面本身仍是 open/unpaid。 */
+export function hostedSubmissionFailure(page: any): string | undefined {
+  const attempt = page?.submission_attempt || page?.submissionAttempt;
+  if (!attempt || attempt.state !== 'failed') return undefined;
+  return String(attempt.error?.code || attempt.error?.decline_code || 'checkout_submission_failed');
+}
+
+function terminalError(message: string) {
+  const error = new Error(message);
+  (error as any).retryable = false;
+  return error;
+}
+
+// Stripe 已明确拒绝这次提交（未创建 PaymentIntent），后台无需再挂着等结果。
+function rejectedError(message: string) {
+  const error = terminalError(message);
+  (error as any).paymentRejected = true;
+  return error;
+}
+
+function abortError() {
+  return Object.assign(new Error('执行已取消'), { code: 'EXECUTION_ABORTED' });
+}
+
+function sleep(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) return reject(abortError());
+    const timer = setTimeout(done, ms);
+    function done() {
+      signal?.removeEventListener('abort', cancelled);
+      resolve();
+    }
+    function cancelled() {
+      clearTimeout(timer);
+      reject(abortError());
+    }
+    signal?.addEventListener('abort', cancelled, { once: true });
+  });
 }
 
 function pageBody(data: any) {
@@ -84,29 +156,49 @@ export async function prepareHostedCheckout(services: ExecutionServices) {
   if (c.hostedAddressReady) return;
   const page = await readHostedPage(services);
   if (page.elements_session?.id) c.hostedElementsId = page.elements_session.id;
+  c.hostedAmount = hostedAmountTotal(page) ?? c.hostedAmount;
   const billing = c.billing!;
   const fields: Record<string, any> = pageFields(services);
   for (const [stripe, local] of [
-    ['country', 'country'],
     ['line1', 'line1'],
     ['city', 'city'],
     ['state', 'state'],
     ['postal_code', 'postalCode'],
   ])
     fields[`tax_region[${stripe}]`] = (billing as any)[local];
-  const updated = await services.stripe(
-    '更新 Hosted 账单地区',
-    '/v1/payment_pages/' + c.checkout!.id,
-    fields,
-  );
+  // 计税地区固定取建单地区，不能让卡片账单地址所在国改写它；地址行仍是卡片的
+  // 真实账单地址。金额随后以官方页面返回的 total_summary 为准。
+  fields['tax_region[country]'] = c.environment.country;
+  let updated: any;
+  try {
+    updated = await services.stripe(
+      '更新 Hosted 账单地区',
+      '/v1/payment_pages/' + c.checkout!.id,
+      fields,
+    );
+  } catch (error) {
+    // 官方不接受跨地区的地址组合时，保留建单地区原来的页面（金额已经是按建单
+    // 地区算好的），不要因此中断本单。
+    if (!(error instanceof UpstreamError) || error.status < 400 || error.status >= 500) throw error;
+    await services.log({
+      name: 'Hosted 账单地址未写入 · 按建单地区计税',
+      status: 'pending',
+      error: (error as Error).message,
+    });
+    c.hostedAddressReady = true;
+    await services.checkpoint('hosted_address_skipped');
+    return;
+  }
   c.paymentPage = bindPage(services, updated);
+  // 页面更新后返回的应付金额就是官方的最终数字，直接采纳，不自己推算。
+  c.hostedAmount = summaryAmount(c.paymentPage) ?? c.hostedAmount;
   c.hostedAddressReady = true;
   await services.checkpoint('hosted_address_ready');
 }
 export async function submitHostedCheckout(services: ExecutionServices) {
   const c = services.context,
     checkout = c.checkout!;
-  const amount = c.snapshot?.amount_total;
+  const amount = c.hostedAmount ?? c.snapshot?.amount_total;
   if (!Number.isSafeInteger(amount) || amount < 0 || !c.confirmationToken)
     throw new Error('Hosted 原结账金额或令牌无效');
   const returnUrl =
@@ -130,6 +222,9 @@ export async function submitHostedCheckout(services: ExecutionServices) {
     },
   );
   c.paymentPage = bindPage(services, data);
+  c.hostedAmount = summaryAmount(c.paymentPage) ?? c.hostedAmount;
+  const rejected = hostedSubmissionFailure(c.paymentPage);
+  if (rejected) throw rejectedError('Hosted 原结账提交被 Stripe 拒绝：' + rejected);
   const intent = paymentIntentFromResponse(c.paymentPage, c.intent);
   if (intent) c.intent = intent;
   await services.checkpoint('hosted_submitted');
@@ -155,15 +250,33 @@ export async function submitHostedCheckout(services: ExecutionServices) {
   await reconcileHostedCheckout(services);
 }
 export async function reconcileHostedCheckout(services: ExecutionServices) {
-  const c = services.context,
-    page = await readHostedPage(services);
+  // Stripe 在 OAI approve 之后才异步创建 PaymentIntent，单次读取经常还是
+  // open/unpaid；先按页面轮询，再向 /poll 要终态。
+  for (let round = 0; round < PAGE_ROUNDS; round++) {
+    if (round > 0) await sleep(PAGE_INTERVAL_MS, services.signal);
+    if (await acceptHostedPage(services, await readHostedPage(services))) return;
+  }
+  const completion = await pollHostedCompletion(services);
+  if (completion === 'paid') {
+    await services.success();
+    return;
+  }
+  if (completion) throw rejectedError('Hosted 原结账在 Stripe 侧停在 ' + completion + '，未完成扣款');
+  await services.park('pending_confirmation', 'Hosted 原付款尚未返回明确结果，仅核对原结账');
+}
+
+/** 页面能确认付款结果时返回 true；无证据时返回 false，由轮询继续等待。 */
+async function acceptHostedPage(services: ExecutionServices, page: any) {
+  const c = services.context;
+  const rejected = hostedSubmissionFailure(page);
+  if (rejected) throw rejectedError('Hosted 原结账提交被 Stripe 拒绝：' + rejected);
   if (
-    (page.checkout_session_id || page.id) === c.checkout!.id &&
+    (page.checkout_session_id || page.session_id || page.id) === c.checkout!.id &&
     page.status === 'complete' &&
     page.payment_status === 'paid'
   ) {
     await services.success();
-    return;
+    return true;
   }
   const intent = paymentIntentFromResponse(page, c.intent);
   if (
@@ -180,7 +293,26 @@ export async function reconcileHostedCheckout(services: ExecutionServices) {
     if (!current || result.id !== intent.id) throw new Error('付款查询返回了其他 Intent');
     c.intent = current;
     await services.handleIntent();
-    return;
+    return true;
   }
-  await services.park('pending_confirmation', 'Hosted 原付款尚未返回明确结果，仅核对原结账');
+  return false;
+}
+
+/** Stripe 的完成轮询：paid 或明确的失败终态，其余返回 undefined 留给后台。 */
+async function pollHostedCompletion(services: ExecutionServices) {
+  const c = services.context;
+  for (let round = 0; round < COMPLETION_ROUNDS; round++) {
+    if (round > 0) await sleep(COMPLETION_INTERVAL_MS, services.signal);
+    const data = await services.stripe(
+      '读取 Hosted 结账终态',
+      '/v1/payment_pages/' + c.checkout!.id + '/poll?' + form({ key: c.key }),
+    );
+    const states = [data.payment_object_status, data.state, data.status, data.payment_status]
+      .map((value) => String(value || '').toLowerCase())
+      .filter(Boolean);
+    if (states.some((value) => PAID_STATES.includes(value))) return 'paid';
+    const failed = states.find((value) => [...FAILED_STATES, 'requires_payment_method'].includes(value));
+    if (failed) return failed;
+  }
+  return;
 }

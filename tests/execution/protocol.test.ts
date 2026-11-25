@@ -334,6 +334,10 @@ async function execute(
     hostedUrlConfig?: boolean;
     hostedKeyMissing?: boolean;
     hostedPageStatus?: number;
+    hostedPageAmount?: number;
+    hostedSubmissionError?: string;
+    hostedAddressStatus?: number;
+    billingCountry?: string;
     credentialAccessToken?: string;
     credentialUserEmail?: string;
     hasLoginSession?: boolean;
@@ -364,6 +368,7 @@ async function execute(
         plan: 'gpt_plus',
         cleanup: {},
         checkoutMode: options.checkoutMode,
+        billingCountry: options.billingCountry,
       },
       paymentSubmitted: false,
       dispatches: {},
@@ -379,6 +384,9 @@ async function execute(
           : {}),
       }),
       customerSessionClientSecret: options.customerSession,
+      ...(options.billingCountry
+        ? { billingAddress: { state: 'WY', source: 'generated' } }
+        : {}),
       ...(options.boundBillingEmail
         ? {
             billingEmailBinding: {
@@ -400,10 +408,11 @@ async function execute(
     demo: options.demo ?? true,
     billing: {
       name: 'Test',
-      line1: '123 Test St',
-      city: 'Manila',
-      postalCode: '1000',
-      country: 'PH',
+      line1: options.billingCountry === 'US' ? '232 West Yellowstone Avenue' : '123 Test St',
+      city: options.billingCountry === 'US' ? 'Cody' : 'Manila',
+      ...(options.billingCountry === 'US' ? { state: 'WY' } : {}),
+      postalCode: options.billingCountry === 'US' ? '82414' : '1000',
+      country: options.billingCountry || 'PH',
       email: options.defaultBillingEmail,
       phone: options.billingPhone,
     },
@@ -578,6 +587,37 @@ async function execute(
           body: '',
           data: { error: { message: 'original page key rejected' } },
         };
+      if (
+        url.pathname.startsWith('/v1/payment_pages/') &&
+        input.method === 'POST' &&
+        !url.pathname.endsWith('/confirm') &&
+        options.hostedAddressStatus
+      )
+        return {
+          status: options.hostedAddressStatus,
+          headers: {},
+          body: '',
+          data: { error: { message: 'invalid tax region' } },
+        };
+      // 线上 hosted 页面：改账单地区后应付金额会变，submission_attempt 承载审批后的失败。
+      if (
+        url.pathname.startsWith('/v1/payment_pages/') &&
+        input.method === 'GET' &&
+        (options.hostedPageAmount !== undefined || options.hostedSubmissionError)
+      ) {
+        const response = await super.request(input);
+        if (options.hostedPageAmount !== undefined)
+          response.data.total_summary = {
+            due: options.hostedPageAmount,
+            total: options.hostedPageAmount,
+          };
+        if (options.hostedSubmissionError)
+          response.data.submission_attempt = {
+            state: 'failed',
+            error: { code: options.hostedSubmissionError },
+          };
+        return response;
+      }
       if (url.pathname.endsWith('/checkout') && options.returnedCheckoutId)
         return {
           status: 200,
@@ -1848,6 +1888,75 @@ test('hosted create response whose labels still say custom is adopted by its ses
       (c) => c.action === 'step' && c.body.step.name === '支付链接类型 · hosted',
     ),
   );
+});
+
+test('hosted confirmation always sends the amount the official page reports', async () => {
+  // 金额完全取官方页面：页面按本单账单地区算出 98214 / 110000 / 3575 都行，
+  // expected_amount 跟着它走，代码里没有地区或税率假设。
+  for (const pageAmount of [98214, 110000, 3575]) {
+    const result = await execute({
+      demo: false,
+      authorizer: boundAuthorizer,
+      checkoutMode: 'hosted',
+      hostedPageAmount: pageAmount,
+    });
+    assert.equal(result.finish.status, 'completed', result.finish.error);
+    const confirm = result.requests.find(
+      (r) => r.url.endsWith('/payment_pages/' + result.assignment.context.checkout!.id + '/confirm'),
+    )!;
+    assert.equal(new URLSearchParams(confirm.body!).get('expected_amount'), String(pageAmount));
+    assert.equal(result.assignment.context.hostedAmount, pageAmount);
+  }
+});
+
+test('tax lookup and the hosted page follow the order region, not the billing address', async () => {
+  // 建单地区 PH、卡片账单地址 US：计税 country 必须是 PH，页面 tax_region 也必须
+  // 是 PH，否则 Stripe 会按账单地址把税额重算成别的数字。
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    checkoutMode: 'hosted',
+    billingCountry: 'US',
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const taxes = JSON.parse(result.requests.find((r) => r.url.endsWith('/checkout/taxes'))!.body!);
+  assert.equal(taxes.billing_country, 'PH');
+  assert.equal(taxes.billing_address.country, 'US');
+  const page = result.requests.find(
+    (r) => r.method === 'POST' && r.url.endsWith('/payment_pages/' + result.assignment.context.checkout!.id),
+  )!;
+  const pageFields = new URLSearchParams(page.body!);
+  assert.equal(pageFields.get('tax_region[country]'), 'PH');
+  assert.equal(pageFields.get('tax_region[line1]'), '232 West Yellowstone Avenue');
+});
+
+test('a rejected hosted address write keeps the official page amount and continues', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    checkoutMode: 'hosted',
+    hostedAddressStatus: 422,
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  assert.equal(result.assignment.context.hostedAmount, 2000);
+  assert.ok(
+    result.commands.some(
+      (c) => c.action === 'step' && c.body.step.name === 'Hosted 账单地址未写入 · 按建单地区计税',
+    ),
+  );
+});
+
+test('hosted submission rejected after approval fails once with the Stripe code', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    checkoutMode: 'hosted',
+    hostedSubmissionError: 'checkout_upcoming_invoice_mismatch',
+  });
+  assert.equal(result.finish.status, 'failed');
+  assert.equal(result.finish.failureRetryable, false);
+  assert.match(result.finish.error || '', /checkout_upcoming_invoice_mismatch/);
+  assert.equal(result.finish.paymentOutcome, undefined);
 });
 
 test('hosted recovery reads the original page and never replays confirmation or approval', async () => {

@@ -644,7 +644,9 @@ export class ProtocolEngine {
         const taxes = await this.chat('更新原结账税费', '/backend-api/payments/checkout/taxes', {
           checkout_session_id: this.context.checkout!.id,
           checkout_email: this.context.billingEmailBinding?.email || undefined,
-          billing_country: billing.country,
+          // 计税地区跟建单地区（order.cdkPaymentCountry）走，不受账单地址所在国影响：
+          // php 单就按 PH 查税，billing_address 仍是卡片的真实账单地址。
+          billing_country: this.context.environment.country,
           billing_name: billing.name,
           currency: this.context.currency.toLowerCase(),
           processor_entity: this.context.checkout!.processor_entity,
@@ -1057,7 +1059,14 @@ export class ProtocolEngine {
           Boolean(intent.last_payment_error || (error instanceof UpstreamError && error.status === 402));
         if (declined) this.context.intent = intent;
         await this.command('finish', {
-          status: this.assignment.run.paymentSubmitted && !declined ? 'pending_confirmation' : 'failed',
+          // 付款已提交但 Stripe 明确拒绝这次提交（未创建 PaymentIntent）时直接失败，
+          // 不要挂在待确认上等一个不会出现的付款；其它提交后的错误仍按结果未知处理。
+          status:
+            this.assignment.run.paymentSubmitted &&
+            !declined &&
+            (error as any).paymentRejected !== true
+              ? 'pending_confirmation'
+              : 'failed',
           paymentOutcome: declined ? 'failed' : undefined,
           context: this.context,
           error: e.message,

@@ -81,6 +81,9 @@ export type RuntimeContext = {
   checkoutMode?: 'custom' | 'hosted';
   // Set when the official response picked a mode other than the one requested.
   officialCheckoutMode?: 'custom' | 'hosted';
+  // Hosted 支付页的应付金额（含税）。更新账单地区会重算税额，expected_amount
+  // 必须用它，而不是 /taxes 快照上的 amount_total。
+  hostedAmount?: number;
   checkoutResume?: {
     sourceRunId: string;
     checkoutId: string;
