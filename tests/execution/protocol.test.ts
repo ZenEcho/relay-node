@@ -212,9 +212,10 @@ for (const checkoutMode of ['custom', 'hosted'] as const) {
 
 test('the forced pre-checkout Session refresh forwards the credential token iat', async () => {
   const iat = 1_700_000_000;
+  // 只剩 5 分钟才进入强制续期区间；refresh token 是一次性的，不能随便烧。
   const credentialAccessToken =
     'fixture.' +
-    Buffer.from(JSON.stringify({ iat, exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url') +
+    Buffer.from(JSON.stringify({ iat, exp: Math.floor(Date.now() / 1000) + 300 })).toString('base64url') +
     '.signature';
   const result = await execute({
     demo: false,
@@ -238,6 +239,72 @@ test('the forced pre-checkout Session refresh forwards the credential token iat'
   assert.equal(refresh.headers?.['x-openai-target-path'], '/api/auth/session');
   const checkout = result.requests.find((request) => request.url.endsWith('/payments/checkout'))!;
   assert.equal(checkout.headers?.authorization, 'Bearer ' + refreshedLoginSession.access_token);
+});
+
+test('a healthy credential token skips the forced refresh and keeps its own bearer', async () => {
+  const iat = 1_700_000_000;
+  const credentialAccessToken =
+    'fixture.' +
+    Buffer.from(JSON.stringify({ iat, exp: Math.floor(Date.now() / 1000) + 6 * 3600 })).toString('base64url') +
+    '.signature';
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    credentialAccessToken,
+    credentialUserEmail: 'saved@example.invalid',
+    hasLoginSession: true,
+    refreshResponse: { status: 200, data: refreshedLoginSession },
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  assert.equal(
+    result.requests.filter((request) => new URL(request.url).searchParams.get('refresh') === 'true')
+      .length,
+    0,
+    '还有效的 accessToken 不应当强制刷新',
+  );
+  const checkout = result.requests.find((request) => request.url.endsWith('/payments/checkout'))!;
+  assert.equal(checkout.headers?.authorization, 'Bearer ' + credentialAccessToken);
+});
+
+test('a rejected refresh with a still-valid token continues instead of reporting a dead Session', async () => {
+  const iat = 1_700_000_000;
+  const now = Math.floor(Date.now() / 1000);
+  const credentialAccessToken =
+    'fixture.' +
+    Buffer.from(JSON.stringify({ iat, exp: now + 300 })).toString('base64url') +
+    '.signature';
+  // 线上实际形态：HTTP 200、带 error，但仍返回同一枚还能用的 accessToken。
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    credentialAccessToken,
+    credentialUserEmail: 'saved@example.invalid',
+    hasLoginSession: true,
+    refreshResponse: {
+      status: 200,
+      data: {
+        access_token: credentialAccessToken,
+        account: { id: 'demo-account' },
+        user: { id: 'demo-user', email: 'saved@example.invalid' },
+        expires: new Date(Date.now() + 90 * 86400 * 1000).toISOString(),
+        error: 'RefreshAccessTokenError',
+      },
+    },
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  assert.equal(
+    result.requests.filter((request) => new URL(request.url).searchParams.get('refresh') === 'true')
+      .length,
+    1,
+  );
+  const checkout = result.requests.find((request) => request.url.endsWith('/payments/checkout'))!;
+  assert.equal(checkout.headers?.authorization, 'Bearer ' + credentialAccessToken);
+  assert.ok(
+    result.commands.some(
+      (c) => c.action === 'step' && c.body.step.name === 'Session 刷新被拒 · 沿用当前 accessToken',
+    ),
+  );
+  assert.ok(!result.commands.some((c) => c.action === 'step' && c.body.step.name === '账号 Session 无法刷新'));
 });
 
 for (const [name, refreshResponse, expected] of [

@@ -4,7 +4,14 @@ import { throwIfExecutionAborted } from '../../../../packages/runtime/src/cancel
 import { bindBillingEmail, selectBillingEmail } from '../../../../packages/rules/src/billing-email.js';
 import { hasChatgptSessionCookie, verifySessionIdentity } from './credentials.js';
 import { UpstreamError } from './http-utils.js';
-import { tokenClaims, rejectedSessionRefresh, sessionRefreshFailure } from './session-refresh.js';
+import {
+  tokenClaims,
+  accessTokenRemainingSeconds,
+  hasUsableAccessToken,
+  rejectedSessionRefresh,
+  sessionRefreshFailure,
+  SESSION_REFRESH_SKEW_SECONDS,
+} from './session-refresh.js';
 import type { ExecutionServices } from './services.js';
 
 const CHECKOUT_PATH = '/backend-api/payments/checkout';
@@ -36,22 +43,36 @@ async function refreshCheckoutSession(services: ExecutionServices) {
       },
     );
     throwIfExecutionAborted(services.signal);
-    // A 200 with a rejected refresh still carries the old access token, so the
-    // later checks would run on a revoked token and fail at checkout instead.
+    // A 200 with a rejected refresh still carries the previous access token.
+    // 刷新被拒只说明这次没能换到新令牌（refresh token 已被其它使用方换走，
+    // 或服务端不接受这次 refresh 请求），不等于 Session 失效：同一份 Cookie
+    // 在浏览器里照常可用。只有连一枚未过期的 accessToken 都拿不到时才终止。
     const rejected = rejectedSessionRefresh(session);
-    if (rejected) {
+    if (rejected && !hasUsableAccessToken(session)) {
       await services.log({
         name: '账号 Session 无法刷新',
         status: 'failed',
         category: 'event',
         response: {
           error: rejected,
-          message: '登录令牌刷新被拒绝，账号需要重新登录后才能继续本单',
+          accessTokenRemainingSeconds: accessTokenRemainingSeconds(session),
+          message: '登录令牌刷新被拒绝，且没有返回可用的 accessToken，账号需要重新登录后才能继续本单',
         },
         error: 'Session 刷新失败：' + rejected,
       });
       throw sessionRefreshFailure(rejected);
     }
+    if (rejected)
+      await services.log({
+        name: 'Session 刷新被拒 · 沿用当前 accessToken',
+        status: 'succeeded',
+        category: 'event',
+        response: {
+          error: rejected,
+          accessTokenRemainingSeconds: accessTokenRemainingSeconds(session),
+          message: '刷新令牌未能更换，当前 accessToken 仍然有效，继续使用原登录会话',
+        },
+      });
     const accessToken = session?.accessToken || session?.access_token;
     const accountId = session?.account?.id || session?.account?.account_id;
     const userId = session?.user?.id;
@@ -162,10 +183,17 @@ export async function preflightExecution(services: ExecutionServices) {
   const required = !services.context.proxyVerified;
   if (required) services.setStage('proxy_check');
   await sampleExecutionEgress(services, required);
+  // 只在 accessToken 真的快过期（或没有）时才强制续期。refresh token 是一次性
+  // 的，把大量还有效的会话拿去强制刷新，会把账号唯一的 refresh token 烧掉，
+  // 之后同一份 Session 的其它使用方（浏览器/插件/下次执行）就都刷不动了。
+  const remainingSeconds = accessTokenRemainingSeconds(services.context.session);
+  const tokenNeedsRefresh =
+    typeof remainingSeconds !== 'number' || remainingSeconds <= SESSION_REFRESH_SKEW_SECONDS;
   const forceSessionRefresh =
     services.assignment.paymentEnabled &&
     !services.assignment.demo &&
     !services.context.checkout &&
+    tokenNeedsRefresh &&
     hasChatgptSessionCookie(services.context.environment.cookies);
   if (forceSessionRefresh) {
     // A forced refresh is an account check; attribute its failure there.

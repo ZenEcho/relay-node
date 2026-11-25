@@ -45,6 +45,32 @@ export function tokenClaims(token: unknown): { iat?: number; exp?: number } {
   }
 }
 
+// Refresh tokens are single use: 每刷新一次，旧 refresh token 就被换掉。所以只有
+// accessToken 真的快过期时才主动续期，否则白白消耗掉账号唯一的 refresh token，
+// 让同一份 Session 的其它使用方（浏览器、插件、下次执行）都刷不动。
+export const SESSION_REFRESH_SKEW_SECONDS = 15 * 60;
+
+function sessionAccessToken(session: unknown): string | undefined {
+  const value = session as Record<string, unknown> | null | undefined;
+  const token = value?.['accessToken'] ?? value?.['access_token'];
+  return typeof token === 'string' && token ? token : undefined;
+}
+
+export function accessTokenRemainingSeconds(session: unknown, now = Date.now()): number | undefined {
+  const { exp } = tokenClaims(sessionAccessToken(session));
+  return typeof exp === 'number' && Number.isFinite(exp) ? exp - Math.floor(now / 1000) : undefined;
+}
+
+export function hasUsableAccessToken(
+  session: unknown,
+  skewSeconds = 60,
+  now = Date.now(),
+): boolean {
+  if (!sessionAccessToken(session)) return false;
+  const remaining = accessTokenRemainingSeconds(session, now);
+  return typeof remaining === 'number' && remaining > skewSeconds;
+}
+
 export async function refreshExpiredAccessToken(
   context: RuntimeContext,
   chat: ExecutionServices['chat'],
@@ -85,8 +111,11 @@ export async function refreshExpiredAccessToken(
         : {}),
     });
     throwIfExecutionAborted(signal);
+    // 刷新被拒也可能是"这枚 refresh token 已被别的使用方换过"，而不是账号被吊销。
+    // 只要返回的 accessToken 本身还能用，就继续用当前令牌，让真正的受保护请求
+    // 去证明它是否失效；只有连可用令牌都拿不到时才是真的需要重新登录。
     const rejected = rejectedSessionRefresh(refreshed);
-    if (rejected) throw sessionRefreshFailure(rejected);
+    if (rejected && !hasUsableAccessToken(refreshed)) throw sessionRefreshFailure(rejected);
     verifySessionIdentity(identity, refreshed);
     const token = refreshed.accessToken || refreshed.access_token;
     const expiry = tokenClaims(token).exp;
