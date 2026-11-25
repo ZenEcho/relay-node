@@ -1812,6 +1812,44 @@ test('the official create response decides the mode even when the workflow prefe
   );
 });
 
+test('hosted create response whose labels still say custom is adopted by its session prefix', async () => {
+  // 线上真实回包（PH / plus）：请求 hosted，返回 cs_live_ 会话，但 checkout_ui_mode
+  // 和 tag 仍是 custom。按标签判就会误报"与官方结账模式 custom 不匹配"，这里要求
+  // 以前缀采纳 hosted，并走 Stripe payment_pages 那条链。
+  const checkoutId = 'cs_live_a0mGUqkQFb3QR6IuHWCGUjasnHJjQOABh4amSyetDan1oevoy5xucjKptI';
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    checkoutMode: 'hosted',
+    checkoutResponse: {
+      status: 200,
+      headers: {},
+      body: '',
+      data: {
+        tag: 'custom_checkout_session',
+        checkout_session_id: checkoutId,
+        checkout_ui_mode: 'custom',
+        checkout_provider: 'stripe',
+        processor_entity: 'openai_llc',
+        url: null,
+      },
+    },
+    taxStripe: { id: checkoutId },
+  });
+  assert.equal(result.assignment.context.checkout!.id, checkoutId);
+  assert.equal(result.assignment.context.checkoutMode, 'hosted');
+  assert.equal(result.assignment.context.officialCheckoutMode, undefined);
+  assert.ok(!/类型不匹配|结账模式/.test(result.finish.error || ''), result.finish.error);
+  assert.equal(result.requests.filter((r) => r.url.endsWith('/payments/checkout')).length, 1);
+  assert.ok(result.requests.some((r) => r.url.startsWith('https://api.stripe.com/v1/payment_pages/' + checkoutId)));
+  assert.ok(!result.requests.some((r) => r.url.endsWith('/checkout/confirm')));
+  assert.ok(
+    result.commands.some(
+      (c) => c.action === 'step' && c.body.step.name === '支付链接类型 · hosted',
+    ),
+  );
+});
+
 test('hosted recovery reads the original page and never replays confirmation or approval', async () => {
   const result = await execute({
     demo: false,

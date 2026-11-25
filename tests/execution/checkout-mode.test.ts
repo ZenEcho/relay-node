@@ -9,8 +9,22 @@ import {
 } from '../../apps/worker/src/execution/checkout-mode.js';
 import { UpstreamError } from '../../apps/worker/src/execution/http-utils.js';
 
-test('official checkout_ui_mode outranks the requested preference', () => {
-  // 官方说 hosted，就按 hosted 收单，哪怕工作流要求 custom。
+test('session prefix outranks a contradictory checkout_ui_mode label', () => {
+  // 线上 hosted 建单的回包：checkout_ui_mode/tag 仍写 custom，但会话是 cs_live_。
+  // Stripe 的确认接口只认会话本身，所以前缀说了算，不能判成"类型不匹配"。
+  assert.deepEqual(
+    adoptCheckoutMode(
+      'hosted',
+      'custom',
+      'cs_live_a0mGUqkQFb3QR6IuHWCGUjasnHJjQOABh4amSyetDan1oevoy5xucjKptI',
+    ),
+    { mode: 'hosted', official: false },
+  );
+  assert.deepEqual(adoptCheckoutMode('custom', 'hosted', 'oaics_c05ec757b5484544b125370d8488dc3f'), {
+    mode: 'custom',
+    official: false,
+  });
+  // 标签和前缀一致时，就是官方覆盖了我们的偏好。
   assert.deepEqual(adoptCheckoutMode('custom', 'hosted', 'cs_live_1'), {
     mode: 'hosted',
     official: true,
@@ -26,20 +40,24 @@ test('official checkout_ui_mode outranks the requested preference', () => {
   });
 });
 
-test('missing official mode falls back to the session prefix, then to the request', () => {
-  assert.deepEqual(adoptCheckoutMode('custom', undefined, 'cs_live_1'), {
+test('without a recognizable prefix, the declared mode wins, then the request', () => {
+  assert.deepEqual(adoptCheckoutMode('custom', 'hosted', 'unknown'), {
     mode: 'hosted',
     official: true,
   });
-  assert.deepEqual(adoptCheckoutMode('custom', undefined, 'oaics_1'), {
+  assert.deepEqual(adoptCheckoutMode('hosted', 'custom', undefined), {
     mode: 'custom',
-    official: false,
+    official: true,
   });
   assert.deepEqual(adoptCheckoutMode('hosted', undefined, 'unknown'), {
     mode: 'hosted',
     official: false,
   });
   assert.deepEqual(adoptCheckoutMode('custom', 'embedded', 'oaics_1'), {
+    mode: 'custom',
+    official: false,
+  });
+  assert.deepEqual(adoptCheckoutMode('custom', 'embedded', 'unknown'), {
     mode: 'custom',
     official: false,
   });

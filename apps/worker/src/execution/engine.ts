@@ -14,6 +14,7 @@ import { handlePaymentIntent } from './payment-intent.js';
 import { paymentIntentFromResponse } from './intent-binding.js';
 import {
   adoptCheckoutMode,
+  checkoutModeFromId,
   isCheckoutModeRejection,
   modeFallbackBlocked,
   zeroAmountRequiresCustom,
@@ -471,12 +472,16 @@ export class ProtocolEngine {
       result.checkout_session?.id,
       result.checkout_session_id,
       result.checkoutSessionId,
-    ];
-    const adopted = adoptCheckoutMode(attempted, result.checkout_ui_mode, candidates.find(
-      (value): value is string => typeof value === 'string',
-    ));
+    ].filter((value): value is string => typeof value === 'string');
+    // 只把带前缀的会话交给采纳逻辑：hosted 回包的 checkout_ui_mode 可能是旧标签，
+    // 前缀才是 Stripe 确认接口认的真相。
+    const adopted = adoptCheckoutMode(
+      attempted,
+      result.checkout_ui_mode,
+      candidates.find((value) => checkoutModeFromId(value)),
+    );
     const prefix = adopted.mode === 'hosted' ? 'cs_' : 'oaics_';
-    const id = candidates.find((value) => typeof value === 'string' && value.startsWith(prefix));
+    const id = candidates.find((value) => value.startsWith(prefix));
     if (!id || !/^(oaics_|cs_(?:live_|test_))[a-zA-Z0-9_]+$/.test(id))
       throw new Error('返回的支付链接与官方结账模式 ' + adopted.mode + ' 不匹配');
     return { id, result, mode: adopted.mode, official: adopted.official || attempted !== requested };

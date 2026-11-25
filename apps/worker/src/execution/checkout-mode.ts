@@ -19,7 +19,10 @@ export function checkoutModeFromId(id: unknown): CheckoutMode | undefined {
 }
 
 /**
- * 采纳官方返回的模式。响应缺字段时退回会话前缀；两者都读不出来时保留请求值。
+ * 采纳官方返回的模式。会话前缀优先：hosted 建单的回包里 checkout_ui_mode 与 tag
+ * 仍可能写 custom（官方模板回显旧值），而 Stripe 的确认接口只认会话本身
+ * （oaics_ → custom，cs_ → hosted），信标签就会在 hosted 分支上误判"类型不匹配"。
+ * 前缀读不出来才用声明字段，再读不出来保留请求值。
  * 返回值永远可以被信任来挑选前缀校验规则。
  */
 export function adoptCheckoutMode(
@@ -27,9 +30,8 @@ export function adoptCheckoutMode(
   returned: unknown,
   id?: unknown,
 ): { mode: CheckoutMode; official: boolean } {
-  const declared = isCheckoutMode(returned) ? returned : checkoutModeFromId(id);
-  if (!declared) return { mode: requested, official: false };
-  return { mode: declared, official: declared !== requested };
+  const mode = checkoutModeFromId(id) ?? (isCheckoutMode(returned) ? returned : undefined) ?? requested;
+  return { mode, official: mode !== requested };
 }
 
 /**
