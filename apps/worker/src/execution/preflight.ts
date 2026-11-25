@@ -7,31 +7,50 @@ import { UpstreamError } from './http-utils.js';
 import {
   tokenClaims,
   accessTokenRemainingSeconds,
-  hasUsableAccessToken,
   rejectedSessionRefresh,
-  sessionRefreshFailure,
-  SESSION_REFRESH_SKEW_SECONDS,
 } from './session-refresh.js';
 import type { ExecutionServices } from './services.js';
 
 const CHECKOUT_PATH = '/backend-api/payments/checkout';
 
+// 建单前总是尝试刷新一次 Session：刷新成功就用刷新回来的会话（保证拿的是最新的
+// accessToken 与轮换后的 Cookie），刷新失败就沿用提交过来的 Session，不在这里判
+// 会话失效。真正无效的会话会在紧随其后的受保护请求（/backend-api/accounts/check
+// → 建单）上以 401 报错，那时再失败也不迟。
 async function refreshCheckoutSession(services: ExecutionServices) {
   const context = services.context;
-  const originalCookies = context.environment.cookies;
-  const originalAccount =
-    context.accountId || context.session?.account?.id || context.session?.account?.account_id;
-  const originalUser = context.userId || context.session?.user?.id;
-  const { iat } = tokenClaims(context.session?.accessToken || context.session?.access_token);
+  const submittedSession = context.session;
+  const submittedAccount =
+    context.accountId || submittedSession?.account?.id || submittedSession?.account?.account_id;
+  const submittedUser = context.userId || submittedSession?.user?.id;
+  const { iat } = tokenClaims(submittedSession?.accessToken || submittedSession?.access_token);
   const query = new URLSearchParams({
     refresh: 'true',
     reason: 'token_expired',
     method: 'POST',
     path: CHECKOUT_PATH,
   });
+
+  const fallback = async (reason: string) => {
+    // 只固定会话内容，Cookie 保留服务端最新状态：传输层的 Cookie 罐已经按
+    // Set-Cookie 轮换过，回滚 context 里的数组只会和实际发出的 Cookie 脱节，
+    // 反让重试拿到被轮换掉的旧登录票据。
+    context.session = submittedSession;
+    await services.log({
+      name: 'Session 刷新未成功 · 沿用提交的 Session',
+      status: 'succeeded',
+      category: 'event',
+      response: {
+        reason,
+        accessTokenRemainingSeconds: accessTokenRemainingSeconds(submittedSession),
+        message: '强制刷新没有返回可用会话，继续使用提交过来的 Session；会话真的无效时由后续建单请求报错',
+      },
+    });
+  };
+
+  let session: any;
   try {
-    throwIfExecutionAborted(services.signal);
-    const session = await services.chat(
+    session = await services.chat(
       '建单前强制刷新 Session',
       '/api/auth/session?' + query,
       undefined,
@@ -42,60 +61,42 @@ async function refreshCheckoutSession(services: ExecutionServices) {
           : {}),
       },
     );
-    throwIfExecutionAborted(services.signal);
-    // A 200 with a rejected refresh still carries the previous access token.
-    // 刷新被拒只说明这次没能换到新令牌（refresh token 已被其它使用方换走，
-    // 或服务端不接受这次 refresh 请求），不等于 Session 失效：同一份 Cookie
-    // 在浏览器里照常可用。只有连一枚未过期的 accessToken 都拿不到时才终止。
-    const rejected = rejectedSessionRefresh(session);
-    if (rejected && !hasUsableAccessToken(session)) {
-      await services.log({
-        name: '账号 Session 无法刷新',
-        status: 'failed',
-        category: 'event',
-        response: {
-          error: rejected,
-          accessTokenRemainingSeconds: accessTokenRemainingSeconds(session),
-          message: '登录令牌刷新被拒绝，且没有返回可用的 accessToken，账号需要重新登录后才能继续本单',
-        },
-        error: 'Session 刷新失败：' + rejected,
-      });
-      throw sessionRefreshFailure(rejected);
-    }
-    if (rejected)
-      await services.log({
-        name: 'Session 刷新被拒 · 沿用当前 accessToken',
-        status: 'succeeded',
-        category: 'event',
-        response: {
-          error: rejected,
-          accessTokenRemainingSeconds: accessTokenRemainingSeconds(session),
-          message: '刷新令牌未能更换，当前 accessToken 仍然有效，继续使用原登录会话',
-        },
-      });
-    const accessToken = session?.accessToken || session?.access_token;
-    const accountId = session?.account?.id || session?.account?.account_id;
-    const userId = session?.user?.id;
-    verifySessionIdentity(
-      { ...context, accountId: originalAccount || accountId, userId: originalUser },
-      session,
-    );
-    if ((originalAccount && !accountId) || (originalUser && !userId))
-      throw new Error('刷新后的 Session 缺少原账号或用户标识，无法确认本单登录身份');
-    const { exp } = tokenClaims(accessToken);
-    const now = Date.now();
-    if (
-      (session.expires && !(Date.parse(session.expires) > now)) ||
-      (typeof exp === 'number' && exp <= now / 1000)
-    )
-      throw new Error('刷新后的 Session 或 accessToken 已过期');
-    context.session = { ...session, accessToken };
-    context.accountId ||= accountId;
-    context.userId ||= userId;
   } catch (error) {
-    context.environment.cookies = originalCookies;
-    throw error;
+    throwIfExecutionAborted(services.signal);
+    await fallback(String((error as Error)?.message || '刷新请求失败').slice(0, 200));
+    return;
   }
+  throwIfExecutionAborted(services.signal);
+
+  // 只有"拿到一枚未过期、且属于本单原账号的令牌"才算刷新成功。
+  const rejected = rejectedSessionRefresh(session);
+  const accessToken = session?.accessToken || session?.access_token;
+  const accountId = session?.account?.id || session?.account?.account_id;
+  const userId = session?.user?.id;
+  const { exp } = tokenClaims(accessToken);
+  const expires = typeof session?.expires === 'string' ? Date.parse(session.expires) : Number.NaN;
+  let failure = '';
+  if (rejected) failure = '令牌刷新被拒绝：' + rejected;
+  else if (!accessToken) failure = '刷新响应缺少 accessToken';
+  else if (typeof exp === 'number' && Number.isFinite(exp) && exp <= Date.now() / 1000)
+    failure = '刷新返回的 accessToken 已过期';
+  else if (Number.isFinite(expires) && expires <= Date.now()) failure = '刷新返回的 Session 已过期';
+  else if ((submittedAccount && !accountId) || (submittedUser && !userId))
+    failure = '刷新后的 Session 缺少原账号或用户标识';
+  else {
+    try {
+      verifySessionIdentity({ ...context, accountId: submittedAccount, userId: submittedUser }, session);
+    } catch (error) {
+      failure = (error as Error)?.message || '刷新后的 Session 与原订单身份不一致';
+    }
+  }
+  if (failure) {
+    await fallback(failure);
+    return;
+  }
+  context.session = { ...session, accessToken };
+  context.accountId ||= accountId;
+  context.userId ||= userId;
 }
 
 export async function sampleExecutionEgress(services: ExecutionServices, required = false) {
@@ -183,17 +184,10 @@ export async function preflightExecution(services: ExecutionServices) {
   const required = !services.context.proxyVerified;
   if (required) services.setStage('proxy_check');
   await sampleExecutionEgress(services, required);
-  // 只在 accessToken 真的快过期（或没有）时才强制续期。refresh token 是一次性
-  // 的，把大量还有效的会话拿去强制刷新，会把账号唯一的 refresh token 烧掉，
-  // 之后同一份 Session 的其它使用方（浏览器/插件/下次执行）就都刷不动了。
-  const remainingSeconds = accessTokenRemainingSeconds(services.context.session);
-  const tokenNeedsRefresh =
-    typeof remainingSeconds !== 'number' || remainingSeconds <= SESSION_REFRESH_SKEW_SECONDS;
   const forceSessionRefresh =
     services.assignment.paymentEnabled &&
     !services.assignment.demo &&
     !services.context.checkout &&
-    tokenNeedsRefresh &&
     hasChatgptSessionCookie(services.context.environment.cookies);
   if (forceSessionRefresh) {
     // A forced refresh is an account check; attribute its failure there.

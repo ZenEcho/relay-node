@@ -45,11 +45,6 @@ export function tokenClaims(token: unknown): { iat?: number; exp?: number } {
   }
 }
 
-// Refresh tokens are single use: 每刷新一次，旧 refresh token 就被换掉。所以只有
-// accessToken 真的快过期时才主动续期，否则白白消耗掉账号唯一的 refresh token，
-// 让同一份 Session 的其它使用方（浏览器、插件、下次执行）都刷不动。
-export const SESSION_REFRESH_SKEW_SECONDS = 15 * 60;
-
 function sessionAccessToken(session: unknown): string | undefined {
   const value = session as Record<string, unknown> | null | undefined;
   const token = value?.['accessToken'] ?? value?.['access_token'];

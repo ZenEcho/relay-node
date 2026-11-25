@@ -212,10 +212,10 @@ for (const checkoutMode of ['custom', 'hosted'] as const) {
 
 test('the forced pre-checkout Session refresh forwards the credential token iat', async () => {
   const iat = 1_700_000_000;
-  // 只剩 5 分钟才进入强制续期区间；refresh token 是一次性的，不能随便烧。
+  // 每次建单都强制刷新一次，所以这里用普通的长效令牌即可。
   const credentialAccessToken =
     'fixture.' +
-    Buffer.from(JSON.stringify({ iat, exp: Math.floor(Date.now() / 1000) + 300 })).toString('base64url') +
+    Buffer.from(JSON.stringify({ iat, exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url') +
     '.signature';
   const result = await execute({
     demo: false,
@@ -241,7 +241,7 @@ test('the forced pre-checkout Session refresh forwards the credential token iat'
   assert.equal(checkout.headers?.authorization, 'Bearer ' + refreshedLoginSession.access_token);
 });
 
-test('a healthy credential token skips the forced refresh and keeps its own bearer', async () => {
+test('every checkout refreshes once and adopts the refreshed Session', async () => {
   const iat = 1_700_000_000;
   const credentialAccessToken =
     'fixture.' +
@@ -259,79 +259,44 @@ test('a healthy credential token skips the forced refresh and keeps its own bear
   assert.equal(
     result.requests.filter((request) => new URL(request.url).searchParams.get('refresh') === 'true')
       .length,
-    0,
-    '还有效的 accessToken 不应当强制刷新',
-  );
-  const checkout = result.requests.find((request) => request.url.endsWith('/payments/checkout'))!;
-  assert.equal(checkout.headers?.authorization, 'Bearer ' + credentialAccessToken);
-});
-
-test('a rejected refresh with a still-valid token continues instead of reporting a dead Session', async () => {
-  const iat = 1_700_000_000;
-  const now = Math.floor(Date.now() / 1000);
-  const credentialAccessToken =
-    'fixture.' +
-    Buffer.from(JSON.stringify({ iat, exp: now + 300 })).toString('base64url') +
-    '.signature';
-  // 线上实际形态：HTTP 200、带 error，但仍返回同一枚还能用的 accessToken。
-  const result = await execute({
-    demo: false,
-    authorizer: boundAuthorizer,
-    credentialAccessToken,
-    credentialUserEmail: 'saved@example.invalid',
-    hasLoginSession: true,
-    refreshResponse: {
-      status: 200,
-      data: {
-        access_token: credentialAccessToken,
-        account: { id: 'demo-account' },
-        user: { id: 'demo-user', email: 'saved@example.invalid' },
-        expires: new Date(Date.now() + 90 * 86400 * 1000).toISOString(),
-        error: 'RefreshAccessTokenError',
-      },
-    },
-  });
-  assert.equal(result.finish.status, 'completed', result.finish.error);
-  assert.equal(
-    result.requests.filter((request) => new URL(request.url).searchParams.get('refresh') === 'true')
-      .length,
     1,
+    '建单前必须强制刷新一次',
   );
   const checkout = result.requests.find((request) => request.url.endsWith('/payments/checkout'))!;
-  assert.equal(checkout.headers?.authorization, 'Bearer ' + credentialAccessToken);
-  assert.ok(
-    result.commands.some(
-      (c) => c.action === 'step' && c.body.step.name === 'Session 刷新被拒 · 沿用当前 accessToken',
-    ),
-  );
-  assert.ok(!result.commands.some((c) => c.action === 'step' && c.body.step.name === '账号 Session 无法刷新'));
+  assert.equal(checkout.headers?.authorization, 'Bearer ' + refreshedLoginSession.access_token);
+  assert.equal(result.finish.context.session.accessToken, refreshedLoginSession.access_token);
 });
 
-for (const [name, refreshResponse, expected] of [
-  ['upstream refusal', { status: 403, data: { detail: 'Session request refused' } }, /Session request refused/],
-  ['empty response', { status: 200, data: {} }, /缺少 accessToken/],
-  ['foreign account', { status: 200, data: { ...refreshedLoginSession, account: { id: 'other' } } }, /账号与原订单不一致/],
-  ['foreign user', { status: 200, data: { ...refreshedLoginSession, user: { id: 'other' } } }, /用户与原订单不一致/],
-  ['unconfirmed user', { status: 200, data: { ...refreshedLoginSession, user: {} } }, /缺少原账号或用户标识/],
-  ['expired Session', { status: 200, data: { ...refreshedLoginSession, expires: new Date(0).toISOString() } }, /已过期/],
+for (const [name, refreshResponse] of [
+  ['an upstream refusal', { status: 403, data: { detail: 'Session request refused' } }],
+  ['an empty response', { status: 200, data: {} }],
+  ['a foreign account', { status: 200, data: { ...refreshedLoginSession, account: { id: 'other' } } }],
+  ['a foreign user', { status: 200, data: { ...refreshedLoginSession, user: { id: 'other' } } }],
+  ['an unconfirmed user', { status: 200, data: { ...refreshedLoginSession, user: {} } }],
+  ['an expired Session', { status: 200, data: { ...refreshedLoginSession, expires: new Date(0).toISOString() } }],
 ] as const) {
-  test(`checkout stops before pricing and authorization on ${name} during the forced Session refresh`, async () => {
+  test(`${name} during the forced Session refresh keeps the submitted Session and continues`, async () => {
     const result = await execute({
       demo: false,
-      authorizer: async () => assert.fail('checkout authorization must not run'),
+      authorizer: boundAuthorizer,
       credentialUserEmail: 'saved@example.invalid',
       hasLoginSession: true,
       sessionResponse: { status: 200, data: ordinaryLoginSession },
       refreshResponse,
     });
-    assert.equal(result.finish.status, 'failed');
-    assert.match(result.finish.error, expected);
+    // 刷新失败不再中断本单：沿用提交的 Session，会话真的无效时由后续建单请求报错。
+    assert.equal(result.finish.status, 'completed', result.finish.error);
     assert.equal(result.finish.context.session.accessToken, 'test-access');
     const sessionRequests = result.requests.filter((request) => new URL(request.url).pathname === '/api/auth/session');
     assert.equal(sessionRequests.length, 1);
     assert.equal(new URL(sessionRequests[0].url).searchParams.get('refresh'), 'true');
-    assert.ok(!result.requests.some((request) => request.url.includes('/checkout_pricing_config/')));
-    assert.ok(!result.requests.some((request) => request.method === 'POST'));
+    const checkout = result.requests.find((request) => request.url.endsWith('/payments/checkout'))!;
+    assert.equal(checkout.headers?.authorization, 'Bearer test-access');
+    assert.ok(
+      result.commands.some(
+        (c) => c.action === 'step' && c.body.step.name === 'Session 刷新未成功 · 沿用提交的 Session',
+      ),
+    );
   });
 }
 
