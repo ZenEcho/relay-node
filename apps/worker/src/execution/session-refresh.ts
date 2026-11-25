@@ -3,6 +3,24 @@ import { throwIfExecutionAborted } from '../../../../packages/runtime/src/cancel
 import { hasChatgptSessionCookie, verifySessionIdentity } from './credentials.js';
 import type { ExecutionServices } from './services.js';
 
+// NextAuth reports a rejected refresh as HTTP 200 with an `error` field while
+// it still returns the previous access token. A rejected refresh token is
+// terminal: OpenAI revokes the token family, so the next protected write ends
+// with token_revoked and only a new login can recover the account.
+export const sessionRevokedMessage = 'Session 已失效，请重新登录并获取新的 Session。';
+
+export function rejectedSessionRefresh(session: unknown): string | undefined {
+  const value = (session as { error?: unknown } | null)?.error;
+  return typeof value === 'string' && value ? value : undefined;
+}
+
+export function sessionRefreshFailure(reason?: unknown) {
+  const detail = typeof reason === 'string' && reason ? reason : 'RefreshAccessTokenError';
+  return Object.assign(new Error(sessionRevokedMessage + '（令牌刷新失败：' + detail + '）'), {
+    code: 'SESSION_REVOKED',
+  });
+}
+
 export function isExpiredAccessToken(error: unknown): boolean {
   const value = error as {
     status?: number;
@@ -67,6 +85,8 @@ export async function refreshExpiredAccessToken(
         : {}),
     });
     throwIfExecutionAborted(signal);
+    const rejected = rejectedSessionRefresh(refreshed);
+    if (rejected) throw sessionRefreshFailure(rejected);
     verifySessionIdentity(identity, refreshed);
     const token = refreshed.accessToken || refreshed.access_token;
     const expiry = tokenClaims(token).exp;

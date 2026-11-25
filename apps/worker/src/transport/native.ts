@@ -26,7 +26,12 @@ export type HttpInput = {
   headers?: Record<string, string>;
   body?: string;
 };
-export type TransportRequestOptions = { onAttempt?: TransportAttemptSink };
+export type TransportRequestOptions = {
+  onAttempt?: TransportAttemptSink;
+  /** A caller may shorten the bounded retry policy for one request, never enlarge it. */
+  retryBudgetMs?: number;
+  retryDelaysMs?: readonly [number, number];
+};
 export type HttpOutput = {
   status: number;
   headers: Record<string, string[]>;
@@ -263,7 +268,8 @@ export class NativeTransport implements Transport {
     this.active(generation);
     const started = Date.now(),
       requestId = randomUUID();
-    const budget = bounded(this.options.retryBudgetMs, 90000, 1);
+    const configured = this.options.retryBudgetMs ?? 90000;
+    const budget = bounded(Math.min(options.retryBudgetMs ?? configured, configured), 90000, 1);
     const deadline = started + budget;
     const history: TransportAttempt[] = [];
     const sink = options.onAttempt || this.options.onAttempt;
@@ -321,7 +327,9 @@ export class NativeTransport implements Transport {
             ? caught
             : new NativeTransportError('NATIVE_TRANSPORT_FAILED');
         const delayMs =
-          attempt < 3 ? bounded(this.options.retryDelaysMs?.[attempt - 1], attempt === 1 ? 500 : 1500) : 0;
+          attempt < 3
+            ? bounded((options.retryDelaysMs ?? this.options.retryDelaysMs)?.[attempt - 1], attempt === 1 ? 500 : 1500)
+            : 0;
         let stopReason =
           error.code === 'TRANSPORT_BUDGET_EXHAUSTED' || Date.now() + delayMs >= deadline
             ? 'budget_exhausted'

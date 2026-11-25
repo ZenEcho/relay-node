@@ -422,6 +422,10 @@ export async function runManager(root: string) {
                         : new NativeTransport(join(releaseRoot, 'bin/relay-transport')),
                       config.officialSdk,
                       config.sentinel,
+                      () =>
+                        assignment.demo
+                          ? new DemoTransport()
+                          : new NativeTransport(join(releaseRoot, 'bin/relay-transport')),
                     ),
                   )
                   .then(() =>

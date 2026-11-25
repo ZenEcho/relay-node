@@ -115,7 +115,7 @@ const targetHosts = new Set([
   'm.stripe.com',
   'r.stripe.com',
   'sentinel.openai.com',
-  'ipapi.co',
+  'www.cloudflare.com',
 ]);
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const isoDate = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;

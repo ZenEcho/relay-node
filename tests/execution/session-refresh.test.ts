@@ -284,8 +284,8 @@ async function execute(
     },
     close() {},
     request: async (input) => {
-      if (new URL(input.url).hostname === 'ipapi.co')
-        return { status: 200, headers: {}, body: '', data: { ip: '192.0.2.4', country_code: 'PH' } };
+      if (new URL(input.url).pathname === '/cdn-cgi/trace')
+        return { status: 200, headers: {}, body: 'h=chatgpt.com\nip=192.0.2.4\nloc=PH\n', data: null };
       native.push(structuredClone(input));
       const path = new URL(input.url).pathname + new URL(input.url).search;
       let data: any;

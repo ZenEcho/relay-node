@@ -54,6 +54,57 @@ for (const [name, hints, expected] of [
   });
 }
 
+test('an authorization blip is replayed instead of abandoning the created intent', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    credentialUserEmail: 'session@example.invalid',
+    authorizeFailures: 2,
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  // Two 503s then the successful dispatch; each replay asks for the same step.
+  assert.equal(result.authorizeAttempts.stripe_confirm, 3);
+  assert.equal(
+    result.requests.filter(
+      (request) => /\/v1\/payment_intents\/[^/]+\/confirm$/.test(request.url),
+    ).length,
+    1,
+  );
+});
+
+test('the exit probe caps its transport retry budget while payment requests keep the default', async () => {
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    credentialUserEmail: 'session@example.invalid',
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const probe = result.optionLog.find((entry) => entry.path === '/cdn-cgi/trace');
+  assert.ok(probe, 'the merchant trace is the first probe');
+  assert.equal(probe.options.retryBudgetMs, 6000);
+  assert.deepEqual(probe.options.retryDelaysMs, [500, 1000]);
+  const checkout = result.optionLog.find((entry) => entry.path === '/backend-api/payments/checkout');
+  assert.equal(checkout?.options.retryBudgetMs, undefined);
+});
+
+test('deferred receipts keep their event time instead of the upload time', async () => {
+  const result = await execute({ demo: false, authorizer: boundAuthorizer,
+    credentialUserEmail: 'session@example.invalid' });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const steps = result.commands
+    .filter((command) => command.action === 'step')
+    .map((command) => command.body.step);
+  assert.ok(steps.length > 0);
+  assert.ok(
+    steps.every((step) => typeof step.startedAt === 'string' && !Number.isNaN(Date.parse(step.startedAt))),
+    'every receipt must carry the time it was produced',
+  );
+  assert.ok(
+    steps.filter((step) => step.status !== 'running').every((step) => typeof step.completedAt === 'string'),
+    'finished receipts are stamped at creation, not at upload',
+  );
+});
+
 test('Session email overrides the default in merchant taxes and Stripe form fields', async () => {
   const result = await execute({
     credentialUserEmail: 'session@example.invalid',
@@ -266,6 +317,7 @@ async function execute(
     transportRetryAudit?: boolean;
     initialContext?: RuntimeContext;
     checkoutReadResponse?: HttpOutput;
+    authorizeFailures?: number;
   } = {},
 ) {
   const environment = createEnvironment('PH', options.proxyUrl || '');
@@ -327,7 +379,8 @@ async function execute(
     assignment.billing = assignment.context.billing || undefined;
   }
   const requests: HttpInput[] = [],
-    commands: { action: string; body: any }[] = [];
+    commands: { action: string; body: any }[] = [],
+    optionLog: { path: string; options?: any }[] = [];
   const card = options.card || {
     number: '4242424242424242',
     expiry: '12/30',
@@ -355,6 +408,7 @@ async function execute(
           startedAt: new Date().toISOString(), elapsedMs: 0, totalElapsedMs: 0,
         });
       requests.push(input);
+      optionLog.push({ path: url.pathname, options: requestOptions });
       // m.stripe.com issues the device identity the payment method must name.
       if (url.hostname === 'm.stripe.com' && url.pathname === '/6')
         return { status: 200, headers: {}, body: JSON.stringify(MINTED_DEVICE), data: MINTED_DEVICE };
@@ -512,6 +566,7 @@ async function execute(
     }
   }
   const activeStages = new Set<string>();
+  const authorizeAttempts = new Map<string, number>();
   const control: Control = {
     signal: cancellation.signal,
     async assertActive(stage) {
@@ -520,6 +575,13 @@ async function execute(
     },
     async request(action, body = {}) {
       options.beforeCommand?.(action, body, assignment.context);
+      if (action === 'authorize') {
+        const kind = String((body as any).action),
+          attempt = (authorizeAttempts.get(kind) || 0) + 1;
+        authorizeAttempts.set(kind, attempt);
+        if (attempt <= (options.authorizeFailures || 0))
+          throw Object.assign(new Error('CDK 暂时不可达'), { status: 503, code: 'CDK_UNAVAILABLE' });
+      }
       commands.push({ action, body: structuredClone(body) });
       if (action === 'authorize') assignment.run.dispatches[(body as any).action] = new Date().toISOString();
       if (action === 'card') return card;
@@ -555,6 +617,8 @@ async function execute(
     card,
     control,
     transport,
+    optionLog,
+    authorizeAttempts: Object.fromEntries(authorizeAttempts),
     finish: commands.filter((c) => c.action === 'finish').at(-1)?.body,
   };
 }
@@ -1291,7 +1355,7 @@ test('Stripe permission failure on confirmation leaves the original payment in r
   await new ProtocolEngine(result.assignment, result.control, result.transport, boundAuthorizer).execute();
   assert.deepEqual(
     result.requests.slice(requestCount).map(({ method, url }) => [method, new URL(url).pathname]),
-    [['GET', '/json/'], ['GET', '/v1/payment_intents/' + intent.id]],
+    [['GET', '/cdn-cgi/trace'], ['GET', '/v1/payment_intents/' + intent.id]],
   );
   assert.ok(!result.commands.slice(commandCount).some((c) => ['card', 'authorize'].includes(c.action)));
   const recovered = result.commands.filter((c) => c.action === 'finish').at(-1)!.body;
@@ -1352,7 +1416,7 @@ for (const status of [200, 402]) {
     const recoveryRequests = result.requests.slice(requestCount);
     assert.deepEqual(
       recoveryRequests.map(({ method, url }) => [method, new URL(url).pathname]),
-      [['GET', '/json/'], ['GET', '/v1/payment_intents/' + originalIntentId]],
+      [['GET', '/cdn-cgi/trace'], ['GET', '/v1/payment_intents/' + originalIntentId]],
     );
     assert.ok(!result.commands.slice(commandCount).some((c) => ['card', 'authorize'].includes(c.action)));
     const recovered = result.commands.filter((c) => c.action === 'finish').at(-1)!.body;
@@ -1766,12 +1830,12 @@ test('a declined card continues with the original checkout, Elements and Intent 
   });
   assert.equal(result.finish.status, 'completed', result.finish.error);
   assert.equal(result.requests[0].method, 'GET');
-  assert.equal(new URL(result.requests[0].url).hostname, 'ipapi.co');
+  assert.equal(new URL(result.requests[0].url).hostname, 'chatgpt.com');
   assert.ok(result.requests[1].url.includes('/payment_intents/' + context.intent!.id + '?'));
   const logs = result.commands.filter((c) => c.action === 'step').map((c) => c.body.step);
   const probe = logs.find((step) => step.name === '记录本单网络出口');
   const confirm = logs.find((step) => step.name === 'Stripe 原 Intent 确认');
-  assert.equal(probe.response.source, 'ipapi.co');
+  assert.equal(probe.response.source, 'chatgpt.com');
   assert.equal(confirm.request.exitFingerprint, probe.response.exitFingerprint);
   assert.equal(confirm.request.exitProbe.observedAt, probe.response.observedAt);
   assert.equal(JSON.stringify(logs).includes(result.assignment.context.exitIp!), false);

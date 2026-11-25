@@ -395,6 +395,28 @@ test('a slow audit sink cannot start another request after the overall budget ex
   assert.equal((await f.records()).filter((x) => x.method === 'GET').length, 1);
 });
 
+test('one request can shorten the retry budget, and never enlarge it', async (t) => {
+  // The 'budget' helper answers after 1000ms, so a short request budget must
+  // stop it early instead of waiting for the helper.
+  const f = await fixture(t, 'budget', { retryBudgetMs: 5000 });
+  const shortened = Date.now();
+  await assert.rejects(
+    f.transport.request(get, { retryBudgetMs: 150 }),
+    (error: NativeTransportError) => {
+      assert.equal(error.code, 'TRANSPORT_BUDGET_EXHAUSTED');
+      return true;
+    },
+  );
+  assert.ok(Date.now() - shortened < 1000, 'the per-request budget shortened the wait');
+  assert.equal((await f.records()).filter((x: any) => x.method === 'GET').length, 1);
+
+  // A larger per-request value cannot widen the configured policy.
+  const bounded = await fixture(t, 'budget', { retryBudgetMs: 150 });
+  const started = Date.now();
+  await assert.rejects(bounded.transport.request(get, { retryBudgetMs: 60_000 }));
+  assert.ok(Date.now() - started < 1000, 'the configured budget still bounds the request');
+});
+
 test('the fresh execution guard prevents a GET retry after its first failed attempt is taken over', async (t) => {
   const cancellation = new AbortController();
   const f = await fixture(t, 'fail', {}, cancellation.signal);
@@ -431,7 +453,7 @@ for (const scenario of ['recover', 'fail'])
           exitCountry: 'PH',
           exitProbe: {
             observedAt: '2026-11-24T07:00:00.000Z',
-            source: 'ipapi.co',
+            source: 'chatgpt.com',
             simulated: false,
           },
         },
@@ -450,7 +472,7 @@ for (const scenario of ['recover', 'fail'])
     const parent = steps.filter((x) => x.name === '测试账号只读查询');
     const attempts = steps.filter((x) => x.name === '原生 HTTP 传输尝试');
     assert.equal(parent[0].request.exitFingerprint, 'abcdef123456');
-    assert.equal(parent[0].request.exitProbe.source, 'ipapi.co');
+    assert.equal(parent[0].request.exitProbe.source, 'chatgpt.com');
     assert.equal(attempts.filter((x) => x.status === 'running').length, scenario === 'recover' ? 2 : 3);
     assert.equal(new Set(attempts.map((x) => x.traceId)).size, scenario === 'recover' ? 2 : 3);
     if (scenario === 'recover') assert.equal(parent.at(-1).response.transportAttempts.length, 2);

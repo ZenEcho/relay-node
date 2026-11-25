@@ -505,6 +505,7 @@ export async function executeWithOnDemandSdk(
   transport: Transport,
   options: OnDemandSdkOptions = {},
   sentinel: SentinelRuntimeOptions = defaultSentinelRuntime(),
+  probeTransport?: () => Transport,
 ) {
   let sdk: OnDemandSdkRuntime | undefined;
   const abort = () => {
@@ -541,6 +542,7 @@ export async function executeWithOnDemandSdk(
               sdk ||= new OnDemandSdkRuntime(assignment, options, control.signal);
               return sdk.cleanupChat(...args);
             }),
+      probeTransport,
     ).execute();
   } finally {
     control.signal?.removeEventListener('abort', abort);

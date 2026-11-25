@@ -44,12 +44,27 @@ const STRIPE_VERSION =
   '2025-03-31.basil; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1';
 // Compatibility metadata from oa-pay-protocol-go; tokenization remains HTTP.
 const STRIPE_JS_VERSIONS = ['628eb3cacd', 'a44b454c', 'd21f1cd6', '9c1e8d52', 'f7a3b211', '692f102a8f'];
+// Exit probes are diagnostics; a dead endpoint must not burn the order's time.
+const EGRESS_PROBE_BUDGET_MS = 6000;
+const EGRESS_PROBE_RETRY_DELAYS = [500, 1000] as const;
 const sentinelWrites: Record<string, SentinelFlow> = {
   '/backend-api/payments/checkout': 'chatgpt_checkout',
   '/backend-api/payments/checkout/taxes': 'chatgpt_checkout',
   '/backend-api/payments/checkout/confirm': 'checkout_session_approval',
   '/backend-api/payments/checkout/approve': 'checkout_session_approval',
 };
+/** An authorization blip is retried; an explicit refusal or abort is not. */
+function retryableAuthorize(error: unknown) {
+  const e = error as {
+    code?: string;
+    status?: number;
+    statusCode?: number;
+    httpResponse?: { status?: number };
+  };
+  if (e?.code === 'EXECUTION_ABORTED') return false;
+  const status = e?.status || e?.statusCode || e?.httpResponse?.status || 0;
+  return status === 0 || status === 429 || status >= 500;
+}
 export class ProtocolEngine {
   private context: RuntimeContext;
   private stage = 'preflight';
@@ -62,6 +77,7 @@ export class ProtocolEngine {
     private sentinelAuthorizer?: SentinelAuthorizer,
     private stripeTokenProvider?: StripeTokenProvider,
     private browserCleanupChat?: ExecutionServices['cleanupChat'],
+    private probeTransport?: () => Transport,
   ) {
     this.context = assignment.context;
     this.stage = assignment.mode === 'reconcile'
@@ -76,6 +92,7 @@ export class ProtocolEngine {
       signal: this.control.signal,
       context: this.context,
       log: this.log,
+      ...(this.probeTransport ? { probeRequest: this.probeRequest.bind(this) } : {}),
       command: this.command.bind(this),
       setStage: this.setStage.bind(this),
       checkpoint: this.checkpoint.bind(this),
@@ -127,9 +144,18 @@ export class ProtocolEngine {
   }
   private log = async (step: AuditEntry) => {
     if (this.control.signal?.aborted) return;
+    // Receipts stay buffered until the run leaves this machine, so stamp the
+    // real event time here: the console orders the timeline by it, not by upload.
+    const at = step.startedAt || new Date().toISOString();
     await executionOperation(this.control.signal, () =>
       this.control.request('step', {
-        step: { ...step, request: { stage: this.stage, ...(step.request as object) }, source: 'worker' },
+        step: {
+          ...step,
+          startedAt: at,
+          ...(step.completedAt || step.status === 'running' ? {} : { completedAt: at }),
+          request: { stage: this.stage, ...(step.request as object) },
+          source: 'worker',
+        },
       }),
     );
   };
@@ -142,29 +168,62 @@ export class ProtocolEngine {
       verification: '客户验证协调',
       finish: '提交执行结果',
     };
-    return trace(
-      this.log,
-      names[action] || action,
-      {
-        method: 'POST',
-        path: `/api/worker/runs/${this.assignment.run.id}/${action}`,
-        action,
-        ...body,
-      },
-      async (capture) => {
-        const result = await executionOperation(this.control.signal, () =>
-          this.control.request(action, body),
-        );
-        if (action === 'authorize' && ['merchant_confirm', 'merchant_approve', 'stripe_confirm', 'registration'].includes(body.action)) {
-          this.assignment.run.dispatches[body.action] ||= new Date().toISOString();
-          if (body.action !== 'registration') this.assignment.run.paymentSubmitted = true;
-        }
-        capture(result);
-        return result;
-      },
-    );
+    const send = () =>
+      trace(
+        this.log,
+        names[action] || action,
+        {
+          method: 'POST',
+          path: `/api/worker/runs/${this.assignment.run.id}/${action}`,
+          action,
+          ...body,
+        },
+        async (capture) => {
+          const result = await executionOperation(this.control.signal, () =>
+            this.control.request(action, body),
+          );
+          if (action === 'authorize' && ['merchant_confirm', 'merchant_approve', 'stripe_confirm', 'registration'].includes(body.action)) {
+            this.assignment.run.dispatches[body.action] ||= new Date().toISOString();
+            if (body.action !== 'registration') this.assignment.run.paymentSubmitted = true;
+          }
+          capture(result);
+          return result;
+        },
+      );
+    // The console records a dispatch before answering, so replaying authorize is
+    // safe. A single CDK/console blip must not abandon an already-created intent.
+    if (action !== 'authorize') return send();
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await send();
+      } catch (error) {
+        if (attempt >= 3 || !retryableAuthorize(error) || this.control.signal?.aborted) throw error;
+        await new Promise((resolve) => setTimeout(resolve, attempt === 1 ? 1000 : 3000));
+        throwIfExecutionAborted(this.control.signal);
+      }
+    }
   }
-  private async request(name: string, input: HttpInput, grant?: SentinelGrant) {
+  private request(name: string, input: HttpInput, grant?: SentinelGrant) {
+    return this.requestOn(this.transport, name, input, grant);
+  }
+  /** Secondary exit probe: its own short-lived transport keeps the task's queue free. */
+  private async probeRequest(input: HttpInput) {
+    const factory = this.probeTransport;
+    if (!factory) throw new Error('缺少并发出口探测传输');
+    const transport = factory();
+    try {
+      await transport.initialize(this.context.environment, this.control.signal);
+      return await this.requestOn(transport, '检查备用出口', input);
+    } finally {
+      transport.close();
+    }
+  }
+  private async requestOn(
+    transport: Transport,
+    name: string,
+    input: HttpInput,
+    grant?: SentinelGrant,
+  ) {
     throwIfExecutionAborted(this.control.signal);
     const environment = this.context.environment;
     const egressProbe = input.url === egressProbeUrls.primary || input.url === egressProbeUrls.fallback;
@@ -199,7 +258,13 @@ export class ProtocolEngine {
         // The controller/audit round trip may outlive or invalidate a grant.
         grant?.assertValid();
         const output = await executionOperation(this.control.signal, () =>
-          this.transport.request(input, {
+          transport.request(input, {
+            ...(egressProbe
+              ? {
+                  retryBudgetMs: EGRESS_PROBE_BUDGET_MS,
+                  retryDelaysMs: EGRESS_PROBE_RETRY_DELAYS,
+                }
+              : {}),
             onAttempt: async (attempt) => {
               const event = transportAttempt(attempt);
               if (!event) return;

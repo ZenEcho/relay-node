@@ -4,7 +4,7 @@ import { throwIfExecutionAborted } from '../../../../packages/runtime/src/cancel
 import { bindBillingEmail, selectBillingEmail } from '../../../../packages/rules/src/billing-email.js';
 import { hasChatgptSessionCookie, verifySessionIdentity } from './credentials.js';
 import { UpstreamError } from './http-utils.js';
-import { tokenClaims } from './session-refresh.js';
+import { tokenClaims, rejectedSessionRefresh, sessionRefreshFailure } from './session-refresh.js';
 import type { ExecutionServices } from './services.js';
 
 const CHECKOUT_PATH = '/backend-api/payments/checkout';
@@ -36,6 +36,22 @@ async function refreshCheckoutSession(services: ExecutionServices) {
       },
     );
     throwIfExecutionAborted(services.signal);
+    // A 200 with a rejected refresh still carries the old access token, so the
+    // later checks would run on a revoked token and fail at checkout instead.
+    const rejected = rejectedSessionRefresh(session);
+    if (rejected) {
+      await services.log({
+        name: '账号 Session 无法刷新',
+        status: 'failed',
+        category: 'event',
+        response: {
+          error: rejected,
+          message: '登录令牌刷新被拒绝，账号需要重新登录后才能继续本单',
+        },
+        error: 'Session 刷新失败：' + rejected,
+      });
+      throw sessionRefreshFailure(rejected);
+    }
     const accessToken = session?.accessToken || session?.access_token;
     const accountId = session?.account?.id || session?.account?.account_id;
     const userId = session?.user?.id;
@@ -75,15 +91,23 @@ export async function sampleExecutionEgress(services: ExecutionServices, require
   };
   delete context.exitProbe;
   let result: Awaited<ReturnType<typeof observeEgress>>;
+  const asProbe = (call: (input: any) => Promise<any>) => async (input: any) => {
+    try {
+      return await call(input);
+    } catch (error) {
+      if (!(error instanceof UpstreamError)) throw error;
+      return { status: error.status, data: error.data, body: '' };
+    }
+  };
   try {
-    result = await observeEgress(async (input) => {
-      try {
-        return await services.request(proxied ? '检查本单代理出口' : '检查执行节点本机出口', input);
-      } catch (error) {
-        if (!(error instanceof UpstreamError)) throw error;
-        return { status: error.status, data: error.data, body: '' };
-      }
-    });
+    // The two traces race on separate transports so a blocked endpoint cannot
+    // add its timeout to the order; the first confirmed exit wins.
+    result = await observeEgress(
+      asProbe((input) =>
+        services.request(proxied ? '检查本单代理出口' : '检查执行节点本机出口', input),
+      ),
+      services.probeRequest ? asProbe((input) => services.probeRequest!(input)) : undefined,
+    );
   } catch (error) {
     throwIfExecutionAborted(services.signal);
     const failure = error as { code?: string; name?: string };
@@ -143,8 +167,11 @@ export async function preflightExecution(services: ExecutionServices) {
     !services.assignment.demo &&
     !services.context.checkout &&
     hasChatgptSessionCookie(services.context.environment.cookies);
-  if (forceSessionRefresh) await refreshCheckoutSession(services);
-  else if (
+  if (forceSessionRefresh) {
+    // A forced refresh is an account check; attribute its failure there.
+    services.setStage('subscription_check');
+    await refreshCheckoutSession(services);
+  } else if (
     !services.context.session?.accessToken ||
     (!services.context.billingEmailBinding &&
       selectBillingEmail('chatgpt', services.context.session).source !== 'session')

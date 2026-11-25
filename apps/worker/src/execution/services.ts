@@ -11,6 +11,8 @@ export type ExecutionServices = {
   setStage(stage: string): void;
   checkpoint(stage: string): Promise<void>;
   request(name: string, input: HttpInput): Promise<HttpOutput>;
+  /** Optional second exit probe on its own transport; runs beside `request`. */
+  probeRequest?(input: HttpInput): Promise<HttpOutput>;
   chat(
     name: string,
     path: string,

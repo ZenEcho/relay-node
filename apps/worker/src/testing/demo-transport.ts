@@ -16,10 +16,18 @@ export class DemoTransport implements Transport {
     const u = new URL(input.url);
     let data: any = {};
     const suffix = this.environment.id.replaceAll('-', '').slice(0, 16);
-    if (u.hostname === 'ipapi.co')
-      data = {
-        ip: '192.0.2.' + (10 + (parseInt(suffix.slice(0, 2), 16) % 100)),
-        country_code: this.environment.country,
+    if (u.pathname === '/cdn-cgi/trace')
+      return {
+        status: 200,
+        headers: {},
+        body: [
+          'fl=demo',
+          'h=' + u.hostname,
+          'ip=192.0.2.' + (10 + (parseInt(suffix.slice(0, 2), 16) % 100)),
+          'loc=' + this.environment.country,
+          'ts=0',
+        ].join('\n') + '\n',
+        data: null,
       };
     else if (u.pathname === '/api/auth/session')
       data = { accessToken: 'demo-refreshed-session', account: { id: 'demo-account' } };

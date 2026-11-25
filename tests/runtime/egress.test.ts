@@ -1,25 +1,52 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { inspectEgress } from '../../packages/runtime/src/egress.js';
+import { egressProbeUrls, inspectEgress, observeEgress } from '../../packages/runtime/src/egress.js';
 
-const trace = {
+const chatgptTrace = {
   status: 200,
   data: null,
   body: 'h=chatgpt.com\nip=192.0.2.4\nloc=PH\n',
 };
+const cloudflareTrace = {
+  status: 200,
+  data: null,
+  body: 'h=www.cloudflare.com\nip=192.0.2.9\nloc=PH\n',
+};
 
-test('a primary transport failure uses the target trace through the supplied transport', async () => {
+function byHost(handlers: Record<string, () => any>) {
+  return async (input: { url: string }) => {
+    const host = new URL(input.url).hostname;
+    return handlers[host] ? handlers[host]() : handlers.default?.();
+  };
+}
+
+test('the merchant trace confirms the exit first and needs no second probe', async () => {
   const calls: string[] = [];
-  const result = await inspectEgress(async (input) => {
+  const result = await observeEgress(async (input) => {
     calls.push(input.url);
-    if (input.url.includes('ipapi.co'))
-      throw Object.assign(new Error('TLS failed'), {
-        code: 'UPSTREAM_TLS_FAILED',
-      });
-    return trace;
+    return chatgptTrace;
   });
-  assert.deepEqual(result, { ip: '192.0.2.4', country: 'PH' });
-  assert.deepEqual(calls, ['https://ipapi.co/json/', 'https://chatgpt.com/cdn-cgi/trace']);
+  assert.deepEqual(result, { ip: '192.0.2.4', country: 'PH', source: 'chatgpt.com' });
+  assert.deepEqual(calls, [egressProbeUrls.primary]);
+});
+
+test('a failed merchant trace falls through to the Cloudflare trace with the same session', async () => {
+  const calls: string[] = [];
+  const result = await observeEgress(
+    byHost({
+      'chatgpt.com': () => {
+        calls.push('chatgpt');
+        throw Object.assign(new Error('TLS failed'), { code: 'UPSTREAM_TLS_FAILED' });
+      },
+      'www.cloudflare.com': () => {
+        calls.push('cloudflare');
+        return cloudflareTrace;
+      },
+    }) as any,
+  );
+  assert.deepEqual(result, { ip: '192.0.2.9', country: 'PH', source: 'cloudflare.com' });
+  assert.deepEqual(calls, ['chatgpt', 'cloudflare']);
+  assert.equal(egressProbeUrls.fallback, 'https://www.cloudflare.com/cdn-cgi/trace');
 });
 
 test('an unsuccessful fallback preserves its transport error and never accepts invalid trace data', async () => {
@@ -27,18 +54,31 @@ test('an unsuccessful fallback preserves its transport error and never accepts i
     code: 'UPSTREAM_TLS_FAILED',
   });
   await assert.rejects(
-    inspectEgress(async (input) => {
-      if (input.url.includes('ipapi.co')) throw new Error('primary failed');
-      throw failure;
-    }),
+    inspectEgress(
+      byHost({
+        'chatgpt.com': () => {
+          throw new Error('primary failed');
+        },
+        'www.cloudflare.com': () => {
+          throw failure;
+        },
+      }) as any,
+    ),
     (error) => error === failure,
   );
   const primary = new Error('primary failed');
   await assert.rejects(
-    inspectEgress(async (input) => {
-      if (input.url.includes('ipapi.co')) throw primary;
-      return { ...trace, body: 'h=other.invalid\nip=192.0.2.4\nloc=PH' };
-    }),
+    inspectEgress(
+      byHost({
+        'chatgpt.com': () => {
+          throw primary;
+        },
+        'www.cloudflare.com': () => ({
+          ...cloudflareTrace,
+          body: 'h=other.invalid\nip=192.0.2.4\nloc=PH',
+        }),
+      }) as any,
+    ),
     (error: any) => error.code === 'EGRESS_UNAVAILABLE' && error.cause === primary,
   );
 });
@@ -59,4 +99,49 @@ test('cancellation and intentionally closed transports do not start a fallback r
     );
     assert.equal(calls, 1);
   }
+});
+
+test('the two probes run beside each other and the first valid answer wins', async () => {
+  const started: string[] = [];
+  const slowPrimary = new Promise((resolve) => setTimeout(() => resolve(chatgptTrace), 120));
+  const result = await observeEgress(
+    (input) => {
+      started.push(new URL(input.url).hostname);
+      return slowPrimary as any;
+    },
+    (input) => {
+      started.push(new URL(input.url).hostname);
+      return Promise.resolve(cloudflareTrace);
+    },
+  );
+  assert.deepEqual(result, { ip: '192.0.2.9', country: 'PH', source: 'cloudflare.com' });
+  assert.deepEqual(started.sort(), ['chatgpt.com', 'www.cloudflare.com']);
+});
+
+test('both probes failing reports one retryable egress failure', async () => {
+  const primary = Object.assign(new Error('primary timeout'), { code: 'UPSTREAM_TIMEOUT' });
+  await assert.rejects(
+    observeEgress(
+      async () => {
+        throw primary;
+      },
+      async () => {
+        throw new Error('secondary timeout');
+      },
+    ),
+    (error: any) => error.code === 'EGRESS_UNAVAILABLE' && error.cause === primary,
+  );
+});
+
+test('a fatal state in either probe stops the pair immediately', async () => {
+  const aborted = Object.assign(new Error('cancelled'), { code: 'EXECUTION_ABORTED' });
+  await assert.rejects(
+    observeEgress(
+      async () => {
+        throw aborted;
+      },
+      () => new Promise(() => {}),
+    ),
+    (error) => error === aborted,
+  );
 });

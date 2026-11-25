@@ -66,7 +66,7 @@ export type RuntimeContext = {
   exitFingerprint?: string;
   exitProbe?: {
     observedAt: string;
-    source: 'ipapi.co' | 'chatgpt.com';
+    source: 'chatgpt.com' | 'cloudflare.com';
     simulated: boolean;
   };
   originalSubscription?: Record<string, any>;

@@ -31,8 +31,8 @@ function fixture(verified = false) {
       requests++;
       return {
         status: 200,
-        data: { ip: '203.0.113.42', country_code: 'PH' },
-        body: '',
+        data: null,
+        body: 'h=chatgpt.com\nip=203.0.113.42\nloc=PH\n',
       };
     },
     log: async (entry: unknown) => {
@@ -58,7 +58,7 @@ test('verified exits get a correlation fingerprint without new raw network or cr
   });
   assert.deepEqual((f.logs[0] as any).response, {
     observedAt: f.context.exitProbe.observedAt,
-    source: 'ipapi.co',
+    source: 'chatgpt.com',
     simulated: false,
     observed: true,
     exitFingerprint: f.context.exitFingerprint,
@@ -89,8 +89,8 @@ for (const actual of ['BR', 'FR']) {
     f.services.request = async () => ({
       status: 200,
       headers: {},
-      data: { ip: '203.0.113.42', country_code: actual },
-      body: '',
+      data: null,
+      body: 'h=chatgpt.com\nip=203.0.113.42\nloc=' + actual + '\n',
     });
     f.services.requireSentinel = async () => assert.fail('must stop before Sentinel');
     f.services.chat = async () => assert.fail('must stop before account or checkout requests');
@@ -130,14 +130,14 @@ test('a fresh fallback probe reports a changed exit and failed diagnostics disca
   const f = fixture(true);
   await sampleExecutionEgress(f.services);
   f.services.request = async (_name, input) => ({
-    status: input.url.includes('ipapi.co') ? 403 : 200,
+    status: input.url.includes('chatgpt.com') ? 403 : 200,
     headers: {},
     data: null,
-    body: 'h=chatgpt.com\nip=203.0.113.84\nloc=PH\n',
+    body: 'h=www.cloudflare.com\nip=203.0.113.84\nloc=PH\n',
   });
   await sampleExecutionEgress(f.services);
   assert.equal(f.context.exitFingerprint, digest('203.0.113.84').slice(0, 12));
-  assert.equal((f.logs[1] as any).response.source, 'chatgpt.com');
+  assert.equal((f.logs[1] as any).response.source, 'cloudflare.com');
   assert.equal((f.logs[1] as any).response.exitChanged, true);
   f.services.request = async () => { throw new Error('diagnostic unavailable'); };
   await sampleExecutionEgress(f.services);
