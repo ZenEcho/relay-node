@@ -7,12 +7,34 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync/atomic"
 	"testing"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls "github.com/bogdanfinn/tls-client"
 )
+
+func TestCloudflareTraceTarget(t *testing.T) {
+	for _, test := range []struct {
+		method    string
+		target    string
+		permitted bool
+	}{
+		{"GET", "https://www.cloudflare.com/cdn-cgi/trace", true},
+		{"POST", "https://www.cloudflare.com/cdn-cgi/trace", false},
+		{"GET", "https://www.cloudflare.com/cdn-cgi/trace?test=1", false},
+		{"GET", "https://www.cloudflare.com/", false},
+	} {
+		target, err := url.Parse(test.target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if actual := targetPermitted(target, test.method); actual != test.permitted {
+			t.Errorf("%s %s permitted = %t, want %t", test.method, test.target, actual, test.permitted)
+		}
+	}
+}
 
 func TestSDKRequestBudgetStopsAnInitialTLSHandshake(t *testing.T) {
 	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

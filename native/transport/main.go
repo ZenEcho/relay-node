@@ -47,6 +47,16 @@ const nativeRequestTimeoutSeconds = 35
 var profileMap = map[string]profiles.ClientProfile{"chrome_146": profiles.Chrome_146, "chrome_133": profiles.Chrome_133, "chrome_131": profiles.Chrome_131, "chrome_124": profiles.Chrome_124, "chrome_120": profiles.Chrome_120}
 var hosts = map[string]bool{"chatgpt.com": true, "auth.openai.com": true, "api.stripe.com": true, "m.stripe.com": true, "r.stripe.com": true, "sentinel.openai.com": true, "ipapi.co": true}
 
+func targetPermitted(target *url.URL, method string) bool {
+	if target.Scheme != "https" || target.User != nil || (target.Port() != "" && target.Port() != "443") {
+		return false
+	}
+	if target.Hostname() == "www.cloudflare.com" {
+		return method == "GET" && target.EscapedPath() == "/cdn-cgi/trace" && target.RawQuery == ""
+	}
+	return hosts[target.Hostname()]
+}
+
 // Classify locally; never return raw errors containing proxy credentials or URLs.
 func transportErrorCode(err error) string {
 	detail := strings.ToLower(err.Error())
@@ -182,7 +192,7 @@ func main() {
 			continue
 		}
 		u, err := url.Parse(input.URL)
-		if err != nil || u.Scheme != "https" || !hosts[u.Hostname()] || u.User != nil || (u.Port() != "" && u.Port() != "443") {
+		if err != nil || !targetPermitted(u, input.Method) {
 			send(map[string]any{"id": input.ID, "error": "target not permitted"})
 			continue
 		}
