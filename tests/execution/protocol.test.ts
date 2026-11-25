@@ -9,6 +9,12 @@ import type { SentinelAuthorizer } from '../../packages/contracts/src/sentinel.j
 import type { ExecutionServices } from '../../apps/worker/src/execution/services.js';
 import type { RuntimeContext } from '../../packages/contracts/src/execution.js';
 
+const MINTED_DEVICE = {
+  muid: '11111111-2222-4333-8444-555555555555aaaaaaaa',
+  guid: '66666666-7777-4888-9999-aaaaaaaaaaaabbbbbbbb',
+  sid: 'cccccccc-dddd-4eee-8fff-00000000000011111111',
+};
+
 const boundAuthorizer: SentinelAuthorizer = async (request) => ({
   ...request,
   token: 'fixture-bound-authorization',
@@ -349,6 +355,9 @@ async function execute(
           startedAt: new Date().toISOString(), elapsedMs: 0, totalElapsedMs: 0,
         });
       requests.push(input);
+      // m.stripe.com issues the device identity the payment method must name.
+      if (url.hostname === 'm.stripe.com' && url.pathname === '/6')
+        return { status: 200, headers: {}, body: JSON.stringify(MINTED_DEVICE), data: MINTED_DEVICE };
       if (url.pathname.includes('/checkout/openai_llc/') && options.checkoutReadResponse)
         return options.checkoutReadResponse;
       if (url.pathname === '/backend-api/payments/checkout' && options.checkoutResponse)
@@ -1818,4 +1827,19 @@ test('a pre-dispatch failure resumes the accepted checkout without another quote
   const preparation = result.requests.slice(0, result.requests.findIndex((r) => r.method === 'POST' && r.url.includes('/payment_intents/')));
   assert.equal(preparation.some((r) => /checkout_pricing|accounts\/check|elements\/sessions|checkout\/taxes/.test(r.url)), false);
   assert.equal(result.requests.some((r) => r.method === 'POST' && r.url.endsWith('/payments/checkout')), false);
+});
+
+test('the confirmation token names the device m.stripe.com issued, not the environment placeholder', async () => {
+  const result = await execute({ demo: false, authorizer: boundAuthorizer });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  const token = result.requests.find((request) => request.url.endsWith('/confirmation_tokens'))!;
+  const form = new URLSearchParams(token.body);
+  assert.equal(form.get('payment_method_data[muid]'), MINTED_DEVICE.muid);
+  assert.equal(form.get('payment_method_data[guid]'), MINTED_DEVICE.guid);
+  assert.equal(form.get('payment_method_data[sid]'), MINTED_DEVICE.sid);
+  assert.equal(result.requests.filter((request) => request.url === 'https://m.stripe.com/6').length, 1);
+  // The console forbids changing environment.stripeIds, so the mint lands on the
+  // context instead of overwriting the placeholders.
+  assert.notEqual(result.finish.context.environment.stripeIds.muid, MINTED_DEVICE.muid);
+  assert.equal(result.finish.context.stripeDevice.muid, MINTED_DEVICE.muid);
 });

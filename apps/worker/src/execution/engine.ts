@@ -25,6 +25,7 @@ import { loadCredential } from './credentials.js';
 import { isExpiredAccessToken, refreshExpiredAccessToken } from './session-refresh.js';
 import { paymentPlan } from '../../../../packages/rules/src/plans.js';
 import { billingPostalCodeOptional } from '../../../../packages/rules/src/billing.js';
+import { issueStripeDevice } from './stripe-device.js';
 import { authorizeSentinel, consumeSentinel, type SentinelGrant } from './sentinel.js';
 import type { RuntimeContext } from '../../../../packages/contracts/src/execution.js';
 import type { StripeTokenProvider } from '../../../../packages/contracts/src/stripe.js';
@@ -618,6 +619,9 @@ export class ProtocolEngine {
       }
       if (!this.context.confirmationToken) {
         this.setStage('card_preparation');
+        // Register the device on the exit that carries the payment, immediately
+        // before the first Stripe write that names it.
+        await issueStripeDevice(this.services);
         const card = await this.command('card');
         try {
           if (this.stripeTokenProvider) {
@@ -669,13 +673,14 @@ export class ProtocolEngine {
             const month = expiry[1].padStart(2, '0'),
               year = expiry[2].length === 2 ? '20' + expiry[2] : expiry[2];
             const jsVersion = STRIPE_JS_VERSIONS[randomInt(STRIPE_JS_VERSIONS.length)];
+            const device = this.context.stripeDevice || this.context.environment.stripeIds;
             const fields: Record<string, any> = {
               key: this.context.key,
               _stripe_version: STRIPE_VERSION,
               'payment_method_data[type]': 'card',
-              'payment_method_data[guid]': this.context.environment.stripeIds.guid,
-              'payment_method_data[muid]': this.context.environment.stripeIds.muid,
-              'payment_method_data[sid]': this.context.environment.stripeIds.sid,
+              'payment_method_data[guid]': device.guid,
+              'payment_method_data[muid]': device.muid,
+              'payment_method_data[sid]': device.sid,
               'payment_method_data[card][number]': number,
               'payment_method_data[card][cvc]': cvc,
               'payment_method_data[card][exp_month]': month,

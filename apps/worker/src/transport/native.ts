@@ -4,6 +4,7 @@ import { access } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { throwIfExecutionAborted } from '../../../../packages/runtime/src/cancellation.js';
+import { chromeHeaderOrder } from '../../../../packages/runtime/src/environment.js';
 import type { Environment } from '../../../../packages/contracts/src/execution.js';
 import {
   nativeTransportErrorCode,
@@ -300,13 +301,16 @@ export class NativeTransport implements Transport {
         // Leave time for the helper to return the last phase and any partial
         // response before the process watchdog has to stop it.
         const timeoutMs = watchdogMs - Math.min(250, Math.floor(watchdogMs / 10));
+        const headers = { ...this.environment!.headers, ...input.headers };
         response = await this.rpc(
           {
             method: input.method,
             url: input.url,
             body: input.body,
             timeoutMs,
-            headers: { ...this.environment!.headers, ...input.headers },
+            headers,
+            // Chrome's wire header sequence, not the map's iteration order.
+            headerOrder: chromeHeaderOrder(Object.keys(headers)),
           },
           watchdogMs,
           requestRemaining <= 45000 ? 'TRANSPORT_BUDGET_EXHAUSTED' : 'NATIVE_TRANSPORT_TIMEOUT',

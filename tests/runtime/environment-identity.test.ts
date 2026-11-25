@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createEnvironment } from '../../packages/runtime/src/environment.js';
+import { chromeHeaderOrder, createEnvironment } from '../../packages/runtime/src/environment.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -19,4 +19,18 @@ test('a rebuilt environment never reuses the previous device identity', () => {
   assert.notEqual(first.id, second.id);
   assert.notEqual(first.deviceId, second.deviceId);
   assert.notDeepEqual(first.stripeIds, second.stripeIds);
+});
+
+test('the environment advertises the same codecs and header sequence as Chrome', () => {
+  const environment = createEnvironment('PH', '');
+  assert.equal(environment.headers['accept-encoding'], 'gzip, deflate, br, zstd');
+  assert.deepEqual(chromeHeaderOrder(['user-agent', 'accept-encoding', 'sec-ch-ua', 'x-openai-target-path']), [
+    'content-length',
+    'x-openai-target-path',
+    'user-agent',
+    'sec-ch-ua',
+    'accept-encoding',
+  ]);
+  // An ordering key with names the request never sends must not add headers.
+  assert.deepEqual(chromeHeaderOrder([]), ['content-length']);
 });

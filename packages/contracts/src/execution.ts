@@ -70,6 +70,10 @@ export type RuntimeContext = {
     simulated: boolean;
   };
   originalSubscription?: Record<string, any>;
+  // Device identity minted by m.stripe.com through the order's own exit. It is
+  // absent until the node registers it, and then it outranks the placeholder
+  // UUIDs baked into the environment at creation time.
+  stripeDevice?: { muid: string; guid: string; sid: string };
   billing?: Billing | null;
   billingEmailBinding?: BillingEmailBinding;
   checkoutResume?: {

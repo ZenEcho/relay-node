@@ -107,6 +107,52 @@ test('browser cookie expiry fractions are normalized before reinitializing the n
   assert.equal(f.environment.cookies[0].expires, 1794906795.273);
 });
 
+test('every request replays Chrome header order instead of the map order', async (t) => {
+  const f = await fixture(t);
+  await f.transport.request(get);
+  const readOrder = async () => {
+    const message = (await f.records())
+      .filter((x: any) => x.method === 'GET' || x.method === 'POST')
+      .at(-1);
+    return { order: message.headerOrder as string[], headers: message.headers };
+  };
+  const first = await readOrder();
+  assert.deepEqual(first.order, [
+    'content-length',
+    'authorization',
+    'sec-ch-ua-platform',
+    'user-agent',
+    'sec-ch-ua',
+    'sec-ch-ua-mobile',
+    'accept-encoding',
+    'accept-language',
+    'priority',
+  ]);
+  assert.equal(first.headers['accept-encoding'], 'gzip, deflate, br, zstd');
+  assert.equal(first.headers.authorization, 'Bearer private-access');
+  await f.transport.request({
+    method: 'POST',
+    url: 'https://api.stripe.com/v1/payment_intents/pi_fixture/confirm',
+    headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded', origin: 'https://js.stripe.com' },
+    body: 'client_secret=cs_fixture',
+  });
+  const second = await readOrder();
+  assert.deepEqual(second.order, [
+    'content-length',
+    'authorization',
+    'sec-ch-ua-platform',
+    'user-agent',
+    'sec-ch-ua',
+    'content-type',
+    'sec-ch-ua-mobile',
+    'accept',
+    'origin',
+    'accept-encoding',
+    'accept-language',
+    'priority',
+  ]);
+});
+
 test('an uncorrelated helper initialization rejection fails immediately', async (t) => {
   await assert.rejects(fixture(t, 'invalid-init'), (error: NativeTransportError) => error.code === 'NATIVE_TRANSPORT_FAILED');
 });

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	fhttp "github.com/bogdanfinn/fhttp"
 	tls "github.com/bogdanfinn/tls-client"
 )
 
@@ -185,5 +186,39 @@ func TestConnectDenialFromRealTransport(t *testing.T) {
 				t.Fatalf("expected %s, got %s", want, code)
 			}
 		})
+	}
+}
+
+func TestHeaderOrderIsReplayedVerbatim(t *testing.T) {
+	request, err := newUpstreamRequest(Request{
+		ID:          "order",
+		Method:      "POST",
+		URL:         "https://api.stripe.com/v1/payment_intents/pi_fixture/confirm",
+		Body:        "client_secret=cs_fixture",
+		Headers:     map[string]string{"sec-ch-ua": `"Chromium";v="146"`, "User-Agent": "ua", "accept": "application/json"},
+		HeaderOrder: []string{"SEC-CH-UA", "user-agent", "accept", "content-type"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := request.Header[fhttp.HeaderOrderKey]
+	want := []string{"sec-ch-ua", "user-agent", "accept", "content-type"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expected %v, got %v", want, got)
+		}
+	}
+}
+
+func TestHeaderOrderIsOptional(t *testing.T) {
+	request, err := newUpstreamRequest(Request{ID: "plain", Method: "GET", URL: "https://api.stripe.com/v1/payment_methods"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if order, ok := request.Header[fhttp.HeaderOrderKey]; ok {
+		t.Fatalf("expected no ordering key, got %v", order)
 	}
 }

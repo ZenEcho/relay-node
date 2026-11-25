@@ -28,15 +28,18 @@ type Cookie struct {
 	Expires int64  `json:"expires"`
 }
 type Request struct {
-	ID        string            `json:"id"`
-	Method    string            `json:"method"`
-	URL       string            `json:"url"`
-	Headers   map[string]string `json:"headers"`
-	Body      string            `json:"body"`
-	TimeoutMs int               `json:"timeoutMs"`
-	Profile   string            `json:"profile"`
-	Proxy     string            `json:"proxyUrl"`
-	Cookies   []Cookie          `json:"cookies"`
+	ID      string            `json:"id"`
+	Method  string            `json:"method"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers"`
+	// HeaderOrder is the wire sequence reported by the caller (lowercase, as in
+	// Chrome). Empty keeps the transport's lexicographic default.
+	HeaderOrder []string `json:"headerOrder"`
+	Body        string   `json:"body"`
+	TimeoutMs   int      `json:"timeoutMs"`
+	Profile     string   `json:"profile"`
+	Proxy       string   `json:"proxyUrl"`
+	Cookies     []Cookie `json:"cookies"`
 }
 
 const nativeRequestTimeoutSeconds = 35
@@ -106,6 +109,15 @@ func newUpstreamRequest(input Request) (*http.Request, error) {
 	}
 	for k, v := range input.Headers {
 		request.Header.Set(k, v)
+	}
+	// fhttp sorts headers lexicographically unless it is told the sequence.
+	// Chrome's order is part of the HTTP/2 fingerprint, so replay it verbatim.
+	if len(input.HeaderOrder) > 0 {
+		order := make([]string, 0, len(input.HeaderOrder))
+		for _, name := range input.HeaderOrder {
+			order = append(order, strings.ToLower(name))
+		}
+		request.Header[http.HeaderOrderKey] = order
 	}
 	return request, nil
 }
