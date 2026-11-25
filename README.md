@@ -33,6 +33,8 @@ relay-node --instance main check_update
 
 macOS LaunchAgent 在当前用户登录后运行；Linux systemd 服务随系统启动。节点只主动连接控制台，不开放公网管理端口，本地菜单通过 0600 Unix socket 管理。
 
+排查控制台延迟时，可在节点服务环境或实例 `config.json` 的 `environment` 中设置 `RELAY_PERFORMANCE_DIAGNOSTICS=1`，排空任务后重启节点。节点服务日志按分钟汇总心跳、派发、续租和检查点耗时。慢请求和失败请求会记录请求 ID、状态和耗时，可按 `x-relay-worker-request-id` 与控制台对应。
+
 ## 开发与发布
 
 ```sh

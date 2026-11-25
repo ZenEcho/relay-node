@@ -259,6 +259,7 @@ export async function runManager(root: string) {
           await saveJson(join(root, 'config.json'), candidate);
           config = candidate;
           stopMetrics();
+          controller.flushDiagnostics();
           controller = replacement;
           await log('节点 · 对接控制台', {
             request: { instance: config.instance, version: manifest.version },
@@ -405,12 +406,12 @@ export async function runManager(root: string) {
           !state.commands.length &&
           !(updateActive(updateStatus) && !['queued', 'draining'].includes(updateStatus.phase))
         ) {
+          const taskController = controller;
           await pollBatch(
-            () => controller.request('poll'),
+            () => taskController.request('poll'),
             (assignment: import('../../../../packages/contracts/src/execution.js').Assignment) => {
               const handle = cancellations.register(assignment.run.id, assignment.run.workerLease);
               if (handle && !handle.controller.signal.aborted) {
-                const taskController = controller;
                 const releaseLogs = taskController.deferRunLogs(assignment);
                 const task = log('执行节点接收订单', { request: { mode: assignment.mode } }, assignment)
                   .then(() =>
@@ -478,6 +479,7 @@ export async function runManager(root: string) {
     await controller.persistLogs();
   } finally {
     stopMetrics();
+    controller.flushDiagnostics();
     server.close();
     await rm(socket, { force: true });
     await rm(lock, { recursive: true, force: true });
