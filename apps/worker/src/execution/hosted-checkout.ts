@@ -14,7 +14,17 @@ const PAGE_ROUNDS = 4;
 const PAGE_INTERVAL_MS = 1500;
 const COMPLETION_ROUNDS = 8;
 const COMPLETION_INTERVAL_MS = 2000;
-const PAID_STATES = ['paid', 'success', 'succeeded', 'complete', 'completed', 'processing', 'requires_capture'];
+// 0 元单（官方优惠全额抵扣）在 Stripe 里是 complete + no_payment_required，同样算完成。
+const PAID_STATES = [
+  'paid',
+  'no_payment_required',
+  'success',
+  'succeeded',
+  'complete',
+  'completed',
+  'processing',
+  'requires_capture',
+];
 const FAILED_STATES = ['failed', 'expired', 'canceled', 'cancelled'];
 
 // Hosted URLs carry Stripe's public client configuration (base64, XOR 5).
@@ -160,15 +170,15 @@ export async function prepareHostedCheckout(services: ExecutionServices) {
   const billing = c.billing!;
   const fields: Record<string, any> = pageFields(services);
   for (const [stripe, local] of [
+    ['country', 'country'],
     ['line1', 'line1'],
     ['city', 'city'],
     ['state', 'state'],
     ['postal_code', 'postalCode'],
   ])
     fields[`tax_region[${stripe}]`] = (billing as any)[local];
-  // 计税地区固定取建单地区，不能让卡片账单地址所在国改写它；地址行仍是卡片的
-  // 真实账单地址。金额随后以官方页面返回的 total_summary 为准。
-  fields['tax_region[country]'] = c.environment.country;
+  // 页面税额必须和 Stripe 提交时按支付方式账单地址重算的发票一致；金额随后仍以
+  // 官方页面返回的 total_summary 为准。
   let updated: any;
   try {
     updated = await services.stripe(
@@ -181,7 +191,7 @@ export async function prepareHostedCheckout(services: ExecutionServices) {
     // 地区算好的），不要因此中断本单。
     if (!(error instanceof UpstreamError) || error.status < 400 || error.status >= 500) throw error;
     await services.log({
-      name: 'Hosted 账单地址未写入 · 按建单地区计税',
+      name: 'Hosted 账单地址未写入 · 沿用官方页面金额',
       status: 'pending',
       error: (error as Error).message,
     });
@@ -273,7 +283,7 @@ async function acceptHostedPage(services: ExecutionServices, page: any) {
   if (
     (page.checkout_session_id || page.session_id || page.id) === c.checkout!.id &&
     page.status === 'complete' &&
-    page.payment_status === 'paid'
+    (page.payment_status === 'paid' || page.payment_status === 'no_payment_required')
   ) {
     await services.success();
     return true;

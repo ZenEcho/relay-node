@@ -17,7 +17,6 @@ import {
   checkoutModeFromId,
   isCheckoutModeRejection,
   modeFallbackBlocked,
-  zeroAmountRequiresCustom,
   type CheckoutMode,
 } from './checkout-mode.js';
 import { cleanupExecution } from './cleanup.js';
@@ -644,9 +643,10 @@ export class ProtocolEngine {
         const taxes = await this.chat('更新原结账税费', '/backend-api/payments/checkout/taxes', {
           checkout_session_id: this.context.checkout!.id,
           checkout_email: this.context.billingEmailBinding?.email || undefined,
-          // 计税地区跟建单地区（order.cdkPaymentCountry）走，不受账单地址所在国影响：
-          // php 单就按 PH 查税，billing_address 仍是卡片的真实账单地址。
-          billing_country: this.context.environment.country,
+          // 计税按卡片的账单地址走。Stripe 在提交付款时会用支付方式的账单地址重算
+          // 订阅发票，建单地区只影响建单时的预估；两边不一致就会在 approve 后以
+          // checkout_upcoming_invoice_mismatch 拒绝（见 2026-11-26 订单日志）。
+          billing_country: billing.country,
           billing_name: billing.name,
           currency: this.context.currency.toLowerCase(),
           processor_entity: this.context.checkout!.processor_entity,
@@ -713,17 +713,8 @@ export class ProtocolEngine {
         throw new Error('原结账金额、币种或标识无法核验，停止准备卡片');
       this.context.snapshot.amount_total = amount;
       this.context.snapshot.currency = currency.toLowerCase();
-      // 零元结账必须落在 custom（oaics_）支付页上：官方 hosted 页面按正常价
-      // 收单，0 元优惠不会生效。这里以官方金额为准判断，0 元却在 hosted 就停。
-      const effectiveMode: CheckoutMode =
-        this.context.checkoutMode === 'hosted' ? 'hosted' : 'custom';
-      if (zeroAmountRequiresCustom(effectiveMode, amount))
-        // 0 元单在 hosted 上会按正常价收单，重试同一个模式不会变好：终结等人工核对。
-        throw terminal(
-          '零元结账必须使用 custom（oaics_）支付页，当前是 ' +
-            effectiveMode +
-            '，已停止准备卡片',
-        );
+      // 零元由官方优惠决定（hosted 建单会自动套 plus-1-month-free，custom 不会）。
+      // 金额是多少就按多少走，节点不再拦 0 元单。
       if (hosted) await prepareHostedCheckout(this.services);
       if (!this.context.elements && !this.stripeTokenProvider) {
         this.context.clientSessionId ||= randomUUID();

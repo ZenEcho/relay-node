@@ -337,6 +337,7 @@ async function execute(
     hostedPageAmount?: number;
     hostedSubmissionError?: string;
     hostedAddressStatus?: number;
+    hostedNoPaymentPage?: boolean;
     billingCountry?: string;
     credentialAccessToken?: string;
     credentialUserEmail?: string;
@@ -599,6 +600,15 @@ async function execute(
           body: '',
           data: { error: { message: 'invalid tax region' } },
         };
+      // 0 元单在 Stripe 里是 complete + no_payment_required。
+      if (url.pathname.startsWith('/v1/payment_pages/') && input.method === 'GET' && options.hostedNoPaymentPage) {
+        const response = await super.request(input);
+        response.data.status = 'complete';
+        response.data.payment_status = 'no_payment_required';
+        if (options.hostedPageAmount !== undefined)
+          response.data.total_summary = { due: options.hostedPageAmount, total: options.hostedPageAmount };
+        return response;
+      }
       // 线上 hosted 页面：改账单地区后应付金额会变，submission_attempt 承载审批后的失败。
       if (
         url.pathname.startsWith('/v1/payment_pages/') &&
@@ -1909,25 +1919,25 @@ test('hosted confirmation always sends the amount the official page reports', as
   }
 });
 
-test('tax lookup and the hosted page follow the order region, not the billing address', async () => {
-  // 建单地区 PH、卡片账单地址 US：计税 country 必须是 PH，页面 tax_region 也必须
-  // 是 PH，否则 Stripe 会按账单地址把税额重算成别的数字。
-  const result = await execute({
-    demo: false,
-    authorizer: boundAuthorizer,
-    checkoutMode: 'hosted',
-    billingCountry: 'US',
-  });
-  assert.equal(result.finish.status, 'completed', result.finish.error);
-  const taxes = JSON.parse(result.requests.find((r) => r.url.endsWith('/checkout/taxes'))!.body!);
-  assert.equal(taxes.billing_country, 'PH');
-  assert.equal(taxes.billing_address.country, 'US');
-  const page = result.requests.find(
-    (r) => r.method === 'POST' && r.url.endsWith('/payment_pages/' + result.assignment.context.checkout!.id),
-  )!;
-  const pageFields = new URLSearchParams(page.body!);
-  assert.equal(pageFields.get('tax_region[country]'), 'PH');
-  assert.equal(pageFields.get('tax_region[line1]'), '232 West Yellowstone Avenue');
+test('tax and the hosted page use the billing address Stripe will invoice against', async () => {
+  // 建单地区 PH、卡片账单地址 US：Stripe 在提交时会按支付方式的 US 地址重算发票，
+  // 所以计税和页面 tax_region 都必须跟账单地址走，否则页面金额和发票金额会分叉。
+  for (const billingCountry of ['US', 'PH']) {
+    const result = await execute({
+      demo: false,
+      authorizer: boundAuthorizer,
+      checkoutMode: 'hosted',
+      billingCountry,
+    });
+    assert.equal(result.finish.status, 'completed', result.finish.error);
+    const taxes = JSON.parse(result.requests.find((r) => r.url.endsWith('/checkout/taxes'))!.body!);
+    assert.equal(taxes.billing_country, billingCountry);
+    assert.equal(taxes.billing_address.country, billingCountry);
+    const page = result.requests.find(
+      (r) => r.method === 'POST' && r.url.endsWith('/payment_pages/' + result.assignment.context.checkout!.id),
+    )!;
+    assert.equal(new URLSearchParams(page.body!).get('tax_region[country]'), billingCountry);
+  }
 });
 
 test('a rejected hosted address write keeps the official page amount and continues', async () => {
@@ -1941,9 +1951,28 @@ test('a rejected hosted address write keeps the official page amount and continu
   assert.equal(result.assignment.context.hostedAmount, 2000);
   assert.ok(
     result.commands.some(
-      (c) => c.action === 'step' && c.body.step.name === 'Hosted 账单地址未写入 · 按建单地区计税',
+      (c) => c.action === 'step' && c.body.step.name === 'Hosted 账单地址未写入 · 沿用官方页面金额',
     ),
   );
+});
+
+test('zero-amount hosted checkout continues instead of demanding a custom page', async () => {
+  // 官方在 hosted 建单时自动套 plus-1-month-free，计税 amount_total = 0；
+  // 旧守卫要求 0 元必须 custom，会把这单终结。现在按官方金额继续走 hosted。
+  const result = await execute({
+    demo: false,
+    authorizer: boundAuthorizer,
+    checkoutMode: 'hosted',
+    taxStripe: { amount_total: 0 },
+    hostedPageAmount: 0,
+    hostedNoPaymentPage: true,
+  });
+  assert.equal(result.finish.status, 'completed', result.finish.error);
+  assert.equal(result.assignment.context.snapshot!.amount_total, 0);
+  const confirm = result.requests.find(
+    (r) => r.url.endsWith('/payment_pages/' + result.assignment.context.checkout!.id + '/confirm'),
+  )!;
+  assert.equal(new URLSearchParams(confirm.body!).get('expected_amount'), '0');
 });
 
 test('hosted submission rejected after approval fails once with the Stripe code', async () => {

@@ -5,7 +5,6 @@ import {
   checkoutModeFromId,
   isCheckoutModeRejection,
   modeFallbackBlocked,
-  zeroAmountRequiresCustom,
 } from '../../apps/worker/src/execution/checkout-mode.js';
 import { UpstreamError } from '../../apps/worker/src/execution/http-utils.js';
 
@@ -69,13 +68,6 @@ test('session prefix always identifies the mode', () => {
   assert.equal(checkoutModeFromId('cs_test_a1b2'), 'hosted');
   for (const value of ['', 'oaics_', 'cs_', 'pi_1', 'oaics_1/../cs_2', 42, null, undefined])
     assert.equal(checkoutModeFromId(value), undefined);
-});
-
-test('zero amount only runs on the custom (oaics_) checkout', () => {
-  assert.equal(zeroAmountRequiresCustom('custom', 0), false);
-  assert.equal(zeroAmountRequiresCustom('hosted', 0), true);
-  for (const amount of [1, 98214, 110000])
-    assert.equal(zeroAmountRequiresCustom('hosted', amount), false);
 });
 
 test('only a mode-shaped official rejection is worth the other mode', () => {

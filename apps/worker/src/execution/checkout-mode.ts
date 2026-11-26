@@ -35,14 +35,6 @@ export function adoptCheckoutMode(
 }
 
 /**
- * 零元结账必须落在 custom（oaics_）支付页上。官方 hosted 页面按正常价收单，
- * 零元优惠不会生效，所以 0 元单出现在 hosted 上就是走错了路，应当停止而不是提交。
- */
-export function zeroAmountRequiresCustom(mode: CheckoutMode, amount: number): boolean {
-  return amount === 0 && mode !== 'custom';
-}
-
-/**
  * 建单被官方以“模式不支持”为由拒绝时，值得换另一种模式再试一次。
  * 其它 4xx/5xx（地区不可用、会话过期、网络错误）不属于模式问题，不能掩盖。
  */
